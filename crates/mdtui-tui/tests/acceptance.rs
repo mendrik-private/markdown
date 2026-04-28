@@ -238,6 +238,19 @@ fn tight_list_renders_without_extra_blank_lines() {
 }
 
 #[test]
+fn wrapped_bullet_list_lines_indent_to_text_column() {
+    let rendered = render_document(
+        &import_gfm("- alpha beta gamma"),
+        RenderOptions {
+            width: 8,
+            ..RenderOptions::default()
+        },
+    )
+    .text();
+    assert_eq!(rendered, "• alpha\n  beta\n  gamma");
+}
+
+#[test]
 fn enter_inside_list_item_creates_new_list_item() {
     let mut app = list_app();
     app.editor.set_cursor(Cursor::ListItem {

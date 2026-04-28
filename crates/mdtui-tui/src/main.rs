@@ -472,11 +472,12 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
     let preferred_x = state.preferred_column.unwrap_or(x);
     let step = headline_visual_step(state, state.app.editor.cursor);
     let mut target_y = y as i32 + delta * step;
-    if target_y < 0 {
+    let max_y = rendered.lines.len() as i32;
+    if target_y < 0 || target_y >= max_y {
         return;
     }
     let mut target = None;
-    for _ in 0..3 {
+    while target_y >= 0 && target_y < max_y {
         let row = target_y as u16;
         target = nearest_cursor_on_row(preferred_x, row, &rendered.display.items)
             .or_else(|| hit_test(preferred_x, row, &rendered.display))
@@ -485,9 +486,6 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
             break;
         }
         target_y += delta.signum();
-        if target_y < 0 {
-            break;
-        }
     }
     let Some(cursor) = target.map(|cursor| normalize_headline_cursor(state, cursor)) else {
         return;
@@ -2087,7 +2085,7 @@ fn style_code_body(line: &str, theme: &Theme) -> Line<'static> {
     let mut spans = vec![
         Span::styled("│".to_string(), code_gutter_border(theme)),
         Span::styled(number.to_string(), code_gutter(theme)),
-        Span::styled("│ ".to_string(), code_gutter_border(theme)),
+        Span::styled("│ ".to_string(), code_gutter_divider(theme)),
     ];
     spans.extend(highlight_code(&rest, theme));
     spans.push(Span::styled(" │".to_string(), code_border(theme)));
@@ -3072,6 +3070,12 @@ fn code_gutter_border(theme: &Theme) -> Style {
         .bg(rgb(theme.panel_bg))
 }
 
+fn code_gutter_divider(theme: &Theme) -> Style {
+    Style::default()
+        .fg(rgb(theme.border))
+        .bg(rgb(theme.panel_bg))
+}
+
 fn code_gutter(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.text_muted))
@@ -3123,4 +3127,40 @@ fn code_comment(theme: &Theme) -> Style {
 
 fn code_number(theme: &Theme) -> Style {
     Style::default().fg(rgb(theme.link)).bg(rgb(theme.code_bg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_visual_skips_code_block_chrome_rows() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "before\n\n```python\ndef greet():\n    return 1\n```\n\nafter",
+            ),
+            None,
+        );
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered = render_document(&state.app.editor.document, state.app.render_options);
+        materialize_active_headline_fallback(&state, &mut rendered);
+        state.last_rendered = Some(rendered);
+
+        move_visual(&mut state, 1, false);
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 1,
+                offset: 0
+            }
+        );
+    }
 }

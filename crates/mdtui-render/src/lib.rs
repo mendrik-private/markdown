@@ -449,40 +449,57 @@ impl RenderContext {
         for (item_index, item) in list.items.iter().enumerate() {
             let marker = list_marker(list, item, item_index);
             let text = item.rendered_text();
-            let y = self.lines.len() as u16;
-            self.display.items.push(DisplayItem {
-                kind: DisplayKind::Adornment,
-                rect: Rect {
-                    x: 0,
-                    y,
-                    width: marker.chars().count() as u16,
-                    height: 1,
-                },
-                cursor: item.checked.map(|_| Cursor::Checkbox {
-                    block: block_index,
-                    item: item_index,
-                }),
-                action: None,
-                text: marker.clone(),
-            });
-            let line = format!("{marker}{text}");
-            self.display.items.push(DisplayItem {
-                kind: DisplayKind::TextRun,
-                rect: Rect {
-                    x: marker.chars().count() as u16,
-                    y,
-                    width: text.chars().count() as u16,
-                    height: 1,
-                },
-                cursor: Some(Cursor::ListItem {
-                    block: block_index,
-                    item: item_index,
-                    offset: 0,
-                }),
-                action: None,
-                text: text.clone(),
-            });
-            self.lines.push(line);
+            let marker_width = marker.chars().count() as u16;
+            let wrap_width = self.options.width.saturating_sub(marker_width).max(1);
+            let wrapped = wrap(&text, wrap_width);
+            let indent = " ".repeat(usize::from(marker_width));
+            let mut offset = 0usize;
+            for (line_index, part) in wrapped.iter().enumerate() {
+                let y = self.lines.len() as u16;
+                if line_index == 0 {
+                    self.display.items.push(DisplayItem {
+                        kind: DisplayKind::Adornment,
+                        rect: Rect {
+                            x: 0,
+                            y,
+                            width: marker_width,
+                            height: 1,
+                        },
+                        cursor: item.checked.map(|_| Cursor::Checkbox {
+                            block: block_index,
+                            item: item_index,
+                        }),
+                        action: None,
+                        text: marker.clone(),
+                    });
+                }
+                self.display.items.push(DisplayItem {
+                    kind: DisplayKind::TextRun,
+                    rect: Rect {
+                        x: marker_width,
+                        y,
+                        width: part.chars().count() as u16,
+                        height: 1,
+                    },
+                    cursor: Some(Cursor::ListItem {
+                        block: block_index,
+                        item: item_index,
+                        offset,
+                    }),
+                    action: None,
+                    text: part.clone(),
+                });
+                let line = if line_index == 0 {
+                    format!("{marker}{part}")
+                } else {
+                    format!("{indent}{part}")
+                };
+                self.lines.push(line);
+                offset += part.chars().count();
+                if line_index + 1 < wrapped.len() {
+                    offset += 1;
+                }
+            }
         }
     }
 
