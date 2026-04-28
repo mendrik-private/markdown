@@ -87,6 +87,7 @@ pub struct RenderOptions {
     pub heading_width: u16,
     pub kitty_graphics: bool,
     pub columns: u8,
+    pub hyphenate: bool,
     pub show_status: bool,
     pub code_horizontal_scrolls: Vec<(usize, usize)>,
 }
@@ -98,6 +99,7 @@ impl Default for RenderOptions {
             heading_width: 0,
             kitty_graphics: false,
             columns: 1,
+            hyphenate: true,
             show_status: true,
             code_horizontal_scrolls: Vec::new(),
         }
@@ -384,13 +386,17 @@ impl RenderContext {
     fn render_text_block(&mut self, block_index: usize, text: String) {
         let columns = usize::from(self.options.columns.max(1));
         if columns > 1
-            && let Some((wrapped, column_width, column_height)) =
-                text_columns(&text, self.options.width.max(1), columns)
+            && let Some((wrapped, column_width, column_height)) = text_columns(
+                &text,
+                self.options.width.max(1),
+                columns,
+                self.options.hyphenate,
+            )
         {
             self.render_text_columns(block_index, &wrapped, column_width, column_height);
             return;
         }
-        let wrapped = wrap_text_block(&text, self.options.width.max(1));
+        let wrapped = wrap_text_block(&text, self.options.width.max(1), self.options.hyphenate);
         self.render_wrapped_text_block(block_index, &wrapped);
     }
 
@@ -1109,7 +1115,7 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
     }
 }
 
-fn wrap_text_block(text: &str, width: u16) -> Vec<WrappedTextLine> {
+fn wrap_text_block(text: &str, width: u16, hyphenate: bool) -> Vec<WrappedTextLine> {
     let width = usize::from(width.max(1));
     if text.is_empty() {
         return vec![WrappedTextLine {
@@ -1126,7 +1132,11 @@ fn wrap_text_block(text: &str, width: u16) -> Vec<WrappedTextLine> {
             hyphenated: false,
         }];
     }
-    let hyphenator = detected_hyphenator(text);
+    let hyphenator = if hyphenate {
+        detected_hyphenator(text)
+    } else {
+        None
+    };
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_offset = 0usize;
@@ -1181,7 +1191,12 @@ fn wrap_text_block(text: &str, width: u16) -> Vec<WrappedTextLine> {
                 continue;
             }
 
-            let take = width.saturating_sub(1).max(1).min(remaining_len);
+            let take = if hyphenate {
+                width.saturating_sub(1).max(1)
+            } else {
+                width.max(1)
+            }
+            .min(remaining_len);
             let (prefix, suffix) = split_chars(&remaining, take);
             current_offset = remaining_offset;
             if suffix.is_empty() {
@@ -1191,7 +1206,7 @@ fn wrap_text_block(text: &str, width: u16) -> Vec<WrappedTextLine> {
             lines.push(WrappedTextLine {
                 text: prefix,
                 offset: current_offset,
-                hyphenated: true,
+                hyphenated: hyphenate,
             });
             remaining = suffix;
             remaining_offset += take;
@@ -1220,6 +1235,7 @@ fn text_columns(
     text: &str,
     width: u16,
     columns: usize,
+    hyphenate: bool,
 ) -> Option<(Vec<WrappedTextLine>, usize, usize)> {
     if columns <= 1 {
         return None;
@@ -1231,7 +1247,7 @@ fn text_columns(
     if column_width < 16 {
         return None;
     }
-    let wrapped = wrap_text_block(text, column_width as u16);
+    let wrapped = wrap_text_block(text, column_width as u16, hyphenate);
     if !column_layout_is_balanced(wrapped.len(), columns) {
         return None;
     }

@@ -811,6 +811,18 @@ fn hyphenation_inserts_visual_breaks_for_long_english_words() {
 }
 
 #[test]
+fn hyphenation_can_be_disabled() {
+    let opts = RenderOptions {
+        width: 12,
+        hyphenate: false,
+        ..RenderOptions::default()
+    };
+    let source = "Hyphenation makes representation considerably prettier in narrow paragraphs.";
+    let rendered = render_document(&import_gfm(source), opts).text();
+    assert!(!rendered.contains("-\n"));
+}
+
+#[test]
 fn lower_headlines_use_custom_rule_glyphs() {
     let rendered = render_document(
         &import_gfm("### Three\n\n#### Four\n\n##### Five\n\n###### Six"),

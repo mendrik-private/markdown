@@ -43,8 +43,8 @@ use ratatui::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
-const HEADLINE_RASTER_VERSION: u32 = 8;
-const HEADLINE_DEBUG_SLAB: bool = true;
+const HEADLINE_RASTER_VERSION: u32 = 9;
+const HEADLINE_DEBUG_SLAB: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -84,6 +84,7 @@ struct ExplorerModeHit {
 enum StatusAction {
     SetWrapWidth(u16),
     SetColumns(u8),
+    ToggleHyphenation,
 }
 
 #[derive(Clone, Debug)]
@@ -145,7 +146,7 @@ struct StylePopupHit {
 struct RenderCacheKey {
     version: u64,
     options: RenderOptions,
-    active_block: usize,
+    active_headline_block: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +543,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.app.render_options.columns = 3;
             state.message = "column mode 3".to_string();
             persist_view_state(state);
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            run_status_action(state, &StatusAction::ToggleHyphenation);
         }
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.editor.undo();
@@ -1197,7 +1201,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     let render_key = RenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
-        active_block: cursor_block(state.app.editor.cursor),
+        active_headline_block: active_headline_block(state),
     };
     let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
         state.last_rendered.clone().unwrap_or_else(|| {
@@ -1857,6 +1861,50 @@ fn draw_status(
         &mut x,
         area.y,
         right,
+        " hy ",
+        Style::default()
+            .fg(rgb(theme.text_muted))
+            .bg(rgb(theme.panel_bg)),
+    );
+    let hyphen_label = if state.app.render_options.hyphenate {
+        "[on]"
+    } else {
+        "[off]"
+    };
+    let hyphen_start = x.saturating_sub(area.x);
+    state.status_hits.push(StatusHit {
+        start: hyphen_start,
+        end: hyphen_start.saturating_add(hyphen_label.chars().count() as u16),
+        action: StatusAction::ToggleHyphenation,
+    });
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        hyphen_label,
+        Style::default()
+            .fg(rgb(if state.app.render_options.hyphenate {
+                theme.accent_highlight
+            } else {
+                theme.text_secondary
+            }))
+            .bg(rgb(if state.app.render_options.hyphenate {
+                theme.panel_raised
+            } else {
+                theme.panel_bg
+            }))
+            .add_modifier(if state.app.render_options.hyphenate {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
+    );
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
         &format!(" {}{} ", compact_text(&state.message, 28), selection),
         Style::default()
             .fg(rgb(theme.text_secondary))
@@ -1879,7 +1927,7 @@ fn draw_status(
         area.y,
         right,
         &format!(
-            "  {} / {}  ctrl-1/2/3 cols  drag wrap slider  F1/? help",
+            "  {} / {}  ctrl-1/2/3 cols  ctrl-h hyphen  drag wrap slider  F1/? help",
             row,
             rendered.lines.len().max(1)
         ),
@@ -2182,11 +2230,11 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
     let mut lines = Vec::new();
     for index in 0..viewport {
         let ch = if index >= start && index < start + thumb {
-            "▒"
+            "┃"
         } else {
             "│"
         };
-        let style = if ch == "▒" {
+        let style = if ch == "┃" {
             Style::default()
                 .fg(rgb(theme.accent_highlight))
                 .bg(rgb(theme.panel_bg))
@@ -2597,6 +2645,16 @@ fn run_status_action(state: &mut TuiState, action: &StatusAction) {
             state.message = format!("column mode {}", state.app.render_options.columns);
             persist_view_state(state);
         }
+        StatusAction::ToggleHyphenation => {
+            state.app.render_options.hyphenate = !state.app.render_options.hyphenate;
+            state.scroll = 0;
+            state.message = if state.app.render_options.hyphenate {
+                "hyphenation on".to_string()
+            } else {
+                "hyphenation off".to_string()
+            };
+            persist_view_state(state);
+        }
     }
 }
 
@@ -2805,6 +2863,8 @@ fn load_view_state(state: &mut TuiState) {
             && let Ok(columns) = value.parse::<u16>()
         {
             state.app.render_options.columns = columns.clamp(1, 3) as u8;
+        } else if let Some(value) = line.strip_prefix("hyphenate=") {
+            state.app.render_options.hyphenate = matches!(value, "1" | "true" | "on");
         }
     }
 }
@@ -2814,8 +2874,14 @@ fn persist_view_state(state: &TuiState) {
     let _ = fs::write(
         path,
         format!(
-            "wrap_width={}\ncolumns={}\n",
-            state.wrap_width, state.app.render_options.columns
+            "wrap_width={}\ncolumns={}\nhyphenate={}\n",
+            state.wrap_width,
+            state.app.render_options.columns,
+            if state.app.render_options.hyphenate {
+                "1"
+            } else {
+                "0"
+            }
         ),
     );
 }
@@ -3101,6 +3167,7 @@ fn outline_lines(
             theme.panel_bg
         };
         let depth = level.saturating_sub(1);
+        let mute_mix = u16::from(depth).saturating_mul(20);
         let title_color = rgb(&mix_hex(
             if active {
                 theme.accent_highlight
@@ -3108,8 +3175,9 @@ fn outline_lines(
                 theme.accent_primary
             },
             theme.panel_bg,
-            u16::from(depth).saturating_mul(10),
+            mute_mix,
         ));
+        let prefix_color = rgb(&mix_hex(theme.link, theme.panel_bg, mute_mix));
         let title_style = Style::default()
             .fg(title_color)
             .bg(rgb(bg))
@@ -3119,7 +3187,7 @@ fn outline_lines(
                 Modifier::empty()
             });
         let prefix_style = Style::default()
-            .fg(rgb(theme.link))
+            .fg(prefix_color)
             .bg(rgb(bg))
             .add_modifier(Modifier::BOLD);
         let indent = "  ".repeat(level.saturating_sub(1) as usize);
@@ -4755,8 +4823,8 @@ fn request_headline_raster(
 }
 
 fn headline_png(text: &str, level: u8, cols: u16, rows: u16) -> io::Result<Vec<u8>> {
-    let cell_w = 16u32;
-    let cell_h = 32u32;
+    let cell_w = 24u32;
+    let cell_h = 48u32;
     let width = u32::from(cols.max(8)) * cell_w;
     let height = u32::from(rows).max(2) * cell_h;
     let mut img = RgbaImage::from_pixel(width, height, Rgba([15, 12, 8, 255]));
@@ -5134,7 +5202,9 @@ fn headline_level(state: &TuiState, item: &mdtui_render::DisplayItem) -> u8 {
 }
 
 fn materialize_active_headline_fallback(state: &TuiState, rendered: &mut Rendered) {
-    let active_block = cursor_block(state.app.editor.cursor);
+    let Some(active_block) = active_headline_block(state) else {
+        return;
+    };
     let mut items = Vec::with_capacity(rendered.display.items.len() + 2);
     for item in &rendered.display.items {
         if item.kind != DisplayKind::HeadlinePlacement {
@@ -5181,6 +5251,17 @@ fn materialize_active_headline_fallback(state: &TuiState, rendered: &mut Rendere
         });
     }
     rendered.display.items = items;
+}
+
+fn active_headline_block(state: &TuiState) -> Option<usize> {
+    if !state.kitty_graphics {
+        return None;
+    }
+    let block = cursor_block(state.app.editor.cursor);
+    match state.app.editor.document.blocks.get(block) {
+        Some(DocBlock::Heading { level: 1 | 2, .. }) => Some(block),
+        _ => None,
+    }
 }
 
 fn clamp_scroll(offset: u16, content: usize, viewport: usize) -> u16 {
@@ -5708,6 +5789,95 @@ mod tests {
     }
 
     #[test]
+    fn render_cache_only_tracks_active_kitty_headlines() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "one\n\ntwo"), None);
+        state.kitty_graphics = true;
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let first = RenderCacheKey {
+            version: state.app.editor.document.version,
+            options: state.app.render_options.clone(),
+            active_headline_block: active_headline_block(&state),
+        };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        let second = RenderCacheKey {
+            version: state.app.editor.document.version,
+            options: state.app.render_options.clone(),
+            active_headline_block: active_headline_block(&state),
+        };
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn kitty_headlines_do_not_draw_debug_placeholder_rows() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "# Title\n\nbody"), None);
+        state.kitty_graphics = true;
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        state.app.render_options = RenderOptions {
+            width: 32,
+            heading_width: 32,
+            kitty_graphics: true,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 34,
+            height: 8,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(34, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert_ne!(buffer.cell((1, 1)).expect("headline slot").symbol(), "*");
+    }
+
+    #[test]
+    fn view_state_persists_hyphenation_columns_and_wrap_width() {
+        let root = std::env::temp_dir().join(format!("mdtui-view-state-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("note.md");
+        fs::write(&path, "body").expect("write note");
+
+        let mut state = TuiState::new(
+            App::from_markdown(path.to_string_lossy(), "body"),
+            Some(path),
+        );
+        state.wrap_width = 72;
+        state.app.render_options.columns = 3;
+        state.app.render_options.hyphenate = false;
+        persist_view_state(&state);
+
+        let reloaded = TuiState::new(
+            App::from_markdown(root.join("note.md").to_string_lossy(), "body"),
+            Some(root.join("note.md")),
+        );
+
+        assert_eq!(reloaded.wrap_width, 72);
+        assert_eq!(reloaded.app.render_options.columns, 3);
+        assert!(!reloaded.app.render_options.hyphenate);
+        let _ = fs::remove_file(root.join(".mdtui-view"));
+        let _ = fs::remove_file(root.join("note.md"));
+        let _ = fs::remove_dir(&root);
+    }
+
+    #[test]
     fn document_scrollbar_renders_on_panel_border() {
         let mut state = TuiState::new(
             App::from_markdown("x.md", "one\ntwo\nthree\nfour\nfive\nsix"),
@@ -5742,7 +5912,7 @@ mod tests {
                 .cell((19, 2))
                 .expect("border scrollbar cell")
                 .symbol(),
-            "│" | "█"
+            "│" | "┃"
         ));
         assert_eq!(
             buffer.cell((18, 2)).expect("content edge cell").symbol(),
