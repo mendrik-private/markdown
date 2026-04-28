@@ -92,6 +92,14 @@ impl App {
         self.editor.apply_mark(InlineMark::Code);
     }
 
+    pub fn apply_superscript(&mut self) {
+        self.editor.apply_mark(InlineMark::Superscript);
+    }
+
+    pub fn apply_subscript(&mut self) {
+        self.editor.apply_mark(InlineMark::Subscript);
+    }
+
     pub fn click(&mut self, x: u16, y: u16) {
         let rendered = self.render();
         if let Some(cursor) = hit_test_or_nearest(x, y, &rendered.display) {

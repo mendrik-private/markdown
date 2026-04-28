@@ -120,6 +120,8 @@ pub enum InlineMark {
     Strong,
     Strike,
     Code,
+    Superscript,
+    Subscript,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1200,27 +1202,310 @@ fn offset(cursor: Cursor) -> usize {
 }
 
 fn wrap_block_range(block: &mut Block, start: usize, end: usize, mark: InlineMark) {
-    let text = block.rendered_text();
-    let (prefix, rest) = split_chars(&text, start);
-    let (selected, suffix) = split_chars(&rest, end - start);
-    let marked = match mark {
-        InlineMark::Emphasis => Inline::Emphasis(vec![Inline::Text(selected)]),
-        InlineMark::Strong => Inline::Strong(vec![Inline::Text(selected)]),
-        InlineMark::Strike => Inline::Strike(vec![Inline::Text(selected)]),
-        InlineMark::Code => Inline::InlineCode(selected),
+    if start >= end {
+        return;
+    }
+    let inlines = match block {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => inlines,
+        _ => return,
     };
-    let mut inlines = Vec::new();
-    if !prefix.is_empty() {
-        inlines.push(Inline::Text(prefix));
+    let chunks = inline_chunks(inlines);
+    if chunks.is_empty() {
+        return;
     }
-    inlines.push(marked);
-    if !suffix.is_empty() {
-        inlines.push(Inline::Text(suffix));
+    let remove = selection_fully_marked(&chunks, start, end, mark);
+    let next = apply_mark_to_chunks(&chunks, start, end, mark, remove);
+    *inlines = chunks_to_inlines(&next);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InlineChunk {
+    text: String,
+    marks: ActiveMarks,
+    link: Option<LinkMeta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkMeta {
+    target: String,
+    title: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveMarks {
+    emphasis: bool,
+    strong: bool,
+    strike: bool,
+    code: bool,
+    superscript: bool,
+    subscript: bool,
+}
+
+fn inline_chunks(inlines: &[Inline]) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    flatten_inline_chunks(inlines, ActiveMarks::default(), None, &mut out);
+    out
+}
+
+fn flatten_inline_chunks(
+    inlines: &[Inline],
+    current: ActiveMarks,
+    link: Option<&LinkMeta>,
+    out: &mut Vec<InlineChunk>,
+) {
+    let mut current = current;
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => push_inline_chunk(out, text.clone(), current, link),
+            Inline::Emphasis(children) => {
+                let mut next = current;
+                next.emphasis = true;
+                flatten_inline_chunks(children, next, link, out);
+            }
+            Inline::Strong(children) => {
+                let mut next = current;
+                next.strong = true;
+                flatten_inline_chunks(children, next, link, out);
+            }
+            Inline::Strike(children) => {
+                let mut next = current;
+                next.strike = true;
+                flatten_inline_chunks(children, next, link, out);
+            }
+            Inline::InlineCode(text) => {
+                let mut next = current;
+                next.code = true;
+                push_inline_chunk(out, text.clone(), next, link);
+            }
+            Inline::Link {
+                target,
+                title,
+                children,
+            } => {
+                let next = LinkMeta {
+                    target: target.clone(),
+                    title: title.clone(),
+                };
+                flatten_inline_chunks(children, current, Some(&next), out);
+            }
+            Inline::Image { alt, .. } => push_inline_chunk(out, alt.clone(), current, link),
+            Inline::HtmlInline(html) => {
+                let tag = html.trim();
+                if tag.eq_ignore_ascii_case("<sup>") {
+                    current.superscript = true;
+                } else if tag.eq_ignore_ascii_case("</sup>") {
+                    current.superscript = false;
+                } else if tag.eq_ignore_ascii_case("<sub>") {
+                    current.subscript = true;
+                } else if tag.eq_ignore_ascii_case("</sub>") {
+                    current.subscript = false;
+                } else {
+                    push_inline_chunk(out, html.clone(), current, link);
+                }
+            }
+            Inline::SoftBreak => push_inline_chunk(out, "\n".to_string(), current, link),
+            Inline::HardBreak => push_inline_chunk(out, "  \n".to_string(), current, link),
+        }
     }
-    match block {
-        Block::Paragraph(old) | Block::Heading { inlines: old, .. } => *old = inlines,
-        _ => {}
+}
+
+fn push_inline_chunk(
+    out: &mut Vec<InlineChunk>,
+    text: String,
+    marks: ActiveMarks,
+    link: Option<&LinkMeta>,
+) {
+    if text.is_empty() {
+        return;
     }
+    if let Some(last) = out.last_mut()
+        && last.marks == marks
+        && last.link.as_ref() == link
+    {
+        last.text.push_str(&text);
+    } else {
+        out.push(InlineChunk {
+            text,
+            marks,
+            link: link.cloned(),
+        });
+    }
+}
+
+fn selection_fully_marked(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+    mark: InlineMark,
+) -> bool {
+    if start >= end {
+        return false;
+    }
+    let mut covered = 0usize;
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end > overlap_start {
+            if !chunk_mark_enabled(chunk.marks, mark) {
+                return false;
+            }
+            covered += overlap_end - overlap_start;
+        }
+        offset = chunk_end;
+    }
+    covered == end - start
+}
+
+fn apply_mark_to_chunks(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+    mark: InlineMark,
+    remove: bool,
+) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end <= overlap_start {
+            push_inline_chunk(
+                &mut out,
+                chunk.text.clone(),
+                chunk.marks,
+                chunk.link.as_ref(),
+            );
+            offset = chunk_end;
+            continue;
+        }
+
+        let leading = overlap_start.saturating_sub(offset);
+        let selected = overlap_end - overlap_start;
+        let (prefix, rest) = split_chars(&chunk.text, leading);
+        let (middle, suffix) = split_chars(&rest, selected);
+
+        if !prefix.is_empty() {
+            push_inline_chunk(&mut out, prefix, chunk.marks, chunk.link.as_ref());
+        }
+        if !middle.is_empty() {
+            push_inline_chunk(
+                &mut out,
+                middle,
+                with_chunk_mark(chunk.marks, mark, remove),
+                chunk.link.as_ref(),
+            );
+        }
+        if !suffix.is_empty() {
+            push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
+        }
+        offset = chunk_end;
+    }
+    out
+}
+
+fn with_chunk_mark(mut marks: ActiveMarks, mark: InlineMark, remove: bool) -> ActiveMarks {
+    let enabled = !remove;
+    match mark {
+        InlineMark::Emphasis => marks.emphasis = enabled,
+        InlineMark::Strong => marks.strong = enabled,
+        InlineMark::Strike => marks.strike = enabled,
+        InlineMark::Code => marks.code = enabled,
+        InlineMark::Superscript => {
+            marks.superscript = enabled;
+            if enabled {
+                marks.subscript = false;
+            }
+        }
+        InlineMark::Subscript => {
+            marks.subscript = enabled;
+            if enabled {
+                marks.superscript = false;
+            }
+        }
+    }
+    marks
+}
+
+fn chunk_mark_enabled(marks: ActiveMarks, mark: InlineMark) -> bool {
+    match mark {
+        InlineMark::Emphasis => marks.emphasis,
+        InlineMark::Strong => marks.strong,
+        InlineMark::Strike => marks.strike,
+        InlineMark::Code => marks.code,
+        InlineMark::Superscript => marks.superscript,
+        InlineMark::Subscript => marks.subscript,
+    }
+}
+
+fn chunks_to_inlines(chunks: &[InlineChunk]) -> Vec<Inline> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        if chunk.text.is_empty() {
+            continue;
+        }
+        out.extend(inlines_for_chunk(chunk));
+    }
+    if out.is_empty() {
+        vec![Inline::Text(String::new())]
+    } else {
+        merge_adjacent_text(out)
+    }
+}
+
+fn inlines_for_chunk(chunk: &InlineChunk) -> Vec<Inline> {
+    let mut children = if chunk.marks.code {
+        vec![Inline::InlineCode(chunk.text.clone())]
+    } else {
+        vec![Inline::Text(chunk.text.clone())]
+    };
+
+    if chunk.marks.emphasis {
+        children = vec![Inline::Emphasis(children)];
+    }
+    if chunk.marks.strong {
+        children = vec![Inline::Strong(children)];
+    }
+    if chunk.marks.strike {
+        children = vec![Inline::Strike(children)];
+    }
+    if chunk.marks.superscript {
+        children = wrap_html_inline(children, "sup");
+    }
+    if chunk.marks.subscript {
+        children = wrap_html_inline(children, "sub");
+    }
+    if let Some(link) = &chunk.link {
+        children = vec![Inline::Link {
+            target: link.target.clone(),
+            title: link.title.clone(),
+            children,
+        }];
+    }
+    children
+}
+
+fn wrap_html_inline(children: Vec<Inline>, tag: &str) -> Vec<Inline> {
+    let mut wrapped = Vec::with_capacity(children.len() + 2);
+    wrapped.push(Inline::HtmlInline(format!("<{tag}>")));
+    wrapped.extend(children);
+    wrapped.push(Inline::HtmlInline(format!("</{tag}>")));
+    wrapped
+}
+
+fn merge_adjacent_text(inlines: Vec<Inline>) -> Vec<Inline> {
+    let mut merged = Vec::new();
+    for inline in inlines {
+        match (merged.last_mut(), inline) {
+            (Some(Inline::Text(left)), Inline::Text(right)) => left.push_str(&right),
+            (_, other) => merged.push(other),
+        }
+    }
+    merged
 }
 
 pub fn recent_transactions(editor: &Editor, limit: usize) -> VecDeque<Transaction> {
@@ -1231,4 +1516,117 @@ pub fn recent_transactions(editor: &Editor, limit: usize) -> VecDeque<Transactio
         .take(limit)
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paragraph_editor(inlines: Vec<Inline>) -> Editor {
+        let mut editor = Editor::new(Document::new(vec![Block::Paragraph(inlines)]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        editor
+    }
+
+    #[test]
+    fn strong_toggle_removes_existing_mark() {
+        let mut editor = paragraph_editor(vec![Inline::Strong(vec![Inline::Text(
+            "hello".to_string(),
+        )])]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        editor.apply_mark(InlineMark::Strong);
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("hello".to_string())])]
+        );
+    }
+
+    #[test]
+    fn strong_toggle_merges_partial_overlap() {
+        let mut editor = paragraph_editor(vec![
+            Inline::Text("ab".to_string()),
+            Inline::Strong(vec![Inline::Text("cd".to_string())]),
+            Inline::Text("ef".to_string()),
+        ]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        editor.apply_mark(InlineMark::Strong);
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Text("a".to_string()),
+                Inline::Strong(vec![Inline::Text("bcde".to_string())]),
+                Inline::Text("f".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn superscript_toggle_round_trips_html_wrappers() {
+        let mut editor = paragraph_editor(vec![Inline::Text("H2O".to_string())]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 2,
+            },
+        );
+
+        editor.apply_mark(InlineMark::Subscript);
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Text("H".to_string()),
+                Inline::HtmlInline("<sub>".to_string()),
+                Inline::Text("2".to_string()),
+                Inline::HtmlInline("</sub>".to_string()),
+                Inline::Text("O".to_string()),
+            ])]
+        );
+
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 2,
+            },
+        );
+        editor.apply_mark(InlineMark::Subscript);
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("H2O".to_string())])]
+        );
+    }
 }

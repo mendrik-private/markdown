@@ -465,3 +465,19 @@ fn merge_text(inlines: Vec<Inline>) -> Vec<Inline> {
         merged
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips_superscript_and_subscript_html() {
+        let source = "H<sub>2</sub>O and x<sup>2</sup>";
+
+        let document = import_gfm(source);
+        let exported = export_gfm(&document);
+
+        assert_eq!(exported, source);
+        assert!(semantic_equivalent_after_roundtrip(source));
+    }
+}

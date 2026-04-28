@@ -93,6 +93,24 @@ struct StatusHit {
     action: StatusAction,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StylePopupAction {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Superscript,
+    Subscript,
+}
+
+#[derive(Clone, Debug)]
+struct StylePopupHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    action: StylePopupAction,
+}
+
 #[derive(Clone, Debug)]
 struct TabHit {
     start: u16,
@@ -207,6 +225,7 @@ struct TuiState {
     last_rendered: Option<Rendered>,
     drag_anchor: Option<(u16, u16)>,
     last_style_popup: Option<Rect>,
+    style_popup_hits: Vec<StylePopupHit>,
     explorer_mode: ExplorerMode,
     explorer_scroll: u16,
     outline_scroll: u16,
@@ -249,6 +268,7 @@ impl TuiState {
             last_rendered: None,
             drag_anchor: None,
             last_style_popup: None,
+            style_popup_hits: Vec::new(),
             explorer_mode: ExplorerMode::Nested,
             explorer_scroll: 0,
             outline_scroll: 0,
@@ -371,18 +391,6 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.app.render_options.columns = 3;
             state.message = "column mode 3".to_string();
         }
-        KeyCode::Char('-') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.preferred_column = None;
-            state.wrap_width = state.wrap_width.saturating_sub(4).max(24);
-            state.message = format!("wrap width {}", state.wrap_width);
-        }
-        KeyCode::Char('=') | KeyCode::Char('+')
-            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            state.preferred_column = None;
-            state.wrap_width = state.wrap_width.saturating_add(4).min(120);
-            state.message = format!("wrap width {}", state.wrap_width);
-        }
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.editor.undo();
             state.preferred_column = None;
@@ -400,6 +408,16 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.apply_code();
+            state.preferred_column = None;
+            state.dirty = true;
+        }
+        KeyCode::Char('.') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.app.apply_superscript();
+            state.preferred_column = None;
+            state.dirty = true;
+        }
+        KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.app.apply_subscript();
             state.preferred_column = None;
             state.dirty = true;
         }
@@ -1031,9 +1049,19 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     draw_status(frame, status_area, state, &rendered, &theme);
 
     if has_selection(state) {
-        state.last_style_popup = Some(draw_style_popover(frame, area, &theme));
+        let selection_rects = selection_rects(state, &rendered);
+        state.last_style_popup = Some(draw_style_popover(
+            frame,
+            area,
+            doc_area,
+            state.scroll,
+            &selection_rects,
+            state,
+            &theme,
+        ));
     } else {
         state.last_style_popup = None;
+        state.style_popup_hits.clear();
     }
     if state.show_help {
         draw_help(frame, area, &theme);
@@ -1616,7 +1644,7 @@ fn draw_status(
         area.y,
         right,
         &format!(
-            "  {} / {}  ctrl-1/2/3 cols  ctrl--/ctrl-= wrap  F1/? help",
+            "  {} / {}  ctrl-1/2/3 cols  drag wrap slider  F1/? help",
             row,
             rendered.lines.len().max(1)
         ),
@@ -1633,9 +1661,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let text = vec![
         Line::from("Navigation"),
         Line::from("  arrows move · Shift+arrows select · PageUp/PageDown scroll"),
-        Line::from("  Ctrl-1/2/3 columns · Ctrl--/Ctrl-= wrap width"),
+        Line::from("  Ctrl-1/2/3 columns · drag the wrap slider"),
         Line::from("Editing"),
         Line::from("  type to edit · Enter split/create · Backspace/Delete remove"),
+        Line::from("  Ctrl-B/I/E style · Ctrl-Shift-X strike · Ctrl-./, super/sub"),
         Line::from("  Ctrl-B bold · Ctrl-I italic · Ctrl-E code · Ctrl-Shift-X strike"),
         Line::from("Tables & Lists"),
         Line::from("  Tab / Shift+Tab move cells · Ctrl+Arrow add row/column"),
@@ -1671,21 +1700,42 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 }
 
-fn draw_style_popover(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect {
-    let width = area.width.min(38);
+fn draw_style_popover(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    doc_area: Rect,
+    scroll: u16,
+    selection_rects: &[mdtui_render::Rect],
+    state: &mut TuiState,
+    theme: &Theme,
+) -> Rect {
+    let chips = [
+        ("B", StylePopupAction::Bold),
+        ("I", StylePopupAction::Italic),
+        ("S", StylePopupAction::Strike),
+        ("</>", StylePopupAction::Code),
+        ("x^", StylePopupAction::Superscript),
+        ("x_", StylePopupAction::Subscript),
+    ];
+    let shortcuts = "Ctrl-B  Ctrl-I  Ctrl-Shift-X  Ctrl-E  Ctrl-.  Ctrl-,";
+    let label_row = chips
+        .iter()
+        .map(|(label, _)| format!("[{label}]"))
+        .collect::<Vec<_>>()
+        .join("  ");
+    let content_width = label_row.chars().count().max(shortcuts.chars().count());
+    let width = (content_width as u16)
+        .saturating_add(4)
+        .min(area.width.max(4));
     let height = 5;
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(width + 4),
-        y: area.y + area.height / 3,
-        width,
-        height,
-    };
+    let popup = anchored_style_popup(area, doc_area, scroll, selection_rects, width, height);
+    state.style_popup_hits.clear();
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(" B   I   S   </> "),
-            Line::from(" Ctrl-B  Ctrl-I  Ctrl-Shift-X  Ctrl-E "),
-            Line::from("              Inline Style              "),
+            Line::from(label_row.clone()),
+            Line::from(shortcuts),
+            Line::from("Inline Style"),
         ])
         .block(
             Block::default()
@@ -1701,7 +1751,74 @@ fn draw_style_popover(frame: &mut Frame<'_>, area: Rect, theme: &Theme) -> Rect 
         ),
         popup,
     );
+    let mut x = 0u16;
+    for (index, (label, action)) in chips.iter().enumerate() {
+        let chip = format!("[{label}]");
+        state.style_popup_hits.push(StylePopupHit {
+            row: 1,
+            start: x,
+            end: x.saturating_add(chip.chars().count() as u16),
+            action: *action,
+        });
+        x = x.saturating_add(chip.chars().count() as u16);
+        if index + 1 < chips.len() {
+            x = x.saturating_add(2);
+        }
+    }
     popup
+}
+
+fn anchored_style_popup(
+    area: Rect,
+    doc_area: Rect,
+    scroll: u16,
+    selection_rects: &[mdtui_render::Rect],
+    width: u16,
+    height: u16,
+) -> Rect {
+    let inner_left = doc_area.x.saturating_add(1);
+    let inner_top = doc_area.y.saturating_add(1);
+    let inner_bottom = doc_area.y.saturating_add(doc_area.height.saturating_sub(2));
+    let mut min_x: Option<u16> = None;
+    let mut max_x = 0u16;
+    let mut min_y: Option<u16> = None;
+    let mut max_y = 0u16;
+    for rect in selection_rects {
+        if rect.y < scroll {
+            continue;
+        }
+        let screen_y = inner_top.saturating_add(rect.y - scroll);
+        if screen_y < inner_top || screen_y > inner_bottom {
+            continue;
+        }
+        let screen_x = inner_left.saturating_add(rect.x);
+        min_x = Some(min_x.map_or(screen_x, |current: u16| current.min(screen_x)));
+        max_x = max_x.max(screen_x.saturating_add(rect.width.saturating_sub(1)));
+        min_y = Some(min_y.map_or(screen_y, |current: u16| current.min(screen_y)));
+        max_y = max_y.max(screen_y);
+    }
+    let default = centered(area, width.min(area.width), height.min(area.height));
+    let (Some(selection_left), Some(selection_top)) = (min_x, min_y) else {
+        return default;
+    };
+    let selection_center = selection_left.saturating_add(max_x).saturating_div(2);
+    let max_x_origin = area.x.saturating_add(area.width.saturating_sub(width));
+    let mut x = selection_center.saturating_sub(width / 2);
+    x = x.clamp(area.x, max_x_origin);
+    let above_y = selection_top.saturating_sub(height);
+    let y = if selection_top >= area.y.saturating_add(height) {
+        above_y
+    } else {
+        max_y
+            .saturating_add(1)
+            .min(area.y.saturating_add(area.height.saturating_sub(height)))
+    };
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }
 
 fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usize, theme: &Theme) {
@@ -1818,19 +1935,30 @@ fn set_code_horizontal_scroll(state: &mut TuiState, block: usize, scroll: usize)
 }
 
 fn click_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
-    if y != popup.y.saturating_add(1) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let Some(action) = state
+        .style_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action)
+    else {
         return;
-    }
-    let local_x = x.saturating_sub(popup.x.saturating_add(2));
-    match local_x {
-        0..=2 => state.app.apply_bold(),
-        4..=6 => state.app.apply_italic(),
-        8..=10 => state.app.apply_strike(),
-        12..=17 => state.app.apply_code(),
-        _ => return,
-    }
+    };
+    apply_style_popup_action(state, action);
     state.dirty = true;
-    state.message = "style applied".to_string();
+    state.message = "style toggled".to_string();
+}
+
+fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
+    match action {
+        StylePopupAction::Bold => state.app.apply_bold(),
+        StylePopupAction::Italic => state.app.apply_italic(),
+        StylePopupAction::Strike => state.app.apply_strike(),
+        StylePopupAction::Code => state.app.apply_code(),
+        StylePopupAction::Superscript => state.app.apply_superscript(),
+        StylePopupAction::Subscript => state.app.apply_subscript(),
+    }
 }
 
 fn run_explorer_action(state: &mut TuiState, action: &ExplorerAction) {
@@ -2370,7 +2498,9 @@ fn style_rendered_line(
             ),
             Span::styled(
                 format!(" {rest}"),
-                Style::default().fg(rgb(theme.text_primary)).bg(background),
+                Style::default()
+                    .fg(rgb(theme.text_secondary))
+                    .bg(background),
             ),
         ]);
     }
@@ -2422,6 +2552,9 @@ fn styled_text_spans_for_row(
     let toc_row = row_items
         .iter()
         .any(|item| matches!(item.action, Some(DisplayAction::FollowLink { .. })));
+    let blockquote_row = row_items
+        .iter()
+        .any(|item| item.kind == DisplayKind::Adornment && item.text.starts_with("▌ "));
     let numbered_row = !toc_row
         && row_items.first().is_some_and(|item| {
             item.kind == DisplayKind::Adornment && is_numbered_marker(&item.text)
@@ -2435,7 +2568,7 @@ fn styled_text_spans_for_row(
                 line_chars[cursor_x..item_x.min(line_chars.len())]
                     .iter()
                     .collect::<String>(),
-                base_document_style(theme, background, heading, numbered_row),
+                base_document_style(theme, background, heading, numbered_row, blockquote_row),
             ));
         }
         spans.extend(spans_for_display_item(
@@ -2445,13 +2578,14 @@ fn styled_text_spans_for_row(
             background,
             heading,
             numbered_row,
+            blockquote_row,
         ));
         cursor_x = item_x.saturating_add(usize::from(item.rect.width));
     }
     if cursor_x < line_chars.len() {
         spans.push(Span::styled(
             line_chars[cursor_x..].iter().collect::<String>(),
-            base_document_style(theme, background, heading, numbered_row),
+            base_document_style(theme, background, heading, numbered_row, blockquote_row),
         ));
     }
     Some(spans)
@@ -2464,15 +2598,33 @@ fn spans_for_display_item(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Vec<Span<'static>> {
+    if matches!(item.action, Some(DisplayAction::FollowLink { .. })) {
+        return toc_row_spans(&item.text, theme, background);
+    }
     if item.kind == DisplayKind::Adornment {
-        return adornment_spans(&item.text, theme, background, heading, numbered_row);
+        return adornment_spans(
+            &item.text,
+            theme,
+            background,
+            heading,
+            numbered_row,
+            blockquote_row,
+        );
     }
     let visible_len = item.text.chars().count();
     if let Some(fragments) =
         styled_fragments_for_item(item, &state.app.editor.document, visible_len)
     {
-        let mut spans = fragments_to_spans(&fragments, theme, background, heading, numbered_row);
+        let mut spans = fragments_to_spans(
+            &fragments,
+            theme,
+            background,
+            heading,
+            numbered_row,
+            blockquote_row,
+        );
         let painted = fragments
             .iter()
             .map(|fragment| fragment.text.chars().count())
@@ -2480,14 +2632,21 @@ fn spans_for_display_item(
         if painted < usize::from(item.rect.width) {
             spans.push(Span::styled(
                 " ".repeat(usize::from(item.rect.width) - painted),
-                base_document_style(theme, background, heading, numbered_row),
+                base_document_style(theme, background, heading, numbered_row, blockquote_row),
             ));
         }
         return spans;
     }
     vec![Span::styled(
         pad_width(&item.text, usize::from(item.rect.width)),
-        style_for_display_item(item, theme, background, heading, numbered_row),
+        style_for_display_item(
+            item,
+            theme,
+            background,
+            heading,
+            numbered_row,
+            blockquote_row,
+        ),
     )]
 }
 
@@ -2497,6 +2656,7 @@ fn adornment_spans(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Vec<Span<'static>> {
     if text.starts_with("▌ ") {
         return vec![
@@ -2509,7 +2669,7 @@ fn adornment_spans(
             ),
             Span::styled(
                 " ".to_string(),
-                base_document_style(theme, background, heading, numbered_row),
+                base_document_style(theme, background, heading, numbered_row, blockquote_row),
             ),
         ];
     }
@@ -2524,8 +2684,51 @@ fn adornment_spans(
     }
     vec![Span::styled(
         text.to_string(),
-        base_document_style(theme, background, heading, numbered_row),
+        base_document_style(theme, background, heading, numbered_row, blockquote_row),
     )]
+}
+
+fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'static>> {
+    let Some((head, number)) = text.rsplit_once(' ') else {
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(rgb(theme.link))
+                .bg(background)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )];
+    };
+    let Some((title, dots)) = head.rsplit_once(' ') else {
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(rgb(theme.link))
+                .bg(background)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )];
+    };
+    vec![
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(rgb(theme.accent_highlight))
+                .bg(background)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+        Span::styled(
+            format!(" {dots} "),
+            Style::default()
+                .fg(rgb(theme.text_secondary))
+                .bg(background),
+        ),
+        Span::styled(
+            number.to_string(),
+            Style::default()
+                .fg(rgb(theme.link))
+                .bg(background)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
+    ]
 }
 
 fn styled_fragments_for_item(
@@ -2756,13 +2959,21 @@ fn fragments_to_spans(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Vec<Span<'static>> {
     fragments
         .iter()
         .map(|fragment| {
             Span::styled(
                 fragment.text.clone(),
-                style_for_inline_fragment(fragment.style, theme, background, heading, numbered_row),
+                style_for_inline_fragment(
+                    fragment.style,
+                    theme,
+                    background,
+                    heading,
+                    numbered_row,
+                    blockquote_row,
+                ),
             )
         })
         .collect()
@@ -2773,10 +2984,13 @@ fn base_document_style(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Style {
     let mut style = Style::default()
         .fg(rgb(if numbered_row {
             theme.accent_highlight
+        } else if blockquote_row {
+            theme.text_secondary
         } else {
             theme.text_primary
         }))
@@ -2795,6 +3009,7 @@ fn style_for_display_item(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Style {
     if matches!(item.action, Some(DisplayAction::FollowLink { .. })) {
         return Style::default()
@@ -2802,7 +3017,7 @@ fn style_for_display_item(
             .bg(background)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     }
-    base_document_style(theme, background, heading, numbered_row)
+    base_document_style(theme, background, heading, numbered_row, blockquote_row)
 }
 
 fn style_for_inline_fragment(
@@ -2811,8 +3026,9 @@ fn style_for_inline_fragment(
     background: Color,
     heading: bool,
     numbered_row: bool,
+    blockquote_row: bool,
 ) -> Style {
-    let mut style = base_document_style(theme, background, heading, numbered_row);
+    let mut style = base_document_style(theme, background, heading, numbered_row, blockquote_row);
     if fragment.link {
         style = style.fg(rgb(theme.link)).add_modifier(Modifier::UNDERLINED);
     }
@@ -4920,5 +5136,117 @@ mod tests {
             buffer.cell((1, 1)).expect("top border cell").fg,
             rgb(theme.border)
         );
+    }
+
+    #[test]
+    fn blockquote_text_uses_muted_color() {
+        let state = TuiState::new(App::from_markdown("x.md", "> quoted"), None);
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 4,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(24, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            buffer.cell((3, 1)).expect("quote text").fg,
+            rgb(theme.text_secondary)
+        );
+    }
+
+    #[test]
+    fn toc_rows_keep_book_style_leaders_and_right_number() {
+        let state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "1. [Project identity](#project-identity)\n\n# Project identity",
+            ),
+            None,
+        );
+        let rendered = render_document(
+            &state.app.editor.document,
+            RenderOptions {
+                width: 28,
+                heading_width: 28,
+                kitty_graphics: false,
+                show_status: false,
+                ..RenderOptions::default()
+            },
+        );
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 6,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(32, 6)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(buffer.cell((19, 1)).expect("dot leader").symbol(), ".");
+        assert_eq!(buffer.cell((28, 1)).expect("page number").symbol(), "1");
+        assert_eq!(
+            buffer.cell((28, 1)).expect("page number").fg,
+            rgb(theme.link)
+        );
+    }
+
+    #[test]
+    fn style_popup_anchors_above_selection() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 30,
+        };
+        let doc_area = Rect {
+            x: 10,
+            y: 6,
+            width: 60,
+            height: 18,
+        };
+        let popup = anchored_style_popup(
+            area,
+            doc_area,
+            0,
+            &[mdtui_render::Rect {
+                x: 12,
+                y: 10,
+                width: 6,
+                height: 1,
+            }],
+            40,
+            5,
+        );
+
+        assert!(popup.y < doc_area.y + 1 + 10);
+    }
+
+    #[test]
+    fn ctrl_wrap_shortcuts_do_not_change_wrap_width() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha"), None);
+        let original = state.wrap_width;
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('-'), KeyModifiers::CONTROL),
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('='), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.wrap_width, original);
     }
 }
