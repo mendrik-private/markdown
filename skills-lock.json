@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "awesome-tui": {
+      "source": "mendrik-private/awesome-tui",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "4db8f62452bdda549646420e544319ab3b4ba60a720b1f73e3b23fee0f0a0b26"
+    }
+  }
+}

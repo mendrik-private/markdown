@@ -1,0 +1,9 @@
+[package]
+name = "mdtui-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

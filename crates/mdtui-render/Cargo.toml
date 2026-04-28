@@ -1,0 +1,10 @@
+[package]
+name = "mdtui-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mdtui-core = { path = "../mdtui-core" }
+
+[lints]
+workspace = true
