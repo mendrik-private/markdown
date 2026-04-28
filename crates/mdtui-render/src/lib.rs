@@ -67,6 +67,7 @@ impl Rendered {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderOptions {
     pub width: u16,
+    pub heading_width: u16,
     pub kitty_graphics: bool,
     pub columns: u8,
     pub show_status: bool,
@@ -76,6 +77,7 @@ impl Default for RenderOptions {
     fn default() -> Self {
         Self {
             width: 80,
+            heading_width: 0,
             kitty_graphics: false,
             columns: 1,
             show_status: true,
@@ -393,24 +395,29 @@ impl RenderContext {
 
     fn render_heading(&mut self, block_index: usize, level: u8, text: &str) {
         if matches!(level, 1 | 2) && self.options.kitty_graphics && text.is_ascii() {
+            let width = self.options.heading_width.max(self.options.width).max(8);
             self.kitty_commands.push(format!(
                 "\u{1b}_Gmdtui=headline,level={level},id={block_index}\u{1b}\\"
             ));
             let y = self.lines.len() as u16;
-            let padded = " ".repeat(usize::from(self.options.width.max(8)));
-            self.push_line(
-                padded,
-                DisplayKind::HeadlinePlacement,
-                y,
-                Some(Cursor::Text {
+            let padded = " ".repeat(usize::from(width));
+            self.display.items.push(DisplayItem {
+                kind: DisplayKind::HeadlinePlacement,
+                rect: Rect {
+                    x: 0,
+                    y,
+                    width,
+                    height: 2,
+                },
+                cursor: Some(Cursor::Text {
                     block: block_index,
                     offset: 0,
                 }),
-            );
-            if let Some(item) = self.display.items.last_mut() {
-                item.text = text.to_string();
-            }
-            self.lines.push(" ".to_string());
+                action: None,
+                text: text.to_string(),
+            });
+            self.lines.push(padded.clone());
+            self.lines.push(padded);
             return;
         }
         let display = if level == 1 {

@@ -1,6 +1,6 @@
 use mdtui_core::{AiConfig, Cursor, Direction, VersionedResult, accept_worker_result};
 use mdtui_markdown::{export_gfm, import_gfm, semantic_equivalent_after_roundtrip};
-use mdtui_render::{RenderOptions, Theme, render_document};
+use mdtui_render::{DisplayKind, RenderOptions, Theme, render_document};
 use mdtui_terminal::{
     HeadlineImageCache, ImageCache, InputEngine, InputEvent, contains_forbidden_text_sizing,
 };
@@ -473,6 +473,48 @@ fn heading_uses_kitty_graphics_when_supported() {
     };
     let rendered = render_document(&import_gfm("# Title"), opts);
     assert!(!rendered.kitty_commands.is_empty());
+}
+
+#[test]
+fn kitty_h1_h2_reserve_two_full_width_rows() {
+    for source in ["# Title", "## Subtitle"] {
+        let opts = RenderOptions {
+            width: 24,
+            kitty_graphics: true,
+            ..RenderOptions::default()
+        };
+        let rendered = render_document(&import_gfm(source), opts);
+        let slot = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| item.kind == DisplayKind::HeadlinePlacement)
+            .expect("headline slot");
+        assert_eq!(slot.rect.width, 24);
+        assert_eq!(slot.rect.height, 2);
+        assert_eq!(rendered.lines[0].chars().count(), 24);
+        assert_eq!(rendered.lines[1].chars().count(), 24);
+    }
+}
+
+#[test]
+fn kitty_h1_h2_can_span_panel_width_beyond_wrap_width() {
+    let opts = RenderOptions {
+        width: 24,
+        heading_width: 48,
+        kitty_graphics: true,
+        ..RenderOptions::default()
+    };
+    let rendered = render_document(&import_gfm("# Title"), opts);
+    let slot = rendered
+        .display
+        .items
+        .iter()
+        .find(|item| item.kind == DisplayKind::HeadlinePlacement)
+        .expect("headline slot");
+    assert_eq!(slot.rect.width, 48);
+    assert_eq!(rendered.lines[0].chars().count(), 48);
+    assert_eq!(rendered.lines[1].chars().count(), 48);
 }
 
 #[test]

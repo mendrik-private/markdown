@@ -43,7 +43,8 @@ use ratatui::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
-const HEADLINE_RASTER_VERSION: u32 = 2;
+const HEADLINE_RASTER_VERSION: u32 = 7;
+const HEADLINE_DEBUG_SLAB: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -773,11 +774,20 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .split(sidebar);
     let doc_split = Layout::default()
         .direction(LayoutDirection::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(5)])
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
         .split(doc_column);
     let tabs_area = doc_split[0];
-    let doc_area = doc_split[1];
-    state.last_tabs_area = tabs_area;
+    let doc_body_area = doc_split[1];
+    let doc_area = Rect {
+        x: doc_body_area.x,
+        y: doc_body_area.y.saturating_sub(1),
+        width: doc_body_area.width,
+        height: doc_body_area.height.saturating_add(1),
+    };
+    state.last_tabs_area = Rect {
+        height: tabs_area.height.saturating_sub(1),
+        ..tabs_area
+    };
     state.last_doc_area = doc_area;
     state.last_explorer_area = sidebar_split[0];
     state.last_outline_area = sidebar_split[1];
@@ -788,8 +798,10 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .saturating_sub(4)
         .max(24)
         .min(state.wrap_width.max(24));
+    let headline_width = doc_area.width.saturating_sub(2).max(8);
     state.app.render_options = RenderOptions {
         width: doc_inner_width,
+        heading_width: headline_width,
         kitty_graphics: state.kitty_graphics,
         show_status: false,
         ..state.app.render_options
@@ -826,7 +838,6 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         usize::from(sidebar_split[1].height.saturating_sub(2)),
     );
 
-    draw_tabs(frame, tabs_area, state, &theme);
     draw_explorer(
         frame,
         sidebar_split[0],
@@ -842,6 +853,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         &theme,
     );
     draw_document(frame, doc_area, state, &rendered, &theme);
+    draw_tabs(frame, tabs_area, state, &theme);
     draw_status(frame, status_area, state, &rendered, &theme);
 
     if has_selection(state) {
@@ -876,6 +888,8 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
     let top_y = area.y;
     let label_y = area.y + if area.height > 1 { 1 } else { 0 };
     let roof = area.height >= 2;
+    let join_y = area.y + area.height.saturating_sub(1);
+    let join = area.height >= 3;
     let right = area.x.saturating_add(area.width);
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(rgb(theme.app_bg)));
@@ -963,6 +977,40 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
         put(buf, &mut x, label_y, right, " ", fill);
         put(buf, &mut x, label_y, right, "│", border);
 
+        if active && join {
+            let mut join_x = start_x;
+            put(
+                buf,
+                &mut join_x,
+                join_y,
+                right,
+                if start_x == area.x { "│" } else { "┘" },
+                border,
+            );
+            if width > 2 {
+                put(
+                    buf,
+                    &mut join_x,
+                    join_y,
+                    right,
+                    &" ".repeat((width - 2) as usize),
+                    fill,
+                );
+            }
+            put(
+                buf,
+                &mut join_x,
+                join_y,
+                right,
+                if start_x.saturating_add(width) >= right {
+                    "│"
+                } else {
+                    "└"
+                },
+                border,
+            );
+        }
+
         x = start_x.saturating_add(width);
     }
 
@@ -1043,6 +1091,21 @@ fn draw_document(
     rendered: &Rendered,
     theme: &Theme,
 ) {
+    let headline_debug_rows = if HEADLINE_DEBUG_SLAB {
+        rendered
+            .display
+            .items
+            .iter()
+            .filter(|item| item.kind == DisplayKind::HeadlinePlacement)
+            .flat_map(|item| {
+                (item.rect.y..item.rect.y.saturating_add(item.rect.height))
+                    .map(usize::from)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let current_y =
         cursor_position(&state.app.editor.cursor, &rendered.display.items).map(|(_, y)| y);
     let selection_range = selection_line_range(state, rendered);
@@ -1051,15 +1114,24 @@ fn draw_document(
         .iter()
         .enumerate()
         .scan(false, |in_code, (index, line)| {
-            Some(style_rendered_line(
-                index,
-                line,
-                rendered.lines.get(index + 1).map(String::as_str),
-                in_code,
-                theme,
-                current_y,
-                selection_range,
-            ))
+            if headline_debug_rows.contains(&index) {
+                Some(Line::from(Span::styled(
+                    "▒".repeat(line.chars().count().max(1)),
+                    Style::default()
+                        .fg(rgb(theme.text_secondary))
+                        .bg(rgb(theme.app_bg)),
+                )))
+            } else {
+                Some(style_rendered_line(
+                    index,
+                    line,
+                    rendered.lines.get(index + 1).map(String::as_str),
+                    in_code,
+                    theme,
+                    current_y,
+                    selection_range,
+                ))
+            }
         })
         .collect::<Vec<_>>();
 
@@ -2274,7 +2346,7 @@ fn nearest_cursor_on_row(x: u16, y: u16, items: &[mdtui_render::DisplayItem]) ->
 }
 
 fn emit_kitty_headlines<W: Write>(writer: &mut W, state: &mut TuiState) -> io::Result<()> {
-    if !state.kitty_graphics {
+    if !state.kitty_graphics || HEADLINE_DEBUG_SLAB {
         return Ok(());
     }
     let Some(rendered) = state.last_rendered.clone() else {
@@ -2303,12 +2375,14 @@ fn visible_headline_commands(
     state: &mut TuiState,
 ) -> io::Result<Vec<String>> {
     let viewport_rows = area.height.saturating_sub(2);
+    let viewport_end = scroll.saturating_add(viewport_rows);
     let mut out = Vec::new();
     for item in &rendered.display.items {
         if item.kind != DisplayKind::HeadlinePlacement {
             continue;
         }
-        if item.rect.y < scroll || item.rect.y >= scroll.saturating_add(viewport_rows) {
+        let rows = item.rect.height.max(2);
+        if item.rect.y < scroll || item.rect.y.saturating_add(rows) > viewport_end {
             continue;
         }
         let text = item.text.trim();
@@ -2316,22 +2390,23 @@ fn visible_headline_commands(
             continue;
         }
         let cols = item.rect.width.max(8);
-        let key = format!("{HEADLINE_RASTER_VERSION}:{text}:{cols}");
+        let level = headline_level(state, item);
+        let key = format!("{HEADLINE_RASTER_VERSION}:{level}:{text}:{cols}:{rows}");
         let png = if let Some(bytes) = state.headline_png_cache.get(&key) {
             bytes.clone()
         } else {
-            request_headline_raster(state, key.clone(), text.to_string(), cols, 2);
+            request_headline_raster(state, key.clone(), text.to_string(), level, cols, rows);
             continue;
         };
         let row = area
             .y
             .saturating_add(1)
             .saturating_add(item.rect.y.saturating_sub(scroll))
-            + 1;
+            + 2;
         let col = area.x.saturating_add(1).saturating_add(item.rect.x) + 1;
         out.push(format!(
             "\u{1b}[{row};{col}H{}",
-            kitty_png_apc(&png, cols, 2)
+            kitty_png_apc(&png, cols, rows)
         ));
     }
     Ok(out)
@@ -2361,24 +2436,33 @@ fn kitty_png_apc(png: &[u8], cols: u16, rows: u16) -> String {
     chunks
 }
 
-fn request_headline_raster(state: &mut TuiState, key: String, text: String, cols: u16, rows: u16) {
+fn request_headline_raster(
+    state: &mut TuiState,
+    key: String,
+    text: String,
+    level: u8,
+    cols: u16,
+    rows: u16,
+) {
     if state.headline_png_cache.contains_key(&key) || state.pending_headline_jobs.contains(&key) {
         return;
     }
     state.pending_headline_jobs.insert(key.clone());
     let tx = state.headline_raster_tx.clone();
     thread::spawn(move || {
-        let _ = tx.send((key, headline_png(&text, cols, rows)));
+        let _ = tx.send((key, headline_png(&text, level, cols, rows)));
     });
 }
 
-fn headline_png(text: &str, cols: u16, rows: u16) -> io::Result<Vec<u8>> {
+fn headline_png(text: &str, level: u8, cols: u16, rows: u16) -> io::Result<Vec<u8>> {
     let cell_w = 16u32;
     let cell_h = 32u32;
     let width = u32::from(cols.max(8)) * cell_w;
     let height = u32::from(rows).max(2) * cell_h;
     let mut img = RgbaImage::from_pixel(width, height, Rgba([15, 12, 8, 255]));
-    if draw_headline_font(&mut img, text).is_err() {
+    if HEADLINE_DEBUG_SLAB {
+        draw_headline_debug_slab(&mut img, cols, rows);
+    } else if draw_headline_font(&mut img, text, level).is_err() {
         let fg = Rgba([230, 168, 90, 255]);
         let glow = Rgba([216, 154, 74, 110]);
         let shadow = Rgba([42, 24, 15, 180]);
@@ -2411,23 +2495,20 @@ fn headline_png(text: &str, cols: u16, rows: u16) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn draw_headline_font(image: &mut RgbaImage, text: &str) -> io::Result<()> {
-    let font = load_headline_font()?;
-    let mut layout = FontLayout::new(CoordinateSystem::PositiveYDown);
-    let size = (image.height() as f32 * 0.82).max(20.0);
-    layout.reset(&LayoutSettings {
-        x: 12.0,
-        y: 0.0,
-        max_width: Some(image.width().saturating_sub(18) as f32),
-        max_height: Some(image.height() as f32),
-        ..LayoutSettings::default()
-    });
-    layout.append(&[&font], &TextStyle::new(text, size, 0));
-    if layout.glyphs().is_empty() {
-        return Err(io::Error::other("no glyphs laid out"));
+fn draw_headline_font(image: &mut RgbaImage, text: &str, level: u8) -> io::Result<()> {
+    if text.is_empty() {
+        return Err(io::Error::other("empty headline"));
     }
-    let (min_y, max_y) = headline_bounds(&font, &layout)?;
-    let offset_y = ((image.height() as f32 - (max_y - min_y)) / 2.0 - min_y).round() as i32;
+    let font = load_headline_font()?;
+    let (layout, bounds) = fit_headline_layout(&font, text, level, image.width(), image.height())?;
+    let offset_x = (-bounds.min_x).round() as i32;
+    let optical_bias = match level {
+        1 => (image.height() as f32 * 0.14).round() as i32,
+        2 => (image.height() as f32 * 0.10).round() as i32,
+        _ => (image.height() as f32 * 0.10).round() as i32,
+    };
+    let offset_y = ((image.height() as f32 - bounds.height()) / 2.0 - bounds.min_y).round() as i32
+        + optical_bias;
     let shadow = Rgba([44, 28, 12, 96]);
     let top = Rgba([255, 220, 160, 255]);
     let bottom = Rgba([217, 138, 82, 255]);
@@ -2435,7 +2516,7 @@ fn draw_headline_font(image: &mut RgbaImage, text: &str) -> io::Result<()> {
         let (metrics, bitmap) = font.rasterize_config(glyph.key);
         paint_alpha_bitmap(
             image,
-            glyph.x as i32 + 1,
+            glyph.x as i32 + offset_x + 1,
             glyph.y as i32 + offset_y + 1,
             metrics.width,
             metrics.height,
@@ -2444,7 +2525,7 @@ fn draw_headline_font(image: &mut RgbaImage, text: &str) -> io::Result<()> {
         );
         paint_alpha_bitmap_gradient(
             image,
-            glyph.x as i32,
+            glyph.x as i32 + offset_x,
             glyph.y as i32 + offset_y,
             metrics.width,
             metrics.height,
@@ -2455,21 +2536,87 @@ fn draw_headline_font(image: &mut RgbaImage, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn headline_bounds(font: &Font, layout: &FontLayout) -> io::Result<(f32, f32)> {
+struct HeadlineBounds {
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+}
+
+impl HeadlineBounds {
+    fn width(&self) -> f32 {
+        self.max_x - self.min_x
+    }
+
+    fn height(&self) -> f32 {
+        self.max_y - self.min_y
+    }
+}
+
+fn fit_headline_layout(
+    font: &Font,
+    text: &str,
+    level: u8,
+    image_width: u32,
+    image_height: u32,
+) -> io::Result<(FontLayout, HeadlineBounds)> {
+    let target_height = match level {
+        1 => image_height.saturating_sub(4) as f32,
+        2 => (image_height as f32 * 0.75).round(),
+        _ => (image_height as f32 * 0.75).round(),
+    };
+    let mut size = match level {
+        1 => image_height as f32 * 1.15,
+        2 => image_height as f32 * 0.92,
+        _ => image_height as f32 * 0.92,
+    };
+    let mut best: Option<(FontLayout, HeadlineBounds)> = None;
+    for _ in 0..18 {
+        let mut layout = FontLayout::new(CoordinateSystem::PositiveYDown);
+        layout.reset(&LayoutSettings {
+            x: 0.0,
+            y: 0.0,
+            max_width: Some(image_width as f32),
+            max_height: Some(image_height as f32),
+            ..LayoutSettings::default()
+        });
+        layout.append(&[font], &TextStyle::new(text, size, 0));
+        let bounds = headline_bounds(font, &layout)?;
+        let fits_height = bounds.height() <= target_height;
+        let fits_width = bounds.width() <= image_width as f32;
+        best = Some((layout, bounds));
+        if fits_height && fits_width {
+            break;
+        }
+        size *= 0.92;
+    }
+    best.ok_or_else(|| io::Error::other("unable to fit headline layout"))
+}
+
+fn headline_bounds(font: &Font, layout: &FontLayout) -> io::Result<HeadlineBounds> {
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
     let mut min_y = f32::MAX;
     let mut max_y = f32::MIN;
     for glyph in layout.glyphs() {
         let (metrics, _) = font.rasterize_config(glyph.key);
-        if metrics.height == 0 {
+        if metrics.width == 0 || metrics.height == 0 {
             continue;
         }
+        min_x = min_x.min(glyph.x);
+        max_x = max_x.max(glyph.x + metrics.width as f32);
         min_y = min_y.min(glyph.y);
         max_y = max_y.max(glyph.y + metrics.height as f32);
     }
-    if min_y == f32::MAX || max_y == f32::MIN {
+    if min_x == f32::MAX || max_x == f32::MIN || min_y == f32::MAX || max_y == f32::MIN {
         return Err(io::Error::other("no visible headline glyph bounds"));
     }
-    Ok((min_y, max_y))
+    Ok(HeadlineBounds {
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    })
 }
 
 fn load_headline_font() -> io::Result<Font> {
@@ -2603,6 +2750,26 @@ fn draw_glyph(image: &mut RgbaImage, glyph: [u8; 8], x: u32, y: u32, scale: u32,
     }
 }
 
+fn draw_headline_debug_slab(image: &mut RgbaImage, cols: u16, rows: u16) {
+    let glyph = font8x8::BASIC_FONTS
+        .get('▒')
+        .or_else(|| font8x8::BASIC_FONTS.get('#'))
+        .unwrap_or([0b0101_0101; 8]);
+    let fg = Rgba([198, 176, 140, 255]);
+    let cell_w = image.width() / u32::from(cols.max(1));
+    let cell_h = image.height() / u32::from(rows.max(1));
+    let scale = (cell_w / 8).max(1).min((cell_h / 8).max(1));
+    let glyph_w = 8 * scale;
+    let glyph_h = 8 * scale;
+    for row in 0..rows.max(1) {
+        for col in 0..cols.max(1) {
+            let x = u32::from(col) * cell_w + cell_w.saturating_sub(glyph_w) / 2;
+            let y = u32::from(row) * cell_h + cell_h.saturating_sub(glyph_h) / 2;
+            draw_glyph(image, glyph, x, y, scale, fg);
+        }
+    }
+}
+
 fn detect_kitty_support() -> bool {
     env::var("KITTY_WINDOW_ID").is_ok()
         || env::var("TERM")
@@ -2653,6 +2820,16 @@ fn cursor_block(cursor: Cursor) -> usize {
         Cursor::ListItem { block, .. } => block,
         Cursor::TableCell { block, .. } => block,
         Cursor::Checkbox { block, .. } => block,
+    }
+}
+
+fn headline_level(state: &TuiState, item: &mdtui_render::DisplayItem) -> u8 {
+    let Some(cursor) = item.cursor else {
+        return 1;
+    };
+    match state.app.editor.document.blocks.get(cursor_block(cursor)) {
+        Some(DocBlock::Heading { level, .. }) => *level,
+        _ => 1,
     }
 }
 
