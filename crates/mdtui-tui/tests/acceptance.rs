@@ -758,23 +758,35 @@ fn internal_link_lists_render_as_toc_rows() {
 }
 
 #[test]
-fn two_column_mode_balances_paragraph_blocks() {
+fn two_column_mode_only_applies_to_long_text_blocks() {
     let opts = RenderOptions {
         columns: 2,
+        width: 64,
         ..RenderOptions::default()
     };
-    let rendered = render_document(&import_gfm("one\n\ntwo\n\nthree\n\nfour"), opts).text();
-    assert!(rendered.contains(" │ "));
+    let source = "# Title\n\nThis paragraph contains enough prose to split into two balanced columns with multiple wrapped lines in each column for a calmer newspaper rhythm. It keeps going with extra sentences so both columns hold enough visible lines to qualify for the balanced layout gate instead of collapsing back to a single ragged block.\n\n- list item stays full width";
+    let rendered = render_document(&import_gfm(source), opts).text();
+    assert!(rendered.lines().any(|line| line.contains(" │ ")));
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.starts_with("- [") || line.starts_with("• "))
+    );
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.trim() == "Title" || line.trim() == "TITLE")
+    );
 }
 
 #[test]
-fn three_column_mode_balances_with_hyphenation() {
+fn short_text_blocks_stay_single_column_even_when_columns_selected() {
     let opts = RenderOptions {
         columns: 3,
         ..RenderOptions::default()
     };
-    let rendered = render_document(&import_gfm("one\n\ntwo\n\nthree"), opts).text();
-    assert!(rendered.contains(" │ "));
+    let rendered = render_document(&import_gfm("Short paragraph only."), opts).text();
+    assert!(!rendered.contains(" │ "));
 }
 
 #[test]
@@ -785,6 +797,29 @@ fn h1_h2_span_columns_by_default() {
     };
     let rendered = render_document(&import_gfm("# Title\n\nbody"), opts).text();
     assert!(rendered.contains("Title") || rendered.contains("TITLE"));
+}
+
+#[test]
+fn hyphenation_inserts_visual_breaks_for_long_english_words() {
+    let opts = RenderOptions {
+        width: 12,
+        ..RenderOptions::default()
+    };
+    let source = "Hyphenation makes representation considerably prettier in narrow paragraphs.";
+    let rendered = render_document(&import_gfm(source), opts).text();
+    assert!(rendered.contains("-\n"));
+}
+
+#[test]
+fn lower_headlines_use_custom_rule_glyphs() {
+    let rendered = render_document(
+        &import_gfm("### Three\n\n#### Four\n\n##### Five\n\n###### Six"),
+        RenderOptions::default(),
+    )
+    .text();
+    assert!(rendered.contains("🬂🬂🬂"));
+    assert!(rendered.contains("🭶🭶🭶"));
+    assert!(rendered.contains("‾‾‾"));
 }
 
 #[test]

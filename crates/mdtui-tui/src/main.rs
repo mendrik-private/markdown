@@ -103,12 +103,43 @@ enum StylePopupAction {
     Subscript,
 }
 
+impl StylePopupAction {
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Bold => "Ctrl+B",
+            Self::Italic => "Ctrl+I",
+            Self::Strike => "Ctrl+Shift+X",
+            Self::Code => "Ctrl+E",
+            Self::Superscript => "Ctrl+.",
+            Self::Subscript => "Ctrl+,",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bold => "Bold",
+            Self::Italic => "Italic",
+            Self::Strike => "Strike",
+            Self::Code => "Code",
+            Self::Superscript => "Superscript",
+            Self::Subscript => "Subscript",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StylePopupHit {
     row: u16,
     start: u16,
     end: u16,
     action: StylePopupAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderCacheKey {
+    version: u64,
+    options: RenderOptions,
+    active_block: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -223,9 +254,12 @@ struct TuiState {
     last_outline_area: Rect,
     last_status_area: Rect,
     last_rendered: Option<Rendered>,
+    last_render_key: Option<RenderCacheKey>,
     drag_anchor: Option<(u16, u16)>,
     last_style_popup: Option<Rect>,
     style_popup_hits: Vec<StylePopupHit>,
+    style_popup_selected: StylePopupAction,
+    style_popup_hover: Option<StylePopupAction>,
     explorer_mode: ExplorerMode,
     explorer_scroll: u16,
     outline_scroll: u16,
@@ -266,9 +300,12 @@ impl TuiState {
             last_outline_area: Rect::default(),
             last_status_area: Rect::default(),
             last_rendered: None,
+            last_render_key: None,
             drag_anchor: None,
             last_style_popup: None,
             style_popup_hits: Vec::new(),
+            style_popup_selected: StylePopupAction::Bold,
+            style_popup_hover: None,
             explorer_mode: ExplorerMode::Nested,
             explorer_scroll: 0,
             outline_scroll: 0,
@@ -371,6 +408,28 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             _ => {}
         }
         return false;
+    }
+
+    if has_selection(state) && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Left => {
+                step_style_popup_selection(state, -1);
+                state.style_popup_hover = None;
+                return false;
+            }
+            KeyCode::Right => {
+                step_style_popup_selection(state, 1);
+                state.style_popup_hover = None;
+                return false;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                apply_style_popup_action(state, active_style_popup_action(state));
+                state.dirty = true;
+                state.message = "style toggled".to_string();
+                return false;
+            }
+            _ => {}
+        }
     }
 
     match key.code {
@@ -603,16 +662,29 @@ fn ensure_cursor_visible(state: &mut TuiState) {
 }
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
+    if state.last_style_popup.is_some()
+        && !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left))
+        && state.style_popup_hover.is_some()
+    {
+        state.style_popup_hover = None;
+    }
     if let Some(popup) = state.last_style_popup
         && mouse.column >= popup.x
         && mouse.column < popup.x.saturating_add(popup.width)
         && mouse.row >= popup.y
         && mouse.row < popup.y.saturating_add(popup.height)
     {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            click_style_popup(state, popup, mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => click_style_popup(state, popup, mouse.column, mouse.row),
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                hover_style_popup(state, popup, mouse.column, mouse.row);
+            }
+            _ => {}
         }
         return;
+    }
+    if state.style_popup_hover.take().is_some() {
+        state.dirty = true;
     }
 
     if let Some(track) = state.wrap_slider_drag {
@@ -995,9 +1067,25 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         show_status: false,
         ..state.app.render_options.clone()
     };
-    let mut rendered =
-        render_document(&state.app.editor.document, state.app.render_options.clone());
-    materialize_active_headline_fallback(state, &mut rendered);
+    let render_key = RenderCacheKey {
+        version: state.app.editor.document.version,
+        options: state.app.render_options.clone(),
+        active_block: cursor_block(state.app.editor.cursor),
+    };
+    let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
+        state.last_rendered.clone().unwrap_or_else(|| {
+            let mut rendered =
+                render_document(&state.app.editor.document, state.app.render_options.clone());
+            materialize_active_headline_fallback(state, &mut rendered);
+            rendered
+        })
+    } else {
+        let mut rendered = render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(state, &mut rendered);
+        state.last_render_key = Some(render_key);
+        state.last_rendered = Some(rendered.clone());
+        rendered
+    };
     let viewport = usize::from(doc_area.height.saturating_sub(2));
     let max_scroll = rendered.lines.len().saturating_sub(viewport);
     state.scroll = state.scroll.min(max_scroll as u16);
@@ -3319,7 +3407,10 @@ fn apply_selection_highlight(
 }
 
 fn is_heading_rule(line: &str) -> bool {
-    !line.is_empty() && line.chars().all(|ch| ch == '═' || ch == '─')
+    !line.is_empty()
+        && line
+            .chars()
+            .all(|ch| matches!(ch, '═' | '─' | '🬂' | '🭶' | '‾'))
 }
 
 fn style_code_header(line: &str, theme: &Theme) -> Line<'static> {
@@ -3338,7 +3429,7 @@ fn style_code_toolbar(line: &str, theme: &Theme) -> Line<'static> {
             "copy".to_string(),
             Style::default()
                 .fg(rgb(theme.link))
-                .bg(rgb(theme.app_bg))
+                .bg(rgb(theme.panel_bg))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(after.to_string(), code_border(theme)),
@@ -4440,11 +4531,15 @@ fn rgb(hex: &str) -> Color {
 }
 
 fn code_border(theme: &Theme) -> Style {
-    Style::default().fg(rgb(theme.border)).bg(rgb(theme.app_bg))
+    Style::default()
+        .fg(rgb(theme.border))
+        .bg(rgb(theme.panel_bg))
 }
 
 fn code_gutter_border(theme: &Theme) -> Style {
-    Style::default().fg(rgb(theme.border)).bg(rgb(theme.app_bg))
+    Style::default()
+        .fg(rgb(theme.border))
+        .bg(rgb(theme.panel_bg))
 }
 
 fn code_gutter_divider(theme: &Theme) -> Style {
@@ -5130,7 +5225,7 @@ mod tests {
 
         assert_eq!(
             buffer.cell((1, 1)).expect("top border cell").bg,
-            rgb(theme.app_bg)
+            rgb(theme.panel_bg)
         );
         assert_eq!(
             buffer.cell((1, 1)).expect("top border cell").fg,

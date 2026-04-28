@@ -1,7 +1,11 @@
+use std::sync::OnceLock;
+
+use hyphenation::{Hyphenator, Language, Load, Standard};
 use mdtui_core::{
     Block, Cursor, Document, Editor, Inline, List, ListItem, Selection, Table, UiFocus, char_len,
-    inline_text,
+    inline_text, split_chars,
 };
+use whatlang::{Lang, detect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -145,14 +149,10 @@ impl Theme {
 
 pub fn render_document(document: &Document, options: RenderOptions) -> Rendered {
     let mut ctx = RenderContext::new(options.clone(), heading_targets(document));
-    if options.columns > 1 {
-        ctx.render_columns(document);
-    } else {
-        for (block_index, block) in document.blocks.iter().enumerate() {
-            ctx.render_block(block_index, block);
-            if block_index + 1 < document.blocks.len() {
-                ctx.lines.push(String::new());
-            }
+    for (block_index, block) in document.blocks.iter().enumerate() {
+        ctx.render_block(block_index, block);
+        if block_index + 1 < document.blocks.len() {
+            ctx.lines.push(String::new());
         }
     }
     Rendered {
@@ -327,6 +327,13 @@ struct TocEntry {
     title: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WrappedTextLine {
+    text: String,
+    offset: usize,
+    hyphenated: bool,
+}
+
 impl RenderContext {
     fn new(options: RenderOptions, heading_targets: Vec<HeadingTarget>) -> Self {
         Self {
@@ -335,26 +342,6 @@ impl RenderContext {
             lines: Vec::new(),
             display: DisplayList::default(),
             kitty_commands: Vec::new(),
-        }
-    }
-
-    fn render_columns(&mut self, document: &Document) {
-        let sep = " │ ";
-        let prose: Vec<String> = document
-            .blocks
-            .iter()
-            .map(Block::rendered_text)
-            .filter(|text| !text.is_empty())
-            .collect();
-        let columns = usize::from(self.options.columns.max(1));
-        let per_col = prose.len().div_ceil(columns).max(1);
-        for row in 0..per_col {
-            let mut parts = Vec::new();
-            for col in 0..columns {
-                let index = col * per_col + row;
-                parts.push(prose.get(index).cloned().unwrap_or_default());
-            }
-            self.lines.push(parts.join(sep));
         }
     }
 
@@ -395,23 +382,112 @@ impl RenderContext {
     }
 
     fn render_text_block(&mut self, block_index: usize, text: String) {
-        let mut offset = 0usize;
-        let wrapped = wrap(&text, self.options.width.max(1));
-        for (index, part) in wrapped.iter().enumerate() {
+        let columns = usize::from(self.options.columns.max(1));
+        if columns > 1
+            && let Some((wrapped, column_width, column_height)) =
+                text_columns(&text, self.options.width.max(1), columns)
+        {
+            self.render_text_columns(block_index, &wrapped, column_width, column_height);
+            return;
+        }
+        let wrapped = wrap_text_block(&text, self.options.width.max(1));
+        self.render_wrapped_text_block(block_index, &wrapped);
+    }
+
+    fn render_wrapped_text_block(&mut self, block_index: usize, wrapped: &[WrappedTextLine]) {
+        for line in wrapped {
             let y = self.lines.len() as u16;
             self.push_line(
-                part.clone(),
+                line.text.clone(),
                 DisplayKind::TextRun,
                 y,
                 Some(Cursor::Text {
                     block: block_index,
-                    offset,
+                    offset: line.offset,
                 }),
             );
-            offset += part.chars().count();
-            if index + 1 < wrapped.len() {
-                offset += 1;
+            if line.hyphenated {
+                let hyphen_x = line.text.chars().count() as u16;
+                self.display.items.push(DisplayItem {
+                    kind: DisplayKind::Adornment,
+                    rect: Rect {
+                        x: hyphen_x,
+                        y,
+                        width: 1,
+                        height: 1,
+                    },
+                    cursor: None,
+                    action: None,
+                    text: "-".to_string(),
+                });
+                if let Some(rendered) = self.lines.last_mut() {
+                    rendered.push('-');
+                }
             }
+        }
+    }
+
+    fn render_text_columns(
+        &mut self,
+        block_index: usize,
+        wrapped: &[WrappedTextLine],
+        column_width: usize,
+        column_height: usize,
+    ) {
+        let columns = usize::from(self.options.columns.max(1));
+        let sep = " │ ";
+        let sep_width = char_len(sep);
+        for row in 0..column_height {
+            let y = self.lines.len() as u16;
+            let mut line = String::new();
+            for col in 0..columns {
+                if col > 0 {
+                    line.push_str(sep);
+                }
+                let x = (col * (column_width + sep_width)) as u16;
+                let index = col * column_height + row;
+                if let Some(part) = wrapped.get(index) {
+                    self.display.items.push(DisplayItem {
+                        kind: DisplayKind::TextRun,
+                        rect: Rect {
+                            x,
+                            y,
+                            width: part.text.chars().count() as u16,
+                            height: 1,
+                        },
+                        cursor: Some(Cursor::Text {
+                            block: block_index,
+                            offset: part.offset,
+                        }),
+                        action: None,
+                        text: part.text.clone(),
+                    });
+                    line.push_str(&part.text);
+                    if part.hyphenated {
+                        self.display.items.push(DisplayItem {
+                            kind: DisplayKind::Adornment,
+                            rect: Rect {
+                                x: x + part.text.chars().count() as u16,
+                                y,
+                                width: 1,
+                                height: 1,
+                            },
+                            cursor: None,
+                            action: None,
+                            text: "-".to_string(),
+                        });
+                        line.push('-');
+                    }
+                    let fill = column_width
+                        .saturating_sub(char_len(&part.text) + if part.hyphenated { 1 } else { 0 });
+                    if fill > 0 {
+                        line.push_str(&" ".repeat(fill));
+                    }
+                } else {
+                    line.push_str(&" ".repeat(column_width));
+                }
+            }
+            self.lines.push(line);
         }
     }
 
@@ -504,9 +580,7 @@ impl RenderContext {
                 offset: 0,
             }),
         );
-        let rule = if level == 1 { '═' } else { '─' };
-        self.lines
-            .push(rule.to_string().repeat(char_len(text).max(1)));
+        self.lines.push(heading_rule(level, text));
     }
 
     fn render_list(&mut self, block_index: usize, list: &List) {
@@ -995,9 +1069,9 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
     let mut current = String::new();
     for word in text.split_whitespace() {
         let needed = if current.is_empty() {
-            word.len()
+            char_len(word)
         } else {
-            current.len() + 1 + word.len()
+            char_len(&current) + 1 + char_len(word)
         };
         if needed > width && !current.is_empty() {
             lines.push(current);
@@ -1017,6 +1091,277 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
     } else {
         lines
     }
+}
+
+fn wrap_text_block(text: &str, width: u16) -> Vec<WrappedTextLine> {
+    let width = usize::from(width.max(1));
+    if text.is_empty() {
+        return vec![WrappedTextLine {
+            text: String::new(),
+            offset: 0,
+            hyphenated: false,
+        }];
+    }
+    let tokens = normalized_word_tokens(text);
+    if tokens.is_empty() {
+        return vec![WrappedTextLine {
+            text: text.to_string(),
+            offset: 0,
+            hyphenated: false,
+        }];
+    }
+    let hyphenator = detected_hyphenator(text);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_offset = 0usize;
+
+    for token in tokens {
+        let mut remaining = token.text.clone();
+        let mut remaining_offset = token.start;
+        loop {
+            let prefix_space = if current.is_empty() { 0 } else { 1 };
+            let available = width.saturating_sub(char_len(&current) + prefix_space);
+            let remaining_len = char_len(&remaining);
+            if remaining_len <= available {
+                if current.is_empty() {
+                    current_offset = remaining_offset;
+                    current.push_str(&remaining);
+                } else {
+                    current.push(' ');
+                    current.push_str(&remaining);
+                }
+                break;
+            }
+
+            if available > 1
+                && let Some((prefix, consumed_chars)) =
+                    hyphenated_prefix(&remaining, available - 1, hyphenator)
+            {
+                if current.is_empty() {
+                    current_offset = remaining_offset;
+                    current.push_str(&prefix);
+                } else {
+                    current.push(' ');
+                    current.push_str(&prefix);
+                }
+                lines.push(WrappedTextLine {
+                    text: current,
+                    offset: current_offset,
+                    hyphenated: true,
+                });
+                current = String::new();
+                remaining = split_chars(&remaining, consumed_chars).1;
+                remaining_offset += consumed_chars;
+                continue;
+            }
+
+            if !current.is_empty() {
+                lines.push(WrappedTextLine {
+                    text: current,
+                    offset: current_offset,
+                    hyphenated: false,
+                });
+                current = String::new();
+                continue;
+            }
+
+            let take = width.saturating_sub(1).max(1).min(remaining_len);
+            let (prefix, suffix) = split_chars(&remaining, take);
+            current_offset = remaining_offset;
+            if suffix.is_empty() {
+                current.push_str(&prefix);
+                break;
+            }
+            lines.push(WrappedTextLine {
+                text: prefix,
+                offset: current_offset,
+                hyphenated: true,
+            });
+            remaining = suffix;
+            remaining_offset += take;
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(WrappedTextLine {
+            text: current,
+            offset: current_offset,
+            hyphenated: false,
+        });
+    }
+    if lines.is_empty() {
+        vec![WrappedTextLine {
+            text: text.to_string(),
+            offset: 0,
+            hyphenated: false,
+        }]
+    } else {
+        lines
+    }
+}
+
+fn text_columns(
+    text: &str,
+    width: u16,
+    columns: usize,
+) -> Option<(Vec<WrappedTextLine>, usize, usize)> {
+    if columns <= 1 {
+        return None;
+    }
+    let total_width = usize::from(width);
+    let sep_width = char_len(" │ ");
+    let available = total_width.checked_sub(sep_width * columns.saturating_sub(1))?;
+    let column_width = available / columns;
+    if column_width < 16 {
+        return None;
+    }
+    let wrapped = wrap_text_block(text, column_width as u16);
+    if !column_layout_is_balanced(wrapped.len(), columns) {
+        return None;
+    }
+    let column_height = wrapped.len().div_ceil(columns);
+    Some((wrapped, column_width, column_height))
+}
+
+fn column_layout_is_balanced(total_lines: usize, columns: usize) -> bool {
+    if columns <= 1 || total_lines == 0 {
+        return false;
+    }
+    let column_height = total_lines.div_ceil(columns);
+    if column_height < 4 {
+        return false;
+    }
+    let trailing = total_lines % column_height;
+    trailing == 0 || trailing + 2 >= column_height
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WordToken {
+    text: String,
+    start: usize,
+}
+
+fn normalized_word_tokens(text: &str) -> Vec<WordToken> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for word in text.split_whitespace() {
+        out.push(WordToken {
+            text: word.to_string(),
+            start: offset,
+        });
+        offset += char_len(word) + 1;
+    }
+    out
+}
+
+fn heading_rule(level: u8, text: &str) -> String {
+    let rule = match level {
+        1 => '═',
+        2 => '─',
+        3 => '🬂',
+        4 => '🭶',
+        _ => '‾',
+    };
+    rule.to_string().repeat(char_len(text).max(1))
+}
+
+fn hyphenated_prefix(
+    word: &str,
+    max_chars: usize,
+    hyphenator: Option<&'static Standard>,
+) -> Option<(String, usize)> {
+    let hyphenator = hyphenator?;
+    let mut prefix = String::new();
+    let mut consumed_chars = 0usize;
+    let total_chars = char_len(word);
+    let mut best = None;
+    for segment in hyphenator.hyphenate(word).into_iter().segments() {
+        let segment_chars = char_len(segment);
+        if consumed_chars + segment_chars > max_chars {
+            break;
+        }
+        prefix.push_str(segment);
+        consumed_chars += segment_chars;
+        if consumed_chars < total_chars {
+            best = Some((prefix.clone(), consumed_chars));
+        }
+    }
+    best
+}
+
+fn detected_hyphenator(text: &str) -> Option<&'static Standard> {
+    detect(text)
+        .filter(|info| info.is_reliable())
+        .and_then(|info| hyphenator_for_lang(info.lang()))
+}
+
+fn hyphenator_for_lang(lang: Lang) -> Option<&'static Standard> {
+    match lang {
+        Lang::Eng => english_us_hyphenator(),
+        Lang::Fra => french_hyphenator(),
+        Lang::Deu => german_hyphenator(),
+        Lang::Spa => spanish_hyphenator(),
+        Lang::Por => portuguese_hyphenator(),
+        Lang::Ita => italian_hyphenator(),
+        Lang::Nld => dutch_hyphenator(),
+        Lang::Pol => polish_hyphenator(),
+        Lang::Rus => russian_hyphenator(),
+        _ => None,
+    }
+}
+
+fn english_us_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::EnglishUS).ok())
+        .as_ref()
+}
+
+fn french_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::French).ok())
+        .as_ref()
+}
+
+fn german_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::German1996).ok())
+        .as_ref()
+}
+
+fn spanish_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Spanish).ok())
+        .as_ref()
+}
+
+fn portuguese_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Portuguese).ok())
+        .as_ref()
+}
+
+fn italian_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Italian).ok())
+        .as_ref()
+}
+
+fn dutch_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Dutch).ok())
+        .as_ref()
+}
+
+fn polish_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Polish).ok())
+        .as_ref()
+}
+
+fn russian_hyphenator() -> Option<&'static Standard> {
+    static DICT: OnceLock<Option<Standard>> = OnceLock::new();
+    DICT.get_or_init(|| Standard::from_embedded(Language::Russian).ok())
+        .as_ref()
 }
 
 pub fn rendered_inlines_without_markers(inlines: &[Inline]) -> String {

@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+hyphenation = { version = "0.8.4", features = ["embed_all"] }
 mdtui-core = { path = "../mdtui-core" }
+whatlang = "0.18.0"
 
 [lints]
 workspace = true
