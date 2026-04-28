@@ -476,6 +476,23 @@ fn heading_uses_kitty_graphics_when_supported() {
 }
 
 #[test]
+fn unicode_heading_uses_kitty_graphics_when_supported() {
+    let opts = RenderOptions {
+        kitty_graphics: true,
+        ..RenderOptions::default()
+    };
+    let rendered = render_document(&import_gfm("# mdtui — TUI GFM Markdown Editor"), opts);
+    assert!(!rendered.kitty_commands.is_empty());
+    assert!(
+        rendered
+            .display
+            .items
+            .iter()
+            .any(|item| item.kind == DisplayKind::HeadlinePlacement)
+    );
+}
+
+#[test]
 fn kitty_h1_h2_reserve_two_full_width_rows() {
     for source in ["# Title", "## Subtitle"] {
         let opts = RenderOptions {
@@ -631,9 +648,28 @@ fn raw_html_never_invokes_tui_layout_renderer() {
 fn code_block_renders_line_numbers_and_copy_button() {
     let rendered =
         App::from_markdown("x.md", "```python\ndef greet():\n    return 1\n```").render_text();
-    assert!(rendered.contains("📋"));
+    assert!(rendered.contains("│ copy │"));
     assert!(rendered.contains("│  1│ def greet():"));
     assert!(rendered.contains("│  2│     return 1"));
+}
+
+#[test]
+fn code_block_toolbar_matches_border_width() {
+    let rendered = render_document(
+        &import_gfm("```python\ndef greet():\n    return 1\n```"),
+        RenderOptions::default(),
+    );
+    assert!(rendered.lines.get(2).is_some_and(|line| line.contains('┴')));
+    let widths = rendered
+        .lines
+        .iter()
+        .take(5)
+        .map(|line| line.chars().count())
+        .collect::<Vec<_>>();
+    assert!(
+        widths.windows(2).all(|pair| pair[0] == pair[1]),
+        "{widths:?}"
+    );
 }
 
 #[test]
@@ -745,6 +781,12 @@ fn width_slider_changes_document_width() {
 }
 
 #[test]
+fn top_level_blocks_have_blank_line_spacing() {
+    let rendered = render_document(&import_gfm("one\n\ntwo"), RenderOptions::default()).text();
+    assert_eq!(rendered, "one\n\ntwo");
+}
+
+#[test]
 fn hyphenation_affects_visual_wrap_only_not_exported_text() {
     document_width_slider_changes_softwrap_without_changing_markdown();
 }
@@ -846,6 +888,33 @@ fn ai_replace_selection_is_single_undo_step() {
 fn theme_matches_dark_amber_palette() {
     let theme = Theme::dark_amber();
     assert_eq!(theme.app_bg, "#0f0c08");
+    assert_eq!(theme.panel_bg, "#18120d");
+    assert_eq!(theme.panel_raised, "#241a12");
+    assert_eq!(theme.code_bg, "#000000");
     assert_eq!(theme.accent_primary, "#e6a85a");
     assert_eq!(theme.border_strong, "#d89a4a");
+}
+
+#[test]
+fn documents_open_on_first_non_headline_line() {
+    let app = App::from_markdown("x.md", "# Title\n\nFirst paragraph");
+    assert_eq!(
+        app.editor.cursor,
+        Cursor::Text {
+            block: 1,
+            offset: 0,
+        }
+    );
+}
+
+#[test]
+fn spec_opens_after_leading_title() {
+    let app = App::from_markdown("SPEC.md", include_str!("../../../SPEC.md"));
+    assert_eq!(
+        app.editor.cursor,
+        Cursor::Text {
+            block: 1,
+            offset: 0,
+        }
+    );
 }

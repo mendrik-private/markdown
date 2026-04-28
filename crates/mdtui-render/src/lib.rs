@@ -90,6 +90,7 @@ pub struct Theme {
     pub app_bg: &'static str,
     pub panel_bg: &'static str,
     pub panel_raised: &'static str,
+    pub code_bg: &'static str,
     pub active_row: &'static str,
     pub border: &'static str,
     pub border_strong: &'static str,
@@ -108,8 +109,9 @@ impl Theme {
     pub fn dark_amber() -> Self {
         Self {
             app_bg: "#0f0c08",
-            panel_bg: "#17120c",
-            panel_raised: "#21180f",
+            panel_bg: "#18120d",
+            panel_raised: "#241a12",
+            code_bg: "#000000",
             active_row: "#5a3518",
             border: "#4a3420",
             border_strong: "#d89a4a",
@@ -133,6 +135,9 @@ pub fn render_document(document: &Document, options: RenderOptions) -> Rendered 
     } else {
         for (block_index, block) in document.blocks.iter().enumerate() {
             ctx.render_block(block_index, block);
+            if block_index + 1 < document.blocks.len() {
+                ctx.lines.push(String::new());
+            }
         }
     }
     Rendered {
@@ -394,7 +399,7 @@ impl RenderContext {
     }
 
     fn render_heading(&mut self, block_index: usize, level: u8, text: &str) {
-        if matches!(level, 1 | 2) && self.options.kitty_graphics && text.is_ascii() {
+        if matches!(level, 1 | 2) && self.options.kitty_graphics {
             let width = self.options.heading_width.max(self.options.width).max(8);
             self.kitty_commands.push(format!(
                 "\u{1b}_Gmdtui=headline,level={level},id={block_index}\u{1b}\\"
@@ -483,8 +488,9 @@ impl RenderContext {
 
     fn render_code(&mut self, block_index: usize, language: Option<&str>, text: &str) {
         let width = usize::from(self.options.width.max(36));
-        let button_inner = 2usize;
-        let content_width = width.saturating_sub(button_inner + 6);
+        let copy_label = "copy";
+        let button_inner = copy_label.chars().count();
+        let content_width = width.saturating_sub(button_inner + 5);
         let body_width = width.saturating_sub(8);
         let label = format!(
             " {}",
@@ -495,9 +501,9 @@ impl RenderContext {
             "─".repeat(content_width),
             "─".repeat(button_inner + 2)
         );
-        let toolbar = format!("│{label:<content_width$}│ {:^button_inner$} │", "📋");
+        let toolbar = format!("│{label:<content_width$}│ {copy_label:^button_inner$} │");
         let separator = format!(
-            "├{}┼{}┤",
+            "├{}┴{}┤",
             "─".repeat(content_width),
             "─".repeat(button_inner + 2)
         );
@@ -513,7 +519,7 @@ impl RenderContext {
             },
             cursor: None,
             action: Some(DisplayAction::CopyCodeBlock { block: block_index }),
-            text: "📋".to_string(),
+            text: copy_label.to_string(),
         });
         self.lines.push(top);
         self.lines.push(toolbar);

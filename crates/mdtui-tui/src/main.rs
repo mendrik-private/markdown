@@ -43,8 +43,8 @@ use ratatui::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
-const HEADLINE_RASTER_VERSION: u32 = 7;
-const HEADLINE_DEBUG_SLAB: bool = false;
+const HEADLINE_RASTER_VERSION: u32 = 8;
+const HEADLINE_DEBUG_SLAB: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -489,7 +489,7 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
             break;
         }
     }
-    let Some(cursor) = target else {
+    let Some(cursor) = target.map(|cursor| normalize_headline_cursor(state, cursor)) else {
         return;
     };
     state.preferred_column = Some(preferred_x);
@@ -508,14 +508,8 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
 fn headline_visual_step(state: &TuiState, cursor: Cursor) -> i32 {
     let block = cursor_block(cursor);
     match state.app.editor.document.blocks.get(block) {
-        Some(DocBlock::Heading { level, inlines })
-            if state.kitty_graphics && matches!(level, 1 | 2) =>
-        {
-            if mdtui_core::inline_text(inlines).is_ascii() {
-                2
-            } else {
-                1
-            }
+        Some(DocBlock::Heading { level, .. }) if state.kitty_graphics && matches!(level, 1 | 2) => {
+            2
         }
         _ => 1,
     }
@@ -806,7 +800,8 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         show_status: false,
         ..state.app.render_options
     };
-    let rendered = render_document(&state.app.editor.document, state.app.render_options);
+    let mut rendered = render_document(&state.app.editor.document, state.app.render_options);
+    materialize_active_headline_fallback(state, &mut rendered);
     let viewport = usize::from(doc_area.height.saturating_sub(2));
     let max_scroll = rendered.lines.len().saturating_sub(viewport);
     state.scroll = state.scroll.min(max_scroll as u16);
@@ -1091,6 +1086,23 @@ fn draw_document(
     rendered: &Rendered,
     theme: &Theme,
 ) {
+    let active_headline_edit_rows = rendered
+        .display
+        .items
+        .iter()
+        .filter_map(|item| {
+            let cursor = item.cursor?;
+            match state.app.editor.document.blocks.get(cursor_block(cursor)) {
+                Some(DocBlock::Heading { .. })
+                    if cursor_block(cursor) == cursor_block(state.app.editor.cursor)
+                        && item.kind == DisplayKind::TextRun =>
+                {
+                    Some(usize::from(item.rect.y))
+                }
+                _ => None,
+            }
+        })
+        .collect::<HashSet<_>>();
     let headline_debug_rows = if HEADLINE_DEBUG_SLAB {
         rendered
             .display
@@ -1114,12 +1126,23 @@ fn draw_document(
         .iter()
         .enumerate()
         .scan(false, |in_code, (index, line)| {
-            if headline_debug_rows.contains(&index) {
+            if active_headline_edit_rows.contains(&index) {
                 Some(Line::from(Span::styled(
-                    "▒".repeat(line.chars().count().max(1)),
+                    line.to_string(),
+                    Style::default()
+                        .fg(rgb(theme.accent_highlight))
+                        .bg(rgb(theme.panel_bg))
+                        .add_modifier(Modifier::BOLD),
+                )))
+            } else if headline_debug_rows.contains(&index) {
+                let width = line.chars().count().max(1);
+                let mut debug = "*******".repeat(width.div_ceil(7));
+                debug.truncate(width);
+                Some(Line::from(Span::styled(
+                    debug,
                     Style::default()
                         .fg(rgb(theme.text_secondary))
-                        .bg(rgb(theme.app_bg)),
+                        .bg(rgb(theme.panel_bg)),
                 )))
             } else {
                 Some(style_rendered_line(
@@ -1142,7 +1165,7 @@ fn draw_document(
                     .border_type(BorderType::Rounded)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(rgb(theme.border_strong)))
-                    .style(Style::default().bg(rgb(theme.app_bg))),
+                    .style(Style::default().bg(rgb(theme.panel_bg))),
             )
             .scroll((state.scroll, 0))
             .wrap(Wrap { trim: false }),
@@ -1986,7 +2009,7 @@ fn style_rendered_line(
         *in_code = true;
         return style_code_header(line, theme);
     }
-    if *in_code && line.contains('📋') {
+    if *in_code && line.contains("│ copy │") {
         return style_code_toolbar(line, theme);
     }
     if *in_code && line.starts_with("├") {
@@ -2002,13 +2025,13 @@ fn style_rendered_line(
     if line.starts_with("▰ ") {
         return Line::from(Span::styled(
             " ".repeat(line.chars().count().max(1)),
-            Style::default().bg(rgb(theme.app_bg)),
+            Style::default().bg(rgb(theme.panel_bg)),
         ));
     }
 
     let mut style = Style::default()
         .fg(rgb(theme.text_primary))
-        .bg(rgb(theme.app_bg));
+        .bg(rgb(theme.panel_bg));
     if next_line.is_some_and(is_heading_rule) {
         style = style
             .fg(rgb(theme.accent_highlight))
@@ -2016,7 +2039,7 @@ fn style_rendered_line(
     } else if is_heading_rule(line) {
         style = Style::default()
             .fg(rgb(theme.border_strong))
-            .bg(rgb(theme.app_bg));
+            .bg(rgb(theme.panel_bg));
     }
     if let Some((start, end)) = selection_range
         && (start as usize..=end as usize).contains(&index)
@@ -2037,21 +2060,21 @@ fn style_code_header(line: &str, theme: &Theme) -> Line<'static> {
 }
 
 fn style_code_toolbar(line: &str, theme: &Theme) -> Line<'static> {
-    let Some(copy_start) = line.find('📋') else {
-        return Line::from(Span::styled(line.to_string(), code_text(theme)));
+    let Some(copy_start) = line.rfind("copy") else {
+        return Line::from(Span::styled(line.to_string(), code_border(theme)));
     };
     let before = &line[..copy_start];
-    let after = &line[copy_start + '📋'.len_utf8()..];
+    let after = &line[copy_start + "copy".len()..];
     Line::from(vec![
-        Span::styled(before.to_string(), code_text(theme)),
+        Span::styled(before.to_string(), code_border(theme)),
         Span::styled(
-            "📋".to_string(),
+            "copy".to_string(),
             Style::default()
                 .fg(rgb(theme.link))
                 .bg(rgb(theme.panel_bg))
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(after.to_string(), code_text(theme)),
+        Span::styled(after.to_string(), code_border(theme)),
     ])
 }
 
@@ -2381,6 +2404,12 @@ fn visible_headline_commands(
         if item.kind != DisplayKind::HeadlinePlacement {
             continue;
         }
+        if item
+            .cursor
+            .is_some_and(|cursor| cursor_block(cursor) == cursor_block(state.app.editor.cursor))
+        {
+            continue;
+        }
         let rows = item.rect.height.max(2);
         if item.rect.y < scroll || item.rect.y.saturating_add(rows) > viewport_end {
             continue;
@@ -2402,7 +2431,7 @@ fn visible_headline_commands(
             .y
             .saturating_add(1)
             .saturating_add(item.rect.y.saturating_sub(scroll))
-            + 2;
+            + 1;
         let col = area.x.saturating_add(1).saturating_add(item.rect.x) + 1;
         out.push(format!(
             "\u{1b}[{row};{col}H{}",
@@ -2833,11 +2862,74 @@ fn headline_level(state: &TuiState, item: &mdtui_render::DisplayItem) -> u8 {
     }
 }
 
+fn materialize_active_headline_fallback(state: &TuiState, rendered: &mut Rendered) {
+    let active_block = cursor_block(state.app.editor.cursor);
+    let mut items = Vec::with_capacity(rendered.display.items.len() + 2);
+    for item in &rendered.display.items {
+        if item.kind != DisplayKind::HeadlinePlacement {
+            items.push(item.clone());
+            continue;
+        }
+        let Some(cursor) = item.cursor else {
+            items.push(item.clone());
+            continue;
+        };
+        if cursor_block(cursor) != active_block {
+            items.push(item.clone());
+            continue;
+        }
+        let Some(DocBlock::Heading { .. }) = state.app.editor.document.blocks.get(active_block)
+        else {
+            items.push(item.clone());
+            continue;
+        };
+        let text = item.text.trim();
+        let display = text.to_string();
+        let text_y = usize::from(item.rect.y);
+        let rule_y = usize::from(item.rect.y.saturating_add(1));
+        if let Some(line) = rendered.lines.get_mut(text_y) {
+            *line = String::new();
+        }
+        if let Some(line) = rendered.lines.get_mut(rule_y) {
+            *line = display.clone();
+        }
+        items.push(mdtui_render::DisplayItem {
+            kind: DisplayKind::TextRun,
+            rect: mdtui_render::Rect {
+                x: 0,
+                y: item.rect.y.saturating_add(1),
+                width: display.chars().count() as u16,
+                height: 1,
+            },
+            cursor: Some(Cursor::Text {
+                block: active_block,
+                offset: 0,
+            }),
+            action: None,
+            text: display,
+        });
+    }
+    rendered.display.items = items;
+}
+
 fn clamp_scroll(offset: u16, content: usize, viewport: usize) -> u16 {
     if viewport == 0 {
         return 0;
     }
     offset.min(content.saturating_sub(viewport) as u16)
+}
+
+fn normalize_headline_cursor(state: &TuiState, cursor: Cursor) -> Cursor {
+    match cursor {
+        Cursor::Text { block, offset } => match state.app.editor.document.blocks.get(block) {
+            Some(DocBlock::Heading { inlines, .. }) if state.kitty_graphics => Cursor::Text {
+                block,
+                offset: offset.min(mdtui_core::inline_text(inlines).chars().count()),
+            },
+            _ => cursor,
+        },
+        _ => cursor,
+    }
 }
 
 fn workspace_root_for(path: Option<&Path>) -> PathBuf {
@@ -2976,7 +3068,7 @@ fn code_border(theme: &Theme) -> Style {
 
 fn code_gutter_border(theme: &Theme) -> Style {
     Style::default()
-        .fg(rgb(theme.border))
+        .fg(rgb(theme.border_strong))
         .bg(rgb(theme.panel_bg))
 }
 
@@ -2989,50 +3081,46 @@ fn code_gutter(theme: &Theme) -> Style {
 fn code_text(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.text_primary))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
 }
 
 fn code_keyword(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.accent_primary))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
         .add_modifier(Modifier::BOLD)
 }
 
 fn code_string(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.success))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
 }
 
 fn code_call(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.accent_highlight))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
         .add_modifier(Modifier::BOLD)
 }
 
 fn code_type(theme: &Theme) -> Style {
-    Style::default()
-        .fg(rgb(theme.link))
-        .bg(rgb(theme.panel_raised))
+    Style::default().fg(rgb(theme.link)).bg(rgb(theme.code_bg))
 }
 
 fn code_punct(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.text_secondary))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
 }
 
 fn code_comment(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.text_muted))
-        .bg(rgb(theme.panel_raised))
+        .bg(rgb(theme.code_bg))
         .add_modifier(Modifier::ITALIC)
 }
 
 fn code_number(theme: &Theme) -> Style {
-    Style::default()
-        .fg(rgb(theme.link))
-        .bg(rgb(theme.panel_raised))
+    Style::default().fg(rgb(theme.link)).bg(rgb(theme.code_bg))
 }

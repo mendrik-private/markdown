@@ -1,4 +1,4 @@
-use mdtui_core::{Cursor, Direction, Editor, InlineMark};
+use mdtui_core::{Block, Cursor, Direction, Editor, InlineMark};
 use mdtui_markdown::{export_gfm, import_gfm};
 use mdtui_render::{RenderOptions, Rendered, hit_test_or_nearest, render_editor};
 
@@ -17,8 +17,12 @@ impl Default for App {
 
 impl App {
     pub fn from_markdown(file_name: impl Into<String>, source: &str) -> Self {
+        let mut editor = Editor::new(import_gfm(source));
+        if let Some(cursor) = first_non_headline_cursor(&editor.document.blocks) {
+            editor.set_cursor(cursor);
+        }
         Self {
-            editor: Editor::new(import_gfm(source)),
+            editor,
             file_name: file_name.into(),
             render_options: RenderOptions::default(),
         }
@@ -121,4 +125,32 @@ impl App {
         ]
         .join("\n")
     }
+}
+
+fn first_non_headline_cursor(blocks: &[Block]) -> Option<Cursor> {
+    blocks
+        .iter()
+        .enumerate()
+        .find_map(|(block, item)| match item {
+            Block::Heading { .. } | Block::ThematicBreak => None,
+            Block::List(list) if list.items.is_empty() => None,
+            Block::List(_) => Some(Cursor::ListItem {
+                block,
+                item: 0,
+                offset: 0,
+            }),
+            Block::Table(table) if table.rows.is_empty() || table.rows[0].cells.is_empty() => None,
+            Block::Table(_) => Some(Cursor::TableCell {
+                block,
+                row: 0,
+                col: 0,
+                offset: 0,
+            }),
+            Block::Paragraph(_)
+            | Block::BlockQuote(_)
+            | Block::CodeBlock { .. }
+            | Block::ImageBlock { .. }
+            | Block::HtmlBlock(_)
+            | Block::Frontmatter(_) => Some(Cursor::Text { block, offset: 0 }),
+        })
 }
