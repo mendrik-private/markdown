@@ -251,6 +251,19 @@ fn wrapped_bullet_list_lines_indent_to_text_column() {
 }
 
 #[test]
+fn wrapped_blockquote_lines_indent_to_text_column() {
+    let rendered = render_document(
+        &import_gfm("> alpha beta gamma"),
+        RenderOptions {
+            width: 8,
+            ..RenderOptions::default()
+        },
+    )
+    .text();
+    assert_eq!(rendered, "▌ alpha\n  beta\n  gamma");
+}
+
+#[test]
 fn enter_inside_list_item_creates_new_list_item() {
     let mut app = list_app();
     app.editor.set_cursor(Cursor::ListItem {
@@ -683,6 +696,20 @@ fn code_block_toolbar_matches_border_width() {
         widths.windows(2).all(|pair| pair[0] == pair[1]),
         "{widths:?}"
     );
+}
+
+#[test]
+fn overflowing_code_block_uses_bottom_thumb_without_ellipsis() {
+    let rendered = render_document(
+        &import_gfm("```python\nabcdefghijklmnopqrstuvwxyz0123456789\n```"),
+        RenderOptions {
+            width: 36,
+            ..RenderOptions::default()
+        },
+    )
+    .text();
+    assert!(rendered.contains('━'));
+    assert!(!rendered.contains('…'));
 }
 
 #[test]

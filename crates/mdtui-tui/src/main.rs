@@ -95,6 +95,25 @@ struct TabHit {
     name: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CodeThumbDrag {
+    block: usize,
+    track_start: u16,
+    track_width: u16,
+    thumb_width: u16,
+    content_width: usize,
+    visible_width: usize,
+    grab_offset: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WrapSliderTrack {
+    start: u16,
+    slots: u16,
+    min: u16,
+    max: u16,
+}
+
 fn main() -> AppResult<()> {
     let path = env::args().nth(1).map(PathBuf::from);
     let (file_name, source) = match &path {
@@ -173,6 +192,9 @@ struct TuiState {
     status_hits: Vec<StatusHit>,
     tab_hits: Vec<TabHit>,
     hidden_tabs: HashSet<String>,
+    code_thumb_drag: Option<CodeThumbDrag>,
+    wrap_slider_track: Option<WrapSliderTrack>,
+    wrap_slider_drag: Option<WrapSliderTrack>,
     kitty_graphics: bool,
     last_kitty_signature: Option<String>,
     headline_png_cache: HashMap<String, Vec<u8>>,
@@ -210,6 +232,9 @@ impl TuiState {
             status_hits: Vec::new(),
             tab_hits: Vec::new(),
             hidden_tabs: HashSet::new(),
+            code_thumb_drag: None,
+            wrap_slider_track: None,
+            wrap_slider_drag: None,
             kitty_graphics: detect_kitty_support(),
             last_kitty_signature: None,
             headline_png_cache: HashMap::new(),
@@ -544,6 +569,21 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         return;
     }
 
+    if let Some(track) = state.wrap_slider_drag {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let local_x = mouse.column.saturating_sub(state.last_status_area.x);
+                update_wrap_width_from_slider(state, track, local_x);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.wrap_slider_drag = None;
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if state.last_status_area.height > 0
         && mouse.column >= state.last_status_area.x
         && mouse.column
@@ -558,10 +598,16 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 .y
                 .saturating_add(state.last_status_area.height)
     {
+        let local_x = mouse.column.saturating_sub(state.last_status_area.x);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let local_x = mouse.column.saturating_sub(state.last_status_area.x);
-                if let Some(action) = state
+                if let Some(track) = state.wrap_slider_track.filter(|track| {
+                    local_x >= track.start
+                        && local_x < track.start.saturating_add(track.slots.max(1))
+                }) {
+                    state.wrap_slider_drag = Some(track);
+                    update_wrap_width_from_slider(state, track, local_x);
+                } else if let Some(action) = state
                     .status_hits
                     .iter()
                     .find(|hit| local_x >= hit.start && local_x < hit.end)
@@ -570,6 +616,12 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                     run_status_action(state, &action);
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(track) = state.wrap_slider_drag {
+                    update_wrap_width_from_slider(state, track, local_x);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => state.wrap_slider_drag = None,
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {}
             _ => {}
         }
@@ -705,27 +757,56 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         .saturating_sub(area.y + 1)
         .saturating_add(state.scroll);
 
-    if let Some(rendered) = &state.last_rendered
-        && let Some(action) = action_at(x, y, &rendered.display)
-    {
-        run_action(state, action);
-        return;
-    }
-
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(rendered) = &state.last_rendered
+                && let Some(action) = action_at(x, y, &rendered.display)
+            {
+                match action {
+                    DisplayAction::CopyCodeBlock { .. } => run_action(state, action),
+                    DisplayAction::ScrollCodeBlock {
+                        block,
+                        track_start,
+                        track_width,
+                        thumb_width,
+                        content_width,
+                        visible_width,
+                    } => {
+                        state.code_thumb_drag = Some(CodeThumbDrag {
+                            block,
+                            track_start,
+                            track_width,
+                            thumb_width,
+                            content_width: usize::from(content_width),
+                            visible_width: usize::from(visible_width),
+                            grab_offset: x
+                                .saturating_sub(track_start)
+                                .min(thumb_width.saturating_sub(1)),
+                        });
+                    }
+                }
+                return;
+            }
             state.drag_anchor = Some((x, y));
             state.preferred_column = None;
             state.app.click(x, y);
             ensure_cursor_visible(state);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(drag) = state.code_thumb_drag {
+                state.preferred_column = None;
+                update_code_thumb_drag(state, drag, x);
+                return;
+            }
             if let Some(anchor) = state.drag_anchor {
                 state.preferred_column = None;
                 state.app.drag_select(anchor, (x, y));
             }
         }
-        MouseEventKind::Up(MouseButton::Left) => state.drag_anchor = None,
+        MouseEventKind::Up(MouseButton::Left) => {
+            state.drag_anchor = None;
+            state.code_thumb_drag = None;
+        }
         MouseEventKind::ScrollDown => {
             state.preferred_column = None;
             state.scroll = state.scroll.saturating_add(1);
@@ -796,9 +877,10 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         heading_width: headline_width,
         kitty_graphics: state.kitty_graphics,
         show_status: false,
-        ..state.app.render_options
+        ..state.app.render_options.clone()
     };
-    let mut rendered = render_document(&state.app.editor.document, state.app.render_options);
+    let mut rendered =
+        render_document(&state.app.editor.document, state.app.render_options.clone());
     materialize_active_headline_fallback(state, &mut rendered);
     let viewport = usize::from(doc_area.height.saturating_sub(2));
     let max_scroll = rendered.lines.len().saturating_sub(viewport);
@@ -1118,7 +1200,7 @@ fn draw_document(
     };
     let current_y =
         cursor_position(&state.app.editor.cursor, &rendered.display.items).map(|(_, y)| y);
-    let selection_range = selection_line_range(state, rendered);
+    let selection_rects = selection_rects(state, rendered);
     let lines = rendered
         .lines
         .iter()
@@ -1150,7 +1232,6 @@ fn draw_document(
                     in_code,
                     theme,
                     current_y,
-                    selection_range,
                 ))
             }
         })
@@ -1170,10 +1251,18 @@ fn draw_document(
         area,
     );
 
+    apply_selection_highlight(
+        frame.buffer_mut(),
+        area,
+        state.scroll,
+        &selection_rects,
+        theme,
+    );
+
     draw_scrollbar(
         frame,
         Rect {
-            x: area.x + area.width.saturating_sub(2),
+            x: area.x + area.width.saturating_sub(1),
             y: area.y + 1,
             width: 1,
             height: area.height.saturating_sub(2),
@@ -1192,6 +1281,7 @@ fn draw_status(
     theme: &Theme,
 ) {
     state.status_hits.clear();
+    state.wrap_slider_track = None;
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(rgb(theme.panel_bg)));
     let right = area.x.saturating_add(area.width);
@@ -1266,6 +1356,13 @@ fn draw_status(
             .fg(rgb(theme.border))
             .bg(rgb(theme.panel_bg)),
     );
+    let slider_start = x.saturating_sub(area.x);
+    state.wrap_slider_track = Some(WrapSliderTrack {
+        start: slider_start,
+        slots: slider_slots,
+        min: min_wrap,
+        max: max_wrap,
+    });
     for index in 0..slider_slots {
         let start = x.saturating_sub(area.x);
         let value = min_wrap
@@ -1381,7 +1478,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         Line::from("Tables & Lists"),
         Line::from("  Tab / Shift+Tab move cells · Ctrl+Arrow add row/column"),
         Line::from("Mouse"),
-        Line::from("  click place cursor · drag select · click explorer/outline/status controls"),
+        Line::from(
+            "  click place cursor · drag select · drag wrap slider · click explorer/outline/status controls",
+        ),
         Line::from("Session"),
         Line::from("  Ctrl-S save · Ctrl-Q quit · F1 or Esc close help"),
     ];
@@ -1462,9 +1561,11 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
         let style = if ch == "█" {
             Style::default()
                 .fg(rgb(theme.accent_highlight))
-                .bg(rgb(theme.app_bg))
+                .bg(rgb(theme.panel_bg))
         } else {
-            Style::default().fg(rgb(theme.border)).bg(rgb(theme.app_bg))
+            Style::default()
+                .fg(rgb(theme.border))
+                .bg(rgb(theme.panel_bg))
         };
         lines.push(Line::from(Span::styled(ch.to_string(), style)));
     }
@@ -1485,6 +1586,47 @@ fn run_action(state: &mut TuiState, action: DisplayAction) {
                 Err(error) => state.message = format!("copy failed: {error}"),
             }
         }
+        DisplayAction::ScrollCodeBlock { .. } => {}
+    }
+}
+
+fn update_code_thumb_drag(state: &mut TuiState, drag: CodeThumbDrag, x: u16) {
+    let max_thumb_start = drag.track_width.saturating_sub(drag.thumb_width);
+    let thumb_start = x
+        .saturating_sub(drag.track_start)
+        .saturating_sub(drag.grab_offset)
+        .min(max_thumb_start);
+    let max_scroll = drag.content_width.saturating_sub(drag.visible_width);
+    let scroll = if max_scroll == 0 || max_thumb_start == 0 {
+        0
+    } else {
+        usize::from(thumb_start)
+            .saturating_mul(max_scroll)
+            .div_ceil(usize::from(max_thumb_start))
+    };
+    set_code_horizontal_scroll(state, drag.block, scroll);
+}
+
+fn set_code_horizontal_scroll(state: &mut TuiState, block: usize, scroll: usize) {
+    if let Some((_, current)) = state
+        .app
+        .render_options
+        .code_horizontal_scrolls
+        .iter_mut()
+        .find(|(entry_block, _)| *entry_block == block)
+    {
+        *current = scroll;
+    } else {
+        state
+            .app
+            .render_options
+            .code_horizontal_scrolls
+            .push((block, scroll));
+        state
+            .app
+            .render_options
+            .code_horizontal_scrolls
+            .sort_by_key(|(entry_block, _)| *entry_block);
     }
 }
 
@@ -1537,11 +1679,21 @@ fn run_status_action(state: &mut TuiState, action: &StatusAction) {
     }
 }
 
+fn update_wrap_width_from_slider(state: &mut TuiState, track: WrapSliderTrack, local_x: u16) {
+    let slot = local_x
+        .saturating_sub(track.start)
+        .min(track.slots.saturating_sub(1));
+    let width = track.min
+        + (slot.saturating_mul(track.max.saturating_sub(track.min))
+            / track.slots.saturating_sub(1).max(1));
+    run_status_action(state, &StatusAction::SetWrapWidth(width));
+}
+
 fn open_file(state: &mut TuiState, path: &Path) {
     match fs::read_to_string(path) {
         Ok(source) => {
             let mut app = App::from_markdown(path.display().to_string(), &source);
-            app.render_options = state.app.render_options;
+            app.render_options = state.app.render_options.clone();
             state.app = app;
             state.path = Some(path.to_path_buf());
             state
@@ -1976,16 +2128,6 @@ fn tab_path(state: &TuiState, name: &str) -> PathBuf {
     }
 }
 
-fn selection_line_range(state: &TuiState, rendered: &Rendered) -> Option<(u16, u16)> {
-    let selection = state.app.editor.selection?;
-    if selection.is_collapsed() {
-        return None;
-    }
-    let (_, start_y) = cursor_position(&selection.anchor, &rendered.display.items)?;
-    let (_, end_y) = cursor_position(&selection.head, &rendered.display.items)?;
-    Some((start_y.min(end_y), start_y.max(end_y)))
-}
-
 fn has_selection(state: &TuiState) -> bool {
     state
         .app
@@ -2001,7 +2143,6 @@ fn style_rendered_line(
     in_code: &mut bool,
     theme: &Theme,
     current_y: Option<u16>,
-    selection_range: Option<(u16, u16)>,
 ) -> Line<'static> {
     if line.starts_with('╭') && line.contains('┬') {
         *in_code = true;
@@ -2039,14 +2180,198 @@ fn style_rendered_line(
             .fg(rgb(theme.border_strong))
             .bg(rgb(theme.panel_bg));
     }
-    if let Some((start, end)) = selection_range
-        && (start as usize..=end as usize).contains(&index)
-    {
-        style = style.bg(rgb(theme.active_row));
-    } else if current_y.is_some_and(|y| y as usize == index) {
+    if current_y.is_some_and(|y| y as usize == index) {
         style = style.bg(rgb(theme.panel_raised));
     }
     Line::from(Span::styled(line.to_string(), style))
+}
+
+fn selection_rects(state: &TuiState, rendered: &Rendered) -> Vec<mdtui_render::Rect> {
+    let Some(selection) = state.app.editor.selection else {
+        return Vec::new();
+    };
+    if selection.is_collapsed() {
+        return Vec::new();
+    }
+    let (start, end) = ordered_cursors(selection.anchor, selection.head);
+    rendered
+        .display
+        .items
+        .iter()
+        .filter_map(|item| selection_rect_for_item(item, start, end))
+        .collect()
+}
+
+fn ordered_cursors(a: Cursor, b: Cursor) -> (Cursor, Cursor) {
+    if compare_cursors(a, b).is_gt() {
+        (b, a)
+    } else {
+        (a, b)
+    }
+}
+
+fn compare_cursors(a: Cursor, b: Cursor) -> std::cmp::Ordering {
+    cursor_sort_key(a).cmp(&cursor_sort_key(b))
+}
+
+fn cursor_sort_key(cursor: Cursor) -> (usize, u8, usize, usize, usize) {
+    match cursor {
+        Cursor::Text { block, offset } => (block, 0, 0, 0, offset),
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } => (block, 1, item, 0, offset),
+        Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        } => (block, 2, row, col, offset),
+        Cursor::Checkbox { block, item } => (block, 1, item, 0, 0),
+    }
+}
+
+fn selection_rect_for_item(
+    item: &mdtui_render::DisplayItem,
+    selection_start: Cursor,
+    selection_end: Cursor,
+) -> Option<mdtui_render::Rect> {
+    let item_start = item.cursor?;
+    if item.kind == DisplayKind::Adornment || item.kind == DisplayKind::HeadlinePlacement {
+        return None;
+    }
+    let item_end = advance_cursor(item_start, usize::from(item.rect.width))?;
+    if compare_cursors(selection_end, item_start).is_le()
+        || compare_cursors(selection_start, item_end).is_ge()
+    {
+        return None;
+    }
+    let start = if compare_cursors(selection_start, item_start).is_gt() {
+        cursor_delta(item_start, selection_start)?
+    } else {
+        0
+    };
+    let end = if compare_cursors(selection_end, item_end).is_lt() {
+        cursor_delta(item_start, selection_end)?
+    } else {
+        usize::from(item.rect.width)
+    };
+    (end > start).then_some(mdtui_render::Rect {
+        x: item.rect.x.saturating_add(start as u16),
+        y: item.rect.y,
+        width: (end - start) as u16,
+        height: 1,
+    })
+}
+
+fn advance_cursor(cursor: Cursor, width: usize) -> Option<Cursor> {
+    Some(match cursor {
+        Cursor::Text { block, offset } => Cursor::Text {
+            block,
+            offset: offset + width,
+        },
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } => Cursor::ListItem {
+            block,
+            item,
+            offset: offset + width,
+        },
+        Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        } => Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset: offset + width,
+        },
+        Cursor::Checkbox { .. } => return None,
+    })
+}
+
+fn cursor_delta(base: Cursor, target: Cursor) -> Option<usize> {
+    match (base, target) {
+        (
+            Cursor::Text {
+                block: base_block,
+                offset: base_offset,
+            },
+            Cursor::Text { block, offset },
+        ) if block == base_block && offset >= base_offset => Some(offset - base_offset),
+        (
+            Cursor::ListItem {
+                block: base_block,
+                item: base_item,
+                offset: base_offset,
+            },
+            Cursor::ListItem {
+                block,
+                item,
+                offset,
+            },
+        ) if block == base_block && item == base_item && offset >= base_offset => {
+            Some(offset - base_offset)
+        }
+        (
+            Cursor::TableCell {
+                block: base_block,
+                row: base_row,
+                col: base_col,
+                offset: base_offset,
+            },
+            Cursor::TableCell {
+                block,
+                row,
+                col,
+                offset,
+            },
+        ) if block == base_block && row == base_row && col == base_col && offset >= base_offset => {
+            Some(offset - base_offset)
+        }
+        _ => None,
+    }
+}
+
+fn apply_selection_highlight(
+    buf: &mut Buffer,
+    area: Rect,
+    scroll: u16,
+    rects: &[mdtui_render::Rect],
+    theme: &Theme,
+) {
+    for rect in rects {
+        let screen_y = area
+            .y
+            .saturating_add(1)
+            .saturating_add(rect.y.saturating_sub(scroll));
+        if screen_y <= area.y || screen_y >= area.y.saturating_add(area.height.saturating_sub(1)) {
+            continue;
+        }
+        let screen_x = area.x.saturating_add(1).saturating_add(rect.x);
+        let right = area.x.saturating_add(area.width.saturating_sub(1));
+        if screen_x >= right {
+            continue;
+        }
+        let width = rect.width.min(right.saturating_sub(screen_x));
+        if width == 0 {
+            continue;
+        }
+        buf.set_style(
+            Rect {
+                x: screen_x,
+                y: screen_y,
+                width,
+                height: 1,
+            },
+            Style::default().bg(rgb(theme.active_row)),
+        );
+    }
 }
 
 fn is_heading_rule(line: &str) -> bool {
@@ -3132,6 +3457,8 @@ fn code_number(theme: &Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn move_visual_skips_code_block_chrome_rows() {
@@ -3149,7 +3476,8 @@ mod tests {
             show_status: false,
             ..RenderOptions::default()
         };
-        let mut rendered = render_document(&state.app.editor.document, state.app.render_options);
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
         materialize_active_headline_fallback(&state, &mut rendered);
         state.last_rendered = Some(rendered);
 
@@ -3161,6 +3489,302 @@ mod tests {
                 block: 1,
                 offset: 0
             }
+        );
+    }
+
+    #[test]
+    fn wheel_over_copy_button_scrolls_without_triggering_copy() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "```python\ndef greet():\n    return 1\n```"),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 80,
+            height: 12,
+        };
+        state.scroll = 2;
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let copy_item = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| item.action.is_some())
+            .cloned()
+            .expect("copy action item");
+        state.last_rendered = Some(rendered);
+        let column = state.last_doc_area.x + 1 + copy_item.rect.x;
+        let row = state.last_doc_area.y + 1 + copy_item.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(state.scroll, 3);
+        assert_ne!(state.message, "code block copied");
+        assert!(state.drag_anchor.is_none());
+    }
+
+    #[test]
+    fn dragging_code_footer_thumb_updates_horizontal_scroll() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "```python\nabcdefghijklmnopqrstuvwxyz0123456789\n```",
+            ),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 80,
+            height: 12,
+        };
+        state.app.render_options = RenderOptions {
+            width: 36,
+            heading_width: 36,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let thumb_item = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| matches!(item.action, Some(DisplayAction::ScrollCodeBlock { .. })))
+            .cloned()
+            .expect("scroll thumb item");
+        state.last_rendered = Some(rendered);
+        let down_column = state.last_doc_area.x + 1 + thumb_item.rect.x;
+        let row = state.last_doc_area.y + 1 + thumb_item.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: down_column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: down_column + 6,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(
+            state
+                .app
+                .render_options
+                .code_horizontal_scrolls
+                .iter()
+                .find(|(block, _)| *block == 0)
+                .is_some_and(|(_, scroll)| *scroll > 0)
+        );
+    }
+
+    #[test]
+    fn selection_rects_are_character_precise() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha beta"), None);
+        state.app.editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 4,
+            },
+        );
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+
+        assert_eq!(
+            selection_rects(&state, &rendered),
+            vec![mdtui_render::Rect {
+                x: 1,
+                y: 0,
+                width: 3,
+                height: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn selection_highlight_only_tints_selected_cells() {
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        buf.set_style(area, Style::default().bg(rgb(theme.panel_bg)));
+
+        apply_selection_highlight(
+            &mut buf,
+            area,
+            0,
+            &[mdtui_render::Rect {
+                x: 1,
+                y: 0,
+                width: 3,
+                height: 1,
+            }],
+            &theme,
+        );
+
+        assert_eq!(
+            buf.cell((1, 1)).expect("left gutter cell").bg,
+            rgb(theme.panel_bg)
+        );
+        assert_eq!(
+            buf.cell((2, 1)).expect("selection start cell").bg,
+            rgb(theme.active_row)
+        );
+        assert_eq!(
+            buf.cell((4, 1)).expect("selection end cell").bg,
+            rgb(theme.active_row)
+        );
+        assert_eq!(
+            buf.cell((5, 1)).expect("right gutter cell").bg,
+            rgb(theme.panel_bg)
+        );
+    }
+
+    #[test]
+    fn dragging_wrap_slider_updates_wrap_width() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha beta"), None);
+        state.last_status_area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 1,
+        };
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, state.last_status_area, &mut state, &rendered, &theme))
+            .expect("draw status");
+        let slider = state.wrap_slider_track.expect("wrap slider track");
+        let row = state.last_status_area.y;
+        let start_column = state.last_status_area.x + slider.start;
+        let end_column = start_column + slider.slots.saturating_sub(1);
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: start_column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: end_column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: end_column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(state.wrap_width, 120);
+        assert!(state.wrap_slider_drag.is_none());
+    }
+
+    #[test]
+    fn document_scrollbar_renders_on_panel_border() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "one\ntwo\nthree\nfour\nfive\nsix"),
+            None,
+        );
+        state.scroll = 1;
+        state.app.render_options = RenderOptions {
+            width: 20,
+            heading_width: 20,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 6,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert!(matches!(
+            buffer
+                .cell((19, 2))
+                .expect("border scrollbar cell")
+                .symbol(),
+            "│" | "█"
+        ));
+        assert_eq!(
+            buffer.cell((18, 2)).expect("content edge cell").symbol(),
+            " "
         );
     }
 }

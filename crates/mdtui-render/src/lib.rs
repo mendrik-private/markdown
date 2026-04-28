@@ -34,7 +34,17 @@ pub enum DisplayKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DisplayAction {
-    CopyCodeBlock { block: usize },
+    CopyCodeBlock {
+        block: usize,
+    },
+    ScrollCodeBlock {
+        block: usize,
+        track_start: u16,
+        track_width: u16,
+        thumb_width: u16,
+        content_width: u16,
+        visible_width: u16,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,13 +74,14 @@ impl Rendered {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderOptions {
     pub width: u16,
     pub heading_width: u16,
     pub kitty_graphics: bool,
     pub columns: u8,
     pub show_status: bool,
+    pub code_horizontal_scrolls: Vec<(usize, usize)>,
 }
 
 impl Default for RenderOptions {
@@ -81,6 +92,7 @@ impl Default for RenderOptions {
             kitty_graphics: false,
             columns: 1,
             show_status: true,
+            code_horizontal_scrolls: Vec::new(),
         }
     }
 }
@@ -129,7 +141,7 @@ impl Theme {
 }
 
 pub fn render_document(document: &Document, options: RenderOptions) -> Rendered {
-    let mut ctx = RenderContext::new(options);
+    let mut ctx = RenderContext::new(options.clone());
     if options.columns > 1 {
         ctx.render_columns(document);
     } else {
@@ -148,7 +160,7 @@ pub fn render_document(document: &Document, options: RenderOptions) -> Rendered 
 }
 
 pub fn render_editor(editor: &Editor, file_name: &str, options: RenderOptions) -> Rendered {
-    let mut rendered = render_document(&editor.document, options);
+    let mut rendered = render_document(&editor.document, options.clone());
     if editor.show_style_popover && editor.selection.is_some() && editor.focus == UiFocus::Document
     {
         rendered
@@ -333,21 +345,7 @@ impl RenderContext {
             Block::Heading { level, inlines } => {
                 self.render_heading(block_index, *level, &inline_text(inlines));
             }
-            Block::BlockQuote(blocks) => {
-                for block in blocks {
-                    let y = self.lines.len() as u16;
-                    let text = format!("▌ {}", block.rendered_text());
-                    self.push_line(
-                        text,
-                        DisplayKind::TextRun,
-                        y,
-                        Some(Cursor::Text {
-                            block: block_index,
-                            offset: 0,
-                        }),
-                    );
-                }
-            }
+            Block::BlockQuote(blocks) => self.render_block_quote(block_index, blocks),
             Block::List(list) => self.render_list(block_index, list),
             Block::CodeBlock { language, text } => {
                 self.render_code(block_index, language.as_deref(), text)
@@ -394,6 +392,62 @@ impl RenderContext {
             offset += part.chars().count();
             if index + 1 < wrapped.len() {
                 offset += 1;
+            }
+        }
+    }
+
+    fn render_block_quote(&mut self, block_index: usize, blocks: &[Block]) {
+        let prefix = "▌ ";
+        let prefix_width = prefix.chars().count() as u16;
+        let wrap_width = self.options.width.saturating_sub(prefix_width).max(1);
+        let indent = " ".repeat(usize::from(prefix_width));
+        let mut offset = 0usize;
+
+        for (quote_index, block) in blocks.iter().enumerate() {
+            let wrapped = wrap(&block.rendered_text(), wrap_width);
+            for (line_index, part) in wrapped.iter().enumerate() {
+                let y = self.lines.len() as u16;
+                self.display.items.push(DisplayItem {
+                    kind: DisplayKind::Adornment,
+                    rect: Rect {
+                        x: 0,
+                        y,
+                        width: prefix_width,
+                        height: 1,
+                    },
+                    cursor: None,
+                    action: None,
+                    text: if line_index == 0 {
+                        prefix.to_string()
+                    } else {
+                        indent.clone()
+                    },
+                });
+                self.display.items.push(DisplayItem {
+                    kind: DisplayKind::TextRun,
+                    rect: Rect {
+                        x: prefix_width,
+                        y,
+                        width: part.chars().count() as u16,
+                        height: 1,
+                    },
+                    cursor: Some(Cursor::Text {
+                        block: block_index,
+                        offset,
+                    }),
+                    action: None,
+                    text: part.clone(),
+                });
+                let line = if line_index == 0 {
+                    format!("{prefix}{part}")
+                } else {
+                    format!("{indent}{part}")
+                };
+                self.lines.push(line);
+                offset += part.chars().count();
+                if line_index + 1 < wrapped.len() || quote_index + 1 < blocks.len() {
+                    offset += 1;
+                }
             }
         }
     }
@@ -509,6 +563,13 @@ impl RenderContext {
         let button_inner = copy_label.chars().count();
         let content_width = width.saturating_sub(button_inner + 5);
         let body_width = width.saturating_sub(8);
+        let scroll = code_horizontal_scroll_for(block_index, &self.options.code_horizontal_scrolls);
+        let content_max_width = text
+            .lines()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let has_horizontal_overflow = content_max_width > body_width;
         let label = format!(
             " {}",
             compact(language.unwrap_or("code"), content_width.saturating_sub(1))
@@ -546,7 +607,14 @@ impl RenderContext {
         for (index, line) in text.lines().enumerate() {
             let y = self.lines.len() as u16;
             let number = format!("{:>3}", index + 1);
-            let clipped = compact(line, body_width);
+            let clipped = if line.chars().count() > scroll {
+                clip_exact(
+                    line.chars().skip(scroll).collect::<String>().as_str(),
+                    body_width,
+                )
+            } else {
+                String::new()
+            };
             let formatted = format!("│{number}│ {clipped:<body_width$} │");
             self.display.items.push(DisplayItem {
                 kind: DisplayKind::TextRun,
@@ -566,8 +634,33 @@ impl RenderContext {
             self.lines.push(formatted);
             offset += line.chars().count() + 1;
         }
-        self.lines
-            .push(format!("╰{}╯", "─".repeat(width.saturating_sub(2))));
+        let footer_y = self.lines.len() as u16;
+        self.lines.push(if has_horizontal_overflow {
+            let (footer, thumb_start, thumb_width) =
+                code_footer_with_thumb(width, body_width, content_max_width, scroll);
+            self.display.items.push(DisplayItem {
+                kind: DisplayKind::Adornment,
+                rect: Rect {
+                    x: thumb_start,
+                    y: footer_y,
+                    width: thumb_width,
+                    height: 1,
+                },
+                cursor: None,
+                action: Some(DisplayAction::ScrollCodeBlock {
+                    block: block_index,
+                    track_start: 1 + CODE_SCROLLBAR_GUTTER_WIDTH as u16,
+                    track_width: code_scrollbar_track_width(width) as u16,
+                    thumb_width,
+                    content_width: content_max_width as u16,
+                    visible_width: body_width as u16,
+                }),
+                text: "━".repeat(usize::from(thumb_width)),
+            });
+            footer
+        } else {
+            format!("╰{}╯", "─".repeat(width.saturating_sub(2)))
+        });
     }
 
     fn render_table(&mut self, block_index: usize, table: &Table) {
@@ -707,6 +800,70 @@ fn compact(text: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+fn clip_exact(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+const CODE_SCROLLBAR_GUTTER_WIDTH: usize = 5;
+
+fn code_footer_with_thumb(
+    width: usize,
+    body_width: usize,
+    content_width: usize,
+    scroll: usize,
+) -> (String, u16, u16) {
+    let gutter_width = CODE_SCROLLBAR_GUTTER_WIDTH;
+    let inner_width = width.saturating_sub(2);
+    let track_width = code_scrollbar_track_width(width);
+    let thumb_width = code_scrollbar_thumb_width(track_width, body_width, content_width);
+    let max_thumb_start = track_width.saturating_sub(thumb_width);
+    let max_scroll = content_width.saturating_sub(body_width);
+    let thumb_offset = if max_scroll == 0 || max_thumb_start == 0 {
+        0
+    } else {
+        scroll
+            .min(max_scroll)
+            .saturating_mul(max_thumb_start)
+            .div_ceil(max_scroll)
+    };
+    (
+        format!(
+            "╰{}{}{}{}╯",
+            "─".repeat(gutter_width.min(inner_width)),
+            "─".repeat(thumb_offset),
+            "━".repeat(thumb_width),
+            "─".repeat(track_width.saturating_sub(thumb_offset + thumb_width))
+        ),
+        (1 + gutter_width + thumb_offset) as u16,
+        thumb_width as u16,
+    )
+}
+
+fn code_scrollbar_track_width(width: usize) -> usize {
+    width.saturating_sub(2 + CODE_SCROLLBAR_GUTTER_WIDTH)
+}
+
+fn code_scrollbar_thumb_width(
+    track_width: usize,
+    body_width: usize,
+    content_width: usize,
+) -> usize {
+    if content_width == 0 {
+        return 0;
+    }
+    ((track_width.saturating_mul(body_width)).div_ceil(content_width))
+        .clamp(5, 10)
+        .min(track_width.max(1))
+}
+
+fn code_horizontal_scroll_for(block_index: usize, scrolls: &[(usize, usize)]) -> usize {
+    scrolls
+        .iter()
+        .find(|(block, _)| *block == block_index)
+        .map(|(_, scroll)| *scroll)
+        .unwrap_or(0)
 }
 
 fn pad(text: &str, width: usize) -> String {

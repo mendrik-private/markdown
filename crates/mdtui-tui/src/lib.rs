@@ -29,7 +29,7 @@ impl App {
     }
 
     pub fn render(&self) -> Rendered {
-        render_editor(&self.editor, &self.file_name, self.render_options)
+        render_editor(&self.editor, &self.file_name, self.render_options.clone())
     }
 
     pub fn render_text(&self) -> String {
