@@ -37,14 +37,15 @@ use ratatui::{
     layout::{Constraint, Direction as LayoutDirection, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
 const HEADLINE_RASTER_VERSION: u32 = 9;
-const HEADLINE_DEBUG_SLAB: bool = false;
+const HEADLINE_DEBUG_SLAB: bool = true;
+const DOCUMENT_LEFT_PAD: u16 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -1067,10 +1068,10 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         return;
     }
 
-    let x = mouse.column.saturating_sub(area.x + 1);
+    let x = mouse.column.saturating_sub(document_content_left(area));
     let y = mouse
         .row
-        .saturating_sub(area.y + 1)
+        .saturating_sub(document_content_top(area))
         .saturating_add(state.scroll);
 
     match mouse.kind {
@@ -1553,6 +1554,18 @@ fn draw_explorer(
         end: nested_start.saturating_add(nested_label.chars().count() as u16),
         action: ExplorerAction::ToggleMode(ExplorerMode::Nested),
     });
+    draw_scrollbar(
+        frame,
+        Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y + 1,
+            width: 1,
+            height: area.height.saturating_sub(2),
+        },
+        usize::from(scroll),
+        lines.len(),
+        theme,
+    );
 }
 
 fn draw_outline(
@@ -1580,6 +1593,18 @@ fn draw_outline(
                     .style(Style::default().bg(rgb(theme.panel_bg))),
             ),
         area,
+    );
+    draw_scrollbar(
+        frame,
+        Rect {
+            x: area.x + area.width.saturating_sub(1),
+            y: area.y + 1,
+            width: 1,
+            height: area.height.saturating_sub(2),
+        },
+        usize::from(scroll),
+        lines.len(),
+        theme,
     );
 }
 
@@ -1645,7 +1670,11 @@ fn draw_document(
                         .add_modifier(Modifier::BOLD),
                 )))
             } else if headline_debug_rows.contains(&index) {
-                let width = line.chars().count().max(1);
+                let width = line
+                    .chars()
+                    .count()
+                    .saturating_sub(usize::from(DOCUMENT_LEFT_PAD))
+                    .max(1);
                 let mut debug = "*******".repeat(width.div_ceil(7));
                 debug.truncate(width);
                 Some(Line::from(Span::styled(
@@ -1673,7 +1702,8 @@ fn draw_document(
                     .border_type(BorderType::Rounded)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(rgb(theme.border_strong)))
-                    .style(Style::default().bg(rgb(theme.panel_bg))),
+                    .style(Style::default().bg(rgb(theme.panel_bg)))
+                    .padding(Padding::new(DOCUMENT_LEFT_PAD, 0, 0, 0)),
             )
             .scroll((state.scroll, 0))
             .wrap(Wrap { trim: false }),
@@ -2173,7 +2203,7 @@ fn anchored_style_popup(
     width: u16,
     height: u16,
 ) -> Rect {
-    let inner_left = doc_area.x.saturating_add(1);
+    let inner_left = document_content_left(doc_area);
     let inner_top = doc_area.y.saturating_add(1);
     let inner_bottom = doc_area.y.saturating_add(doc_area.height.saturating_sub(2));
     let mut min_x: Option<u16> = None;
@@ -2230,11 +2260,11 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
     let mut lines = Vec::new();
     for index in 0..viewport {
         let ch = if index >= start && index < start + thumb {
-            "┃"
+            "█"
         } else {
             "│"
         };
-        let style = if ch == "┃" {
+        let style = if ch == "█" {
             Style::default()
                 .fg(rgb(theme.accent_highlight))
                 .bg(rgb(theme.panel_bg))
@@ -2680,6 +2710,9 @@ fn open_file(state: &mut TuiState, path: &Path) {
                 .remove(&file_leaf(&path.display().to_string()));
             state.scroll = 0;
             state.preferred_column = None;
+            state.last_rendered = None;
+            state.last_render_key = None;
+            state.last_kitty_signature = None;
             state.dirty = false;
             state.message = format!("opened {}", file_leaf(&path.display().to_string()));
         }
@@ -3141,6 +3174,9 @@ fn outline_lines(
     theme: &Theme,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<OutlineHit>) {
+    if let Some(entries) = outline_toc_entries(blocks) {
+        return outline_toc_lines(&entries, active_block, theme, width);
+    }
     let headings = blocks
         .iter()
         .enumerate()
@@ -3236,6 +3272,164 @@ fn outline_lines(
         )));
     }
     (lines, hits)
+}
+
+fn outline_toc_entries(blocks: &[DocBlock]) -> Option<Vec<(usize, String)>> {
+    let headings = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            DocBlock::Heading { inlines, .. } => {
+                let title = mdtui_core::inline_text(inlines);
+                Some((outline_slugify_heading(&title), index, title))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    blocks.iter().find_map(|block| {
+        let DocBlock::List(list) = block else {
+            return None;
+        };
+        list.items
+            .iter()
+            .enumerate()
+            .map(|(item_index, item)| {
+                let [DocBlock::Paragraph(inlines)] = item.blocks.as_slice() else {
+                    return None;
+                };
+                let [
+                    Inline::Link {
+                        target, children, ..
+                    },
+                ] = inlines.as_slice()
+                else {
+                    return None;
+                };
+                let slug = target.strip_prefix('#')?;
+                let (_, block, title) = headings
+                    .iter()
+                    .find(|(heading_slug, _, _)| heading_slug == slug)?;
+                let title = if title.is_empty() {
+                    outline_strip_toc_numbering(&mdtui_core::inline_text(children))
+                } else {
+                    outline_strip_toc_numbering(title)
+                };
+                Some((
+                    *block,
+                    if title.is_empty() {
+                        format!("Section {}", item_index + 1)
+                    } else {
+                        title
+                    },
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+    })
+}
+
+fn outline_toc_lines(
+    entries: &[(usize, String)],
+    active_block: usize,
+    theme: &Theme,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<OutlineHit>) {
+    let mut lines = Vec::new();
+    let mut hits = Vec::new();
+    let prefix_width = entries.len().max(1).to_string().chars().count() + 2;
+    for (index, (block, title)) in entries.iter().enumerate() {
+        let active = *block == active_block;
+        let bg = if active {
+            theme.active_row
+        } else {
+            theme.panel_bg
+        };
+        let prefix = format!("{:>width$}. ", index + 1, width = prefix_width - 2);
+        let available = usize::from(width).saturating_sub(prefix_width).max(8);
+        let wrapped = wrap_outline_text(title, available);
+        for (wrap_index, part) in wrapped.iter().enumerate() {
+            let row = lines.len() as u16;
+            if wrap_index == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        prefix.clone(),
+                        Style::default()
+                            .fg(rgb(theme.text_secondary))
+                            .bg(rgb(bg))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        part.clone(),
+                        Style::default()
+                            .fg(rgb(if active {
+                                theme.accent_highlight
+                            } else {
+                                theme.link
+                            }))
+                            .bg(rgb(bg))
+                            .add_modifier(if active {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(" ".repeat(prefix_width), Style::default().bg(rgb(bg))),
+                    Span::styled(
+                        part.clone(),
+                        Style::default()
+                            .fg(rgb(if active {
+                                theme.accent_highlight
+                            } else {
+                                theme.link
+                            }))
+                            .bg(rgb(bg))
+                            .add_modifier(if active {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]));
+            }
+            hits.push(OutlineHit { row, block: *block });
+        }
+    }
+    (lines, hits)
+}
+
+fn outline_strip_toc_numbering(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some((prefix, rest)) = trimmed.split_once(' ') else {
+        return trimmed.to_string();
+    };
+    if prefix.ends_with('.')
+        && prefix[..prefix.len().saturating_sub(1)]
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+    {
+        rest.trim_start().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn outline_slugify_heading(text: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in text.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else if ch.is_whitespace() || ch == '-' {
+            pending_dash = true;
+        }
+    }
+    slug
 }
 
 fn tab_entries(
@@ -4254,7 +4448,7 @@ fn apply_selection_highlight(
         if screen_y <= area.y || screen_y >= area.y.saturating_add(area.height.saturating_sub(1)) {
             continue;
         }
-        let screen_x = area.x.saturating_add(1).saturating_add(rect.x);
+        let screen_x = document_content_left(area).saturating_add(rect.x);
         let right = area.x.saturating_add(area.width.saturating_sub(1));
         if screen_x >= right {
             continue;
@@ -4766,12 +4960,12 @@ fn visible_headline_commands(
             request_headline_raster(state, key.clone(), text.to_string(), level, cols, rows);
             continue;
         };
-        let row = area
-            .y
-            .saturating_add(1)
+        let row = document_content_top(area)
             .saturating_add(item.rect.y.saturating_sub(scroll))
-            + 1;
-        let col = area.x.saturating_add(1).saturating_add(item.rect.x) + 1;
+            .saturating_add(1);
+        let col = document_content_left(area)
+            .saturating_add(item.rect.x)
+            .saturating_add(1);
         out.push(format!(
             "\u{1b}[{row};{col}H{}",
             kitty_png_apc(&png, cols, rows)
@@ -5264,6 +5458,14 @@ fn active_headline_block(state: &TuiState) -> Option<usize> {
     }
 }
 
+fn document_content_left(area: Rect) -> u16 {
+    area.x.saturating_add(1 + DOCUMENT_LEFT_PAD)
+}
+
+fn document_content_top(area: Rect) -> u16 {
+    area.y.saturating_add(1)
+}
+
 fn clamp_scroll(offset: u16, content: usize, viewport: usize) -> u16 {
     if viewport == 0 {
         return 0;
@@ -5566,8 +5768,8 @@ mod tests {
             .cloned()
             .expect("copy action item");
         state.last_rendered = Some(rendered);
-        let column = state.last_doc_area.x + 1 + copy_item.rect.x;
-        let row = state.last_doc_area.y + 1 + copy_item.rect.y;
+        let column = document_content_left(state.last_doc_area) + copy_item.rect.x;
+        let row = document_content_top(state.last_doc_area) + copy_item.rect.y;
 
         handle_mouse(
             &mut state,
@@ -5617,8 +5819,8 @@ mod tests {
             .cloned()
             .expect("scroll thumb item");
         state.last_rendered = Some(rendered);
-        let down_column = state.last_doc_area.x + 1 + thumb_item.rect.x;
-        let row = state.last_doc_area.y + 1 + thumb_item.rect.y;
+        let down_column = document_content_left(state.last_doc_area) + thumb_item.rect.x;
+        let row = document_content_top(state.last_doc_area) + thumb_item.rect.y;
 
         handle_mouse(
             &mut state,
@@ -5711,19 +5913,23 @@ mod tests {
         );
 
         assert_eq!(
-            buf.cell((1, 1)).expect("left gutter cell").bg,
+            buf.cell((1, 1)).expect("left border cell").bg,
             rgb(theme.panel_bg)
         );
         assert_eq!(
-            buf.cell((2, 1)).expect("selection start cell").bg,
+            buf.cell((2, 1)).expect("left padding cell").bg,
+            rgb(theme.panel_bg)
+        );
+        assert_eq!(
+            buf.cell((3, 1)).expect("selection start cell").bg,
             rgb(theme.active_row)
         );
         assert_eq!(
-            buf.cell((4, 1)).expect("selection end cell").bg,
+            buf.cell((5, 1)).expect("selection end cell").bg,
             rgb(theme.active_row)
         );
         assert_eq!(
-            buf.cell((5, 1)).expect("right gutter cell").bg,
+            buf.cell((6, 1)).expect("right gutter cell").bg,
             rgb(theme.panel_bg)
         );
     }
@@ -5815,7 +6021,41 @@ mod tests {
     }
 
     #[test]
-    fn kitty_headlines_do_not_draw_debug_placeholder_rows() {
+    fn opening_a_tab_clears_cached_render_state() {
+        let root = std::env::temp_dir().join(format!("mdtui-open-file-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "first").expect("write first file");
+        fs::write(&second, "second").expect("write second file");
+
+        let mut state = TuiState::new(
+            App::from_markdown(first.to_string_lossy(), "first"),
+            Some(first.clone()),
+        );
+        state.last_render_key = Some(RenderCacheKey {
+            version: 1,
+            options: state.app.render_options.clone(),
+            active_headline_block: None,
+        });
+        state.last_rendered = Some(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        state.last_kitty_signature = Some("cached".to_string());
+
+        open_file(&mut state, &second);
+
+        assert!(state.last_render_key.is_none());
+        assert!(state.last_rendered.is_none());
+        assert!(state.last_kitty_signature.is_none());
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn kitty_headlines_draw_debug_placeholder_rows() {
         let mut state = TuiState::new(App::from_markdown("x.md", "# Title\n\nbody"), None);
         state.kitty_graphics = true;
         state.app.editor.set_cursor(Cursor::Text {
@@ -5845,7 +6085,13 @@ mod tests {
             .expect("draw document");
         let buffer = terminal.backend().buffer();
 
-        assert_ne!(buffer.cell((1, 1)).expect("headline slot").symbol(), "*");
+        assert_eq!(
+            buffer
+                .cell((document_content_left(area), document_content_top(area)))
+                .expect("headline slot")
+                .symbol(),
+            "*"
+        );
     }
 
     #[test]
@@ -5912,7 +6158,7 @@ mod tests {
                 .cell((19, 2))
                 .expect("border scrollbar cell")
                 .symbol(),
-            "│" | "┃"
+            "│" | "█"
         ));
         assert_eq!(
             buffer.cell((18, 2)).expect("content edge cell").symbol(),
@@ -5947,21 +6193,21 @@ mod tests {
 
         assert!(
             buffer
-                .cell((1 + bold_x, 1))
+                .cell((document_content_left(area) + bold_x, 1))
                 .expect("bold cell")
                 .modifier
                 .contains(Modifier::BOLD)
         );
         assert!(
             buffer
-                .cell((1 + ital_x, 1))
+                .cell((document_content_left(area) + ital_x, 1))
                 .expect("italic cell")
                 .modifier
                 .contains(Modifier::ITALIC)
         );
         assert!(
             buffer
-                .cell((1 + gone_x, 1))
+                .cell((document_content_left(area) + gone_x, 1))
                 .expect("strike cell")
                 .modifier
                 .contains(Modifier::CROSSED_OUT)
@@ -6020,8 +6266,8 @@ mod tests {
             .cloned()
             .expect("toc row");
         state.last_rendered = Some(rendered);
-        let column = state.last_doc_area.x + 1 + toc_item.rect.x;
-        let row = state.last_doc_area.y + 1 + toc_item.rect.y;
+        let column = document_content_left(state.last_doc_area) + toc_item.rect.x;
+        let row = document_content_top(state.last_doc_area) + toc_item.rect.y;
 
         handle_mouse(
             &mut state,
@@ -6177,12 +6423,56 @@ mod tests {
         let buffer = terminal.backend().buffer();
 
         assert_eq!(
-            buffer.cell((1, 1)).expect("number cell").fg,
+            buffer
+                .cell((document_content_left(area), document_content_top(area)))
+                .expect("number cell")
+                .fg,
             rgb(theme.link)
         );
         assert_eq!(
-            buffer.cell((4, 1)).expect("text cell").fg,
+            buffer
+                .cell((document_content_left(area) + 3, document_content_top(area)))
+                .expect("text cell")
+                .fg,
             rgb(theme.accent_highlight)
+        );
+    }
+
+    #[test]
+    fn outline_prefers_toc_over_heading_tree() {
+        let doc = App::from_markdown(
+            "x.md",
+            "## Table of contents\n\n1. [Project identity](#project-identity)\n2. [Definition of done](#definition-of-done)\n\n# Project identity\n\n# Definition of done",
+        )
+        .editor
+        .document;
+        let theme = Theme::dark_amber();
+        let (lines, hits) = outline_lines(&doc.blocks, 0, &theme, 32);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(hits.len(), 2);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Project identity"))
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Definition of done"))
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line.contains("Table of contents"))
         );
     }
 
@@ -6207,13 +6497,14 @@ mod tests {
             .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
             .expect("draw document");
         let buffer = terminal.backend().buffer();
+        let content_x = document_content_left(area);
 
         assert_eq!(
-            buffer.cell((1, 1)).expect("top border cell").bg,
+            buffer.cell((content_x, 1)).expect("top border cell").bg,
             rgb(theme.panel_bg)
         );
         assert_eq!(
-            buffer.cell((1, 1)).expect("top border cell").fg,
+            buffer.cell((content_x, 1)).expect("top border cell").fg,
             rgb(theme.border)
         );
     }
@@ -6273,11 +6564,24 @@ mod tests {
             .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
             .expect("draw document");
         let buffer = terminal.backend().buffer();
+        let content_x = document_content_left(area);
 
-        assert_eq!(buffer.cell((19, 1)).expect("dot leader").symbol(), ".");
-        assert_eq!(buffer.cell((28, 1)).expect("page number").symbol(), "1");
         assert_eq!(
-            buffer.cell((28, 1)).expect("page number").fg,
+            buffer
+                .cell((content_x + 18, 1))
+                .expect("dot leader")
+                .symbol(),
+            "."
+        );
+        assert_eq!(
+            buffer
+                .cell((content_x + 27, 1))
+                .expect("page number")
+                .symbol(),
+            "1"
+        );
+        assert_eq!(
+            buffer.cell((content_x + 27, 1)).expect("page number").fg,
             rgb(theme.link)
         );
     }
