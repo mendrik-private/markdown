@@ -37,6 +37,9 @@ pub enum DisplayAction {
     CopyCodeBlock {
         block: usize,
     },
+    FollowLink {
+        block: usize,
+    },
     ScrollCodeBlock {
         block: usize,
         track_start: u16,
@@ -123,7 +126,7 @@ impl Theme {
             app_bg: "#0f0c08",
             panel_bg: "#18120d",
             panel_raised: "#241a12",
-            code_bg: "#000000",
+            code_bg: "#18120d",
             active_row: "#5a3518",
             border: "#4a3420",
             border_strong: "#d89a4a",
@@ -141,7 +144,7 @@ impl Theme {
 }
 
 pub fn render_document(document: &Document, options: RenderOptions) -> Rendered {
-    let mut ctx = RenderContext::new(options.clone());
+    let mut ctx = RenderContext::new(options.clone(), heading_targets(document));
     if options.columns > 1 {
         ctx.render_columns(document);
     } else {
@@ -304,15 +307,31 @@ pub fn range_to_rects(selection: Selection, display: &DisplayList) -> Vec<Rect> 
 
 struct RenderContext {
     options: RenderOptions,
+    heading_targets: Vec<HeadingTarget>,
     lines: Vec<String>,
     display: DisplayList,
     kitty_commands: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeadingTarget {
+    slug: String,
+    block: usize,
+    title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TocEntry {
+    item: usize,
+    block: usize,
+    title: String,
+}
+
 impl RenderContext {
-    fn new(options: RenderOptions) -> Self {
+    fn new(options: RenderOptions, heading_targets: Vec<HeadingTarget>) -> Self {
         Self {
             options,
+            heading_targets,
             lines: Vec::new(),
             display: DisplayList::default(),
             kitty_commands: Vec::new(),
@@ -400,7 +419,6 @@ impl RenderContext {
         let prefix = "▌ ";
         let prefix_width = prefix.chars().count() as u16;
         let wrap_width = self.options.width.saturating_sub(prefix_width).max(1);
-        let indent = " ".repeat(usize::from(prefix_width));
         let mut offset = 0usize;
 
         for (quote_index, block) in blocks.iter().enumerate() {
@@ -417,11 +435,7 @@ impl RenderContext {
                     },
                     cursor: None,
                     action: None,
-                    text: if line_index == 0 {
-                        prefix.to_string()
-                    } else {
-                        indent.clone()
-                    },
+                    text: prefix.to_string(),
                 });
                 self.display.items.push(DisplayItem {
                     kind: DisplayKind::TextRun,
@@ -438,11 +452,7 @@ impl RenderContext {
                     action: None,
                     text: part.clone(),
                 });
-                let line = if line_index == 0 {
-                    format!("{prefix}{part}")
-                } else {
-                    format!("{indent}{part}")
-                };
+                let line = format!("{prefix}{part}");
                 self.lines.push(line);
                 offset += part.chars().count();
                 if line_index + 1 < wrapped.len() || quote_index + 1 < blocks.len() {
@@ -500,6 +510,10 @@ impl RenderContext {
     }
 
     fn render_list(&mut self, block_index: usize, list: &List) {
+        if let Some(entries) = toc_entries_for_list(list, &self.heading_targets) {
+            self.render_toc_list(block_index, &entries);
+            return;
+        }
         for (item_index, item) in list.items.iter().enumerate() {
             let marker = list_marker(list, item, item_index);
             let text = item.rendered_text();
@@ -554,6 +568,36 @@ impl RenderContext {
                     offset += 1;
                 }
             }
+        }
+    }
+
+    fn render_toc_list(&mut self, block_index: usize, entries: &[TocEntry]) {
+        let width = usize::from(self.options.width.max(12));
+        for (index, entry) in entries.iter().enumerate() {
+            let number = (index + 1).to_string();
+            let max_title = width.saturating_sub(number.chars().count() + 3).max(1);
+            let title = compact(&entry.title, max_title);
+            let dots = "."
+                .repeat(width.saturating_sub(title.chars().count() + number.chars().count() + 2));
+            let line = format!("{title} {dots} {number}");
+            let y = self.lines.len() as u16;
+            self.display.items.push(DisplayItem {
+                kind: DisplayKind::TextRun,
+                rect: Rect {
+                    x: 0,
+                    y,
+                    width: line.chars().count() as u16,
+                    height: 1,
+                },
+                cursor: Some(Cursor::ListItem {
+                    block: block_index,
+                    item: entry.item,
+                    offset: 0,
+                }),
+                action: Some(DisplayAction::FollowLink { block: entry.block }),
+                text: line.clone(),
+            });
+            self.lines.push(line);
         }
     }
 
@@ -750,15 +794,82 @@ impl RenderContext {
 fn list_marker(list: &List, item: &ListItem, index: usize) -> String {
     if let Some(checked) = item.checked {
         if checked {
-            "☑ ".to_string()
+            "[✗] ".to_string()
         } else {
-            "☐ ".to_string()
+            "[_] ".to_string()
         }
     } else if list.ordered {
         format!("{}. ", index + 1)
     } else {
         "• ".to_string()
     }
+}
+
+fn heading_targets(document: &Document) -> Vec<HeadingTarget> {
+    document
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(block, item)| match item {
+            Block::Heading { inlines, .. } => {
+                let title = inline_text(inlines);
+                Some(HeadingTarget {
+                    slug: slugify_heading(&title),
+                    block,
+                    title,
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn toc_entries_for_list(list: &List, headings: &[HeadingTarget]) -> Option<Vec<TocEntry>> {
+    list.items
+        .iter()
+        .enumerate()
+        .map(|(item_index, item)| {
+            let Block::Paragraph(inlines) = item.blocks.first()? else {
+                return None;
+            };
+            let [
+                Inline::Link {
+                    target, children, ..
+                },
+            ] = inlines.as_slice()
+            else {
+                return None;
+            };
+            let slug = target.strip_prefix('#')?;
+            let heading = headings.iter().find(|heading| heading.slug == slug)?;
+            Some(TocEntry {
+                item: item_index,
+                block: heading.block,
+                title: if heading.title.is_empty() {
+                    inline_text(children)
+                } else {
+                    heading.title.clone()
+                },
+            })
+        })
+        .collect()
+}
+
+fn slugify_heading(text: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in text.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else if ch.is_whitespace() || ch == '-' {
+            pending_dash = true;
+        }
+    }
+    slug
 }
 
 fn table_widths(table: &Table) -> Vec<usize> {
@@ -854,7 +965,7 @@ fn code_scrollbar_thumb_width(
         return 0;
     }
     ((track_width.saturating_mul(body_width)).div_ceil(content_width))
-        .clamp(5, 10)
+        .clamp(7, 14)
         .min(track_width.max(1))
 }
 

@@ -1,6 +1,6 @@
 use mdtui_core::{AiConfig, Cursor, Direction, VersionedResult, accept_worker_result};
 use mdtui_markdown::{export_gfm, import_gfm, semantic_equivalent_after_roundtrip};
-use mdtui_render::{DisplayKind, RenderOptions, Theme, render_document};
+use mdtui_render::{DisplayAction, DisplayKind, RenderOptions, Theme, render_document};
 use mdtui_terminal::{
     HeadlineImageCache, ImageCache, InputEngine, InputEvent, contains_forbidden_text_sizing,
 };
@@ -107,7 +107,7 @@ fn rendered_list_bold_does_not_show_star_markers() {
 #[test]
 fn rendered_task_item_does_not_show_bracket_marker() {
     let rendered = App::from_markdown("x.md", "- [x] done").render_text();
-    assert!(rendered.contains('☑'));
+    assert!(rendered.contains("[✗]"));
     assert!(!rendered.contains("[x]"));
 }
 
@@ -260,7 +260,7 @@ fn wrapped_blockquote_lines_indent_to_text_column() {
         },
     )
     .text();
-    assert_eq!(rendered, "▌ alpha\n  beta\n  gamma");
+    assert_eq!(rendered, "▌ alpha\n▌ beta\n▌ gamma");
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn enter_in_task_item_creates_unchecked_task_item() {
         offset: 4,
     });
     app.enter();
-    assert!(app.render_text().contains('☐'));
+    assert!(app.render_text().contains("[_]"));
 }
 
 #[test]
@@ -336,7 +336,7 @@ fn backspace_at_start_of_first_item_unwraps_without_marker_text() {
 fn clicking_checkbox_toggles_task_state() {
     let mut app = App::from_markdown("x.md", "- [ ] todo");
     app.click(0, 0);
-    assert!(app.render_text().contains('☑'));
+    assert!(app.render_text().contains("[✗]"));
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn space_on_checkbox_toggles_task_state() {
     app.editor
         .set_cursor(Cursor::Checkbox { block: 0, item: 0 });
     app.editor.space();
-    assert!(app.render_text().contains('☑'));
+    assert!(app.render_text().contains("[✗]"));
 }
 
 #[test]
@@ -713,6 +713,51 @@ fn overflowing_code_block_uses_bottom_thumb_without_ellipsis() {
 }
 
 #[test]
+fn code_block_scroll_thumb_is_thicker() {
+    let rendered = render_document(
+        &import_gfm("```python\nabcdefghijklmnopqrstuvwxyz0123456789\n```"),
+        RenderOptions {
+            width: 36,
+            ..RenderOptions::default()
+        },
+    );
+    let thumb = rendered
+        .display
+        .items
+        .iter()
+        .find(|item| matches!(item.action, Some(DisplayAction::ScrollCodeBlock { .. })))
+        .expect("scroll thumb");
+    assert!(thumb.rect.width >= 7);
+}
+
+#[test]
+fn internal_link_lists_render_as_toc_rows() {
+    let rendered = render_document(
+        &import_gfm(
+            "## Table of contents\n\n1. [Project identity](#project-identity)\n\n# Project identity",
+        ),
+        RenderOptions {
+            width: 28,
+            ..RenderOptions::default()
+        },
+    );
+    assert!(
+        rendered
+            .lines
+            .iter()
+            .any(|line| line.contains("Project identity"))
+    );
+    assert!(rendered.lines.iter().any(|line| line.contains("....")));
+    assert!(
+        rendered
+            .display
+            .items
+            .iter()
+            .any(|item| matches!(item.action, Some(DisplayAction::FollowLink { block: 2 })))
+    );
+}
+
+#[test]
 fn two_column_mode_balances_paragraph_blocks() {
     let opts = RenderOptions {
         columns: 2,
@@ -930,7 +975,7 @@ fn theme_matches_dark_amber_palette() {
     assert_eq!(theme.app_bg, "#0f0c08");
     assert_eq!(theme.panel_bg, "#18120d");
     assert_eq!(theme.panel_raised, "#241a12");
-    assert_eq!(theme.code_bg, "#000000");
+    assert_eq!(theme.code_bg, "#18120d");
     assert_eq!(theme.accent_primary, "#e6a85a");
     assert_eq!(theme.border_strong, "#d89a4a");
 }

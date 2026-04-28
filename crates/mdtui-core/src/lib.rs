@@ -1111,9 +1111,15 @@ pub fn inline_text(inlines: &[Inline]) -> String {
     let mut out = String::new();
     for inline in inlines {
         match inline {
-            Inline::Text(text) | Inline::InlineCode(text) | Inline::HtmlInline(text) => {
+            Inline::Text(text) | Inline::InlineCode(text) => {
                 out.push_str(text);
             }
+            Inline::HtmlInline(text)
+                if matches!(
+                    text.trim().to_ascii_lowercase().as_str(),
+                    "<sup>" | "</sup>" | "<sub>" | "</sub>"
+                ) => {}
+            Inline::HtmlInline(text) => out.push_str(text),
             Inline::Emphasis(children)
             | Inline::Strong(children)
             | Inline::Strike(children)

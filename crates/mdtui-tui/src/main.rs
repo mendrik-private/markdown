@@ -24,7 +24,7 @@ use fontdue::{
     layout::{CoordinateSystem, Layout as FontLayout, LayoutSettings, TextStyle},
 };
 use image::{ColorType, ImageEncoder, Rgba, RgbaImage, codecs::png::PngEncoder};
-use mdtui_core::{Block as DocBlock, Cursor, Direction};
+use mdtui_core::{Block as DocBlock, Cursor, Direction, Inline};
 use mdtui_render::{
     DisplayAction, DisplayKind, RenderOptions, Rendered, Theme, action_at, hit_test,
     render_document,
@@ -74,6 +74,13 @@ struct OutlineHit {
 }
 
 #[derive(Clone, Debug)]
+struct ExplorerModeHit {
+    start: u16,
+    end: u16,
+    action: ExplorerAction,
+}
+
+#[derive(Clone, Debug)]
 enum StatusAction {
     SetWrapWidth(u16),
     SetColumns(u8),
@@ -112,6 +119,23 @@ struct WrapSliderTrack {
     slots: u16,
     min: u16,
     max: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PanelScrollDrag {
+    area_y: u16,
+    track_height: u16,
+    thumb_height: u16,
+    content: usize,
+    viewport: usize,
+    grab_offset: u16,
+}
+
+struct RenderLineContext<'a> {
+    state: &'a TuiState,
+    rendered: &'a Rendered,
+    theme: &'a Theme,
+    current_y: Option<u16>,
 }
 
 fn main() -> AppResult<()> {
@@ -188,11 +212,13 @@ struct TuiState {
     outline_scroll: u16,
     collapsed_dirs: HashSet<PathBuf>,
     explorer_hits: Vec<ExplorerHit>,
+    explorer_mode_hits: Vec<ExplorerModeHit>,
     outline_hits: Vec<OutlineHit>,
     status_hits: Vec<StatusHit>,
     tab_hits: Vec<TabHit>,
     hidden_tabs: HashSet<String>,
     code_thumb_drag: Option<CodeThumbDrag>,
+    panel_scroll_drag: Option<PanelScrollDrag>,
     wrap_slider_track: Option<WrapSliderTrack>,
     wrap_slider_drag: Option<WrapSliderTrack>,
     kitty_graphics: bool,
@@ -228,11 +254,13 @@ impl TuiState {
             outline_scroll: 0,
             collapsed_dirs: HashSet::new(),
             explorer_hits: Vec::new(),
+            explorer_mode_hits: Vec::new(),
             outline_hits: Vec::new(),
             status_hits: Vec::new(),
             tab_hits: Vec::new(),
             hidden_tabs: HashSet::new(),
             code_thumb_drag: None,
+            panel_scroll_drag: None,
             wrap_slider_track: None,
             wrap_slider_drag: None,
             kitty_graphics: detect_kitty_support(),
@@ -584,6 +612,20 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         }
     }
 
+    if let Some(drag) = state.panel_scroll_drag {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                update_panel_scroll_drag(state, drag, mouse.row);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.panel_scroll_drag = None;
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if state.last_status_area.height > 0
         && mouse.column >= state.last_status_area.x
         && mouse.column
@@ -655,6 +697,29 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 } else {
                     activate_tab(state, &hit.name);
                 }
+            }
+        }
+        return;
+    }
+
+    if state.last_explorer_area.width > 2
+        && mouse.row == state.last_explorer_area.y
+        && mouse.column >= state.last_explorer_area.x
+        && mouse.column
+            < state
+                .last_explorer_area
+                .x
+                .saturating_add(state.last_explorer_area.width)
+    {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let local_x = mouse.column.saturating_sub(state.last_explorer_area.x);
+            if let Some(action) = state
+                .explorer_mode_hits
+                .iter()
+                .find(|hit| local_x >= hit.start && local_x < hit.end)
+                .map(|hit| hit.action.clone())
+            {
+                run_explorer_action(state, &action);
             }
         }
         return;
@@ -743,6 +808,36 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     }
 
     let area = state.last_doc_area;
+    if mouse.column == area.x.saturating_add(area.width.saturating_sub(1))
+        && mouse.row > area.y
+        && mouse.row < area.y.saturating_add(area.height.saturating_sub(1))
+        && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+    {
+        let viewport = usize::from(area.height.saturating_sub(2));
+        let content = state
+            .last_rendered
+            .as_ref()
+            .map(|rendered| rendered.lines.len())
+            .unwrap_or(0);
+        if viewport > 0 && content > viewport {
+            let thumb_height = ((viewport * viewport) / content).max(1).min(viewport) as u16;
+            let track_height = area.height.saturating_sub(2);
+            let drag = PanelScrollDrag {
+                area_y: area.y + 1,
+                track_height,
+                thumb_height,
+                content,
+                viewport,
+                grab_offset: mouse
+                    .row
+                    .saturating_sub(area.y + 1)
+                    .min(thumb_height.saturating_sub(1)),
+            };
+            state.panel_scroll_drag = Some(drag);
+            update_panel_scroll_drag(state, drag, mouse.row);
+        }
+        return;
+    }
     if mouse.column <= area.x
         || mouse.row <= area.y
         || mouse.column >= area.x.saturating_add(area.width.saturating_sub(1))
@@ -763,7 +858,9 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 && let Some(action) = action_at(x, y, &rendered.display)
             {
                 match action {
-                    DisplayAction::CopyCodeBlock { .. } => run_action(state, action),
+                    DisplayAction::CopyCodeBlock { .. } | DisplayAction::FollowLink { .. } => {
+                        run_action(state, action)
+                    }
                     DisplayAction::ScrollCodeBlock {
                         block,
                         track_start,
@@ -806,6 +903,7 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         MouseEventKind::Up(MouseButton::Left) => {
             state.drag_anchor = None;
             state.code_thumb_drag = None;
+            state.panel_scroll_drag = None;
         }
         MouseEventKind::ScrollDown => {
             state.preferred_column = None;
@@ -836,7 +934,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     let columns = Layout::default()
         .direction(LayoutDirection::Horizontal)
-        .constraints([Constraint::Length(31), Constraint::Min(40)])
+        .constraints([Constraint::Length(43), Constraint::Min(40)])
         .split(body_area);
     let sidebar = columns[0];
     let doc_column = columns[1];
@@ -916,6 +1014,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     draw_explorer(
         frame,
         sidebar_split[0],
+        state,
         &explorer_lines,
         state.explorer_scroll,
         &theme,
@@ -1106,10 +1205,12 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
 fn draw_explorer(
     frame: &mut Frame<'_>,
     area: Rect,
+    state: &mut TuiState,
     lines: &[Line<'static>],
     scroll: u16,
     theme: &Theme,
 ) {
+    state.explorer_mode_hits.clear();
     frame.render_widget(
         Paragraph::new(lines.to_vec())
             .scroll((scroll, 0))
@@ -1129,6 +1230,62 @@ fn draw_explorer(
             ),
         area,
     );
+    if area.width <= 2 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let right = area.x.saturating_add(area.width.saturating_sub(1));
+    let flat_label = "[flat]";
+    let nested_label = "[nested]";
+    let controls = format!("{flat_label} {nested_label}");
+    let start = right
+        .saturating_sub(controls.chars().count() as u16)
+        .saturating_sub(1);
+    let mut x = start;
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        " ",
+        Style::default().bg(rgb(theme.panel_bg)),
+    );
+    let flat_start = x.saturating_sub(area.x);
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        flat_label,
+        toggle_style(state.explorer_mode == ExplorerMode::Flat, theme),
+    );
+    state.explorer_mode_hits.push(ExplorerModeHit {
+        start: flat_start,
+        end: flat_start.saturating_add(flat_label.chars().count() as u16),
+        action: ExplorerAction::ToggleMode(ExplorerMode::Flat),
+    });
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        " ",
+        Style::default().bg(rgb(theme.panel_bg)),
+    );
+    let nested_start = x.saturating_sub(area.x);
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        nested_label,
+        toggle_style(state.explorer_mode == ExplorerMode::Nested, theme),
+    );
+    state.explorer_mode_hits.push(ExplorerModeHit {
+        start: nested_start,
+        end: nested_start.saturating_add(nested_label.chars().count() as u16),
+        action: ExplorerAction::ToggleMode(ExplorerMode::Nested),
+    });
 }
 
 fn draw_outline(
@@ -1201,6 +1358,12 @@ fn draw_document(
     let current_y =
         cursor_position(&state.app.editor.cursor, &rendered.display.items).map(|(_, y)| y);
     let selection_rects = selection_rects(state, rendered);
+    let render_context = RenderLineContext {
+        state,
+        rendered,
+        theme,
+        current_y,
+    };
     let lines = rendered
         .lines
         .iter()
@@ -1229,9 +1392,8 @@ fn draw_document(
                     index,
                     line,
                     rendered.lines.get(index + 1).map(String::as_str),
+                    &render_context,
                     in_code,
-                    theme,
-                    current_y,
                 ))
             }
         })
@@ -1303,27 +1465,6 @@ fn draw_status(
         Style::default()
             .fg(rgb(theme.app_bg))
             .bg(rgb(theme.accent_primary))
-            .add_modifier(Modifier::BOLD),
-    );
-    put(
-        buf,
-        &mut x,
-        area.y,
-        right,
-        &format!(" {}{} ", compact_text(&state.message, 28), selection),
-        Style::default()
-            .fg(rgb(theme.text_secondary))
-            .bg(rgb(theme.panel_bg)),
-    );
-    put(
-        buf,
-        &mut x,
-        area.y,
-        right,
-        &format!(" {} row {row} col {col} ", file_leaf(&state.app.file_name)),
-        Style::default()
-            .fg(rgb(theme.text_primary))
-            .bg(rgb(theme.panel_bg))
             .add_modifier(Modifier::BOLD),
     );
     put(
@@ -1453,6 +1594,27 @@ fn draw_status(
         &mut x,
         area.y,
         right,
+        &format!(" {}{} ", compact_text(&state.message, 28), selection),
+        Style::default()
+            .fg(rgb(theme.text_secondary))
+            .bg(rgb(theme.panel_bg)),
+    );
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
+        &format!(" {} row {row} col {col} ", file_leaf(&state.app.file_name)),
+        Style::default()
+            .fg(rgb(theme.text_primary))
+            .bg(rgb(theme.panel_bg))
+            .add_modifier(Modifier::BOLD),
+    );
+    put(
+        buf,
+        &mut x,
+        area.y,
+        right,
         &format!(
             "  {} / {}  ctrl-1/2/3 cols  ctrl--/ctrl-= wrap  F1/? help",
             row,
@@ -1564,12 +1726,28 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
                 .bg(rgb(theme.panel_bg))
         } else {
             Style::default()
-                .fg(rgb(theme.border))
+                .fg(rgb(theme.accent_primary))
                 .bg(rgb(theme.panel_bg))
         };
         lines.push(Line::from(Span::styled(ch.to_string(), style)));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn update_panel_scroll_drag(state: &mut TuiState, drag: PanelScrollDrag, row: u16) {
+    let max_thumb_start = drag.track_height.saturating_sub(drag.thumb_height);
+    let thumb_start = row
+        .saturating_sub(drag.area_y)
+        .saturating_sub(drag.grab_offset)
+        .min(max_thumb_start);
+    let max_scroll = drag.content.saturating_sub(drag.viewport);
+    state.scroll = if max_scroll == 0 || max_thumb_start == 0 {
+        0
+    } else {
+        usize::from(thumb_start)
+            .saturating_mul(max_scroll)
+            .div_ceil(usize::from(max_thumb_start)) as u16
+    };
 }
 
 fn run_action(state: &mut TuiState, action: DisplayAction) {
@@ -1585,6 +1763,15 @@ fn run_action(state: &mut TuiState, action: DisplayAction) {
                 Ok(()) => state.message = "code block copied".to_string(),
                 Err(error) => state.message = format!("copy failed: {error}"),
             }
+        }
+        DisplayAction::FollowLink { block } => {
+            state.preferred_column = None;
+            state
+                .app
+                .editor
+                .set_cursor(Cursor::Text { block, offset: 0 });
+            state.message = "link jump".to_string();
+            ensure_cursor_visible(state);
         }
         DisplayAction::ScrollCodeBlock { .. } => {}
     }
@@ -1746,33 +1933,6 @@ fn explorer_lines(
     let mut lines = Vec::new();
     let mut hits = Vec::new();
 
-    let flat_label = "[flat]";
-    let nested_label = "[nested]";
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            flat_label.to_string(),
-            toggle_style(mode == ExplorerMode::Flat, theme),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            nested_label.to_string(),
-            toggle_style(mode == ExplorerMode::Nested, theme),
-        ),
-    ]));
-    hits.push(ExplorerHit {
-        row: 0,
-        start: 1,
-        end: 1 + flat_label.chars().count() as u16,
-        action: ExplorerAction::ToggleMode(ExplorerMode::Flat),
-    });
-    hits.push(ExplorerHit {
-        row: 0,
-        start: 2 + flat_label.chars().count() as u16,
-        end: 2 + flat_label.chars().count() as u16 + nested_label.chars().count() as u16,
-        action: ExplorerAction::ToggleMode(ExplorerMode::Nested),
-    });
-
     match mode {
         ExplorerMode::Flat => {
             let mut files = Vec::new();
@@ -1785,7 +1945,7 @@ fn explorer_lines(
                     active_file.ends_with(&label) || active_file == file.display().to_string();
                 lines.push(Line::from(vec![
                     Span::styled(
-                        " M ".to_string(),
+                        "▪ ".to_string(),
                         Style::default()
                             .fg(rgb(theme.link))
                             .bg(rgb(if active {
@@ -1844,7 +2004,7 @@ fn explorer_lines(
                 ),
             ]));
             hits.push(ExplorerHit {
-                row: 1,
+                row: 0,
                 start: 0,
                 end: u16::MAX,
                 action: ExplorerAction::ToggleDir(root.clone()),
@@ -1863,7 +2023,7 @@ fn explorer_lines(
         }
     }
 
-    if lines.len() == 1 {
+    if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             " no markdown files".to_string(),
             Style::default()
@@ -1963,7 +2123,7 @@ fn walk_dir_nested(
                         })),
                 ),
                 Span::styled(
-                    " M ".to_string(),
+                    "▪ ".to_string(),
                     Style::default()
                         .fg(rgb(theme.link))
                         .bg(rgb(if active {
@@ -2038,7 +2198,7 @@ fn outline_lines(
             .fg(rgb(if active {
                 theme.accent_highlight
             } else {
-                theme.link
+                theme.accent_primary
             }))
             .bg(rgb(bg))
             .add_modifier(if active {
@@ -2140,10 +2300,10 @@ fn style_rendered_line(
     index: usize,
     line: &str,
     next_line: Option<&str>,
+    context: &RenderLineContext<'_>,
     in_code: &mut bool,
-    theme: &Theme,
-    current_y: Option<u16>,
 ) -> Line<'static> {
+    let theme = context.theme;
     if line.starts_with('╭') && line.contains('┬') {
         *in_code = true;
         return style_code_header(line, theme);
@@ -2159,7 +2319,16 @@ fn style_rendered_line(
         return Line::from(Span::styled(line.to_string(), code_border(theme)));
     }
     if *in_code && line.starts_with('│') {
-        return style_code_body(line, theme);
+        return style_code_body(
+            line,
+            theme,
+            code_source_for_row(
+                index,
+                context.rendered,
+                &context.state.app.editor.document,
+                &context.state.app.render_options.code_horizontal_scrolls,
+            ),
+        );
     }
     if line.starts_with("▰ ") {
         return Line::from(Span::styled(
@@ -2168,22 +2337,581 @@ fn style_rendered_line(
         ));
     }
 
-    let mut style = Style::default()
-        .fg(rgb(theme.text_primary))
-        .bg(rgb(theme.panel_bg));
+    let background = if context.current_y.is_some_and(|y| y as usize == index) {
+        rgb(theme.panel_raised)
+    } else {
+        rgb(theme.panel_bg)
+    };
+    let mut style = Style::default().fg(rgb(theme.text_primary)).bg(background);
     if next_line.is_some_and(is_heading_rule) {
         style = style
             .fg(rgb(theme.accent_highlight))
             .add_modifier(Modifier::BOLD);
     } else if is_heading_rule(line) {
-        style = Style::default()
-            .fg(rgb(theme.border_strong))
-            .bg(rgb(theme.panel_bg));
-    }
-    if current_y.is_some_and(|y| y as usize == index) {
-        style = style.bg(rgb(theme.panel_raised));
+        style = Style::default().fg(rgb(theme.border_strong)).bg(background);
+    } else if let Some(spans) = styled_text_spans_for_row(
+        index,
+        line,
+        context.state,
+        context.rendered,
+        theme,
+        background,
+        next_line,
+    ) {
+        return Line::from(spans);
+    } else if let Some(rest) = line.strip_prefix("▌ ") {
+        return Line::from(vec![
+            Span::styled(
+                "▌".to_string(),
+                Style::default()
+                    .fg(rgb(theme.border))
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {rest}"),
+                Style::default().fg(rgb(theme.text_primary)).bg(background),
+            ),
+        ]);
     }
     Line::from(Span::styled(line.to_string(), style))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InlinePaintStyle {
+    bold: bool,
+    italic: bool,
+    strike: bool,
+    code: bool,
+    link: bool,
+    superscript: bool,
+    subscript: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StyledFragment {
+    text: String,
+    style: InlinePaintStyle,
+}
+
+fn styled_text_spans_for_row(
+    index: usize,
+    line: &str,
+    state: &TuiState,
+    rendered: &Rendered,
+    theme: &Theme,
+    background: Color,
+    next_line: Option<&str>,
+) -> Option<Vec<Span<'static>>> {
+    let mut row_items = rendered
+        .display
+        .items
+        .iter()
+        .filter(|item| {
+            item.rect.y as usize == index
+                && item.kind != DisplayKind::HeadlinePlacement
+                && !(item.kind == DisplayKind::Adornment && item.text.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    if row_items.is_empty() {
+        return None;
+    }
+    row_items.sort_by_key(|item| item.rect.x);
+    let line_chars = line.chars().collect::<Vec<_>>();
+    let heading = next_line.is_some_and(is_heading_rule);
+    let toc_row = row_items
+        .iter()
+        .any(|item| matches!(item.action, Some(DisplayAction::FollowLink { .. })));
+    let numbered_row = !toc_row
+        && row_items.first().is_some_and(|item| {
+            item.kind == DisplayKind::Adornment && is_numbered_marker(&item.text)
+        });
+    let mut spans = Vec::new();
+    let mut cursor_x = 0usize;
+    for item in row_items {
+        let item_x = usize::from(item.rect.x);
+        if item_x > cursor_x && cursor_x < line_chars.len() {
+            spans.push(Span::styled(
+                line_chars[cursor_x..item_x.min(line_chars.len())]
+                    .iter()
+                    .collect::<String>(),
+                base_document_style(theme, background, heading, numbered_row),
+            ));
+        }
+        spans.extend(spans_for_display_item(
+            item,
+            state,
+            theme,
+            background,
+            heading,
+            numbered_row,
+        ));
+        cursor_x = item_x.saturating_add(usize::from(item.rect.width));
+    }
+    if cursor_x < line_chars.len() {
+        spans.push(Span::styled(
+            line_chars[cursor_x..].iter().collect::<String>(),
+            base_document_style(theme, background, heading, numbered_row),
+        ));
+    }
+    Some(spans)
+}
+
+fn spans_for_display_item(
+    item: &mdtui_render::DisplayItem,
+    state: &TuiState,
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Vec<Span<'static>> {
+    if item.kind == DisplayKind::Adornment {
+        return adornment_spans(&item.text, theme, background, heading, numbered_row);
+    }
+    let visible_len = item.text.chars().count();
+    if let Some(fragments) =
+        styled_fragments_for_item(item, &state.app.editor.document, visible_len)
+    {
+        let mut spans = fragments_to_spans(&fragments, theme, background, heading, numbered_row);
+        let painted = fragments
+            .iter()
+            .map(|fragment| fragment.text.chars().count())
+            .sum::<usize>();
+        if painted < usize::from(item.rect.width) {
+            spans.push(Span::styled(
+                " ".repeat(usize::from(item.rect.width) - painted),
+                base_document_style(theme, background, heading, numbered_row),
+            ));
+        }
+        return spans;
+    }
+    vec![Span::styled(
+        pad_width(&item.text, usize::from(item.rect.width)),
+        style_for_display_item(item, theme, background, heading, numbered_row),
+    )]
+}
+
+fn adornment_spans(
+    text: &str,
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Vec<Span<'static>> {
+    if text.starts_with("▌ ") {
+        return vec![
+            Span::styled(
+                "▌".to_string(),
+                Style::default()
+                    .fg(rgb(theme.border))
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " ".to_string(),
+                base_document_style(theme, background, heading, numbered_row),
+            ),
+        ];
+    }
+    if numbered_row && is_numbered_marker(text) {
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(rgb(theme.link))
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        )];
+    }
+    vec![Span::styled(
+        text.to_string(),
+        base_document_style(theme, background, heading, numbered_row),
+    )]
+}
+
+fn styled_fragments_for_item(
+    item: &mdtui_render::DisplayItem,
+    document: &mdtui_core::Document,
+    visible_len: usize,
+) -> Option<Vec<StyledFragment>> {
+    let cursor = item.cursor?;
+    if visible_len == 0 {
+        return Some(Vec::new());
+    }
+    match cursor {
+        Cursor::Text { block, offset } => {
+            styled_fragments_for_block(document.blocks.get(block)?, offset, visible_len)
+        }
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } => match document.blocks.get(block)? {
+            DocBlock::List(list) => {
+                styled_fragments_for_list_item(list.items.get(item)?, offset, visible_len)
+            }
+            _ => None,
+        },
+        Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        } => match document.blocks.get(block)? {
+            DocBlock::Table(table) => {
+                let cell = table.rows.get(row)?.cells.get(col)?;
+                styled_fragments_for_table_cell(cell, offset, visible_len)
+            }
+            _ => None,
+        },
+        Cursor::Checkbox { .. } => None,
+    }
+}
+
+fn styled_fragments_for_block(
+    block: &DocBlock,
+    offset: usize,
+    visible_len: usize,
+) -> Option<Vec<StyledFragment>> {
+    let fragments = styled_fragments_from_block(block);
+    Some(slice_styled_fragments(&fragments, offset, visible_len))
+}
+
+fn styled_fragments_for_list_item(
+    item: &mdtui_core::ListItem,
+    offset: usize,
+    visible_len: usize,
+) -> Option<Vec<StyledFragment>> {
+    let block = item.blocks.first()?;
+    styled_fragments_for_block(block, offset, visible_len)
+}
+
+fn styled_fragments_for_table_cell(
+    cell: &mdtui_core::TableCell,
+    offset: usize,
+    visible_len: usize,
+) -> Option<Vec<StyledFragment>> {
+    let block = cell.blocks.first()?;
+    styled_fragments_for_block(block, offset, visible_len)
+}
+
+fn styled_fragments_from_block(block: &DocBlock) -> Vec<StyledFragment> {
+    match block {
+        DocBlock::Paragraph(inlines) => styled_fragments_from_inlines(inlines),
+        DocBlock::Heading { level, inlines } => {
+            let mut fragments = styled_fragments_from_inlines(inlines);
+            if *level == 1 {
+                for fragment in &mut fragments {
+                    fragment.text = fragment.text.to_uppercase();
+                }
+            }
+            fragments
+        }
+        DocBlock::BlockQuote(blocks) => {
+            let mut fragments = Vec::new();
+            for (index, block) in blocks.iter().enumerate() {
+                fragments.extend(styled_fragments_from_block(block));
+                if index + 1 < blocks.len() {
+                    push_fragment(
+                        &mut fragments,
+                        "\n".to_string(),
+                        InlinePaintStyle::default(),
+                    );
+                }
+            }
+            fragments
+        }
+        _ => vec![StyledFragment {
+            text: block.rendered_text(),
+            style: InlinePaintStyle::default(),
+        }],
+    }
+}
+
+fn styled_fragments_from_inlines(inlines: &[Inline]) -> Vec<StyledFragment> {
+    let mut fragments = Vec::new();
+    flatten_inlines(inlines, InlinePaintStyle::default(), &mut fragments);
+    fragments
+}
+
+fn flatten_inlines(inlines: &[Inline], current: InlinePaintStyle, out: &mut Vec<StyledFragment>) {
+    let mut current = current;
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => push_fragment(out, apply_super_sub(text, current), current),
+            Inline::Emphasis(children) => {
+                let mut next = current;
+                next.italic = true;
+                flatten_inlines(children, next, out);
+            }
+            Inline::Strong(children) => {
+                let mut next = current;
+                next.bold = true;
+                flatten_inlines(children, next, out);
+            }
+            Inline::Strike(children) => {
+                let mut next = current;
+                next.strike = true;
+                flatten_inlines(children, next, out);
+            }
+            Inline::InlineCode(text) => {
+                let mut next = current;
+                next.code = true;
+                push_fragment(out, apply_super_sub(text, next), next);
+            }
+            Inline::Link { children, .. } => {
+                let mut next = current;
+                next.link = true;
+                flatten_inlines(children, next, out);
+            }
+            Inline::Image { alt, .. } => push_fragment(out, apply_super_sub(alt, current), current),
+            Inline::HtmlInline(html) => {
+                let tag = html.trim();
+                if tag.eq_ignore_ascii_case("<sup>") {
+                    current.superscript = true;
+                    continue;
+                }
+                if tag.eq_ignore_ascii_case("</sup>") {
+                    current.superscript = false;
+                    continue;
+                }
+                if tag.eq_ignore_ascii_case("<sub>") {
+                    current.subscript = true;
+                    continue;
+                }
+                if tag.eq_ignore_ascii_case("</sub>") {
+                    current.subscript = false;
+                    continue;
+                }
+                push_fragment(out, html.clone(), current);
+            }
+            Inline::SoftBreak | Inline::HardBreak => {
+                push_fragment(out, "\n".to_string(), InlinePaintStyle::default())
+            }
+        }
+    }
+}
+
+fn push_fragment(out: &mut Vec<StyledFragment>, text: String, style: InlinePaintStyle) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = out.last_mut()
+        && last.style == style
+    {
+        last.text.push_str(&text);
+    } else {
+        out.push(StyledFragment { text, style });
+    }
+}
+
+fn apply_super_sub(text: &str, style: InlinePaintStyle) -> String {
+    if style.superscript {
+        text.chars().map(to_superscript_char).collect()
+    } else if style.subscript {
+        text.chars().map(to_subscript_char).collect()
+    } else {
+        text.to_string()
+    }
+}
+
+fn slice_styled_fragments(
+    fragments: &[StyledFragment],
+    start: usize,
+    visible_len: usize,
+) -> Vec<StyledFragment> {
+    let end = start.saturating_add(visible_len);
+    let mut offset = 0usize;
+    let mut out = Vec::new();
+    for fragment in fragments {
+        let fragment_len = fragment.text.chars().count();
+        let fragment_end = offset.saturating_add(fragment_len);
+        if fragment_end <= start {
+            offset = fragment_end;
+            continue;
+        }
+        if offset >= end {
+            break;
+        }
+        let local_start = start.saturating_sub(offset);
+        let local_end = fragment_len.min(end.saturating_sub(offset));
+        if local_end > local_start {
+            out.push(StyledFragment {
+                text: fragment
+                    .text
+                    .chars()
+                    .skip(local_start)
+                    .take(local_end - local_start)
+                    .collect(),
+                style: fragment.style,
+            });
+        }
+        offset = fragment_end;
+    }
+    out
+}
+
+fn fragments_to_spans(
+    fragments: &[StyledFragment],
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Vec<Span<'static>> {
+    fragments
+        .iter()
+        .map(|fragment| {
+            Span::styled(
+                fragment.text.clone(),
+                style_for_inline_fragment(fragment.style, theme, background, heading, numbered_row),
+            )
+        })
+        .collect()
+}
+
+fn base_document_style(
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Style {
+    let mut style = Style::default()
+        .fg(rgb(if numbered_row {
+            theme.accent_highlight
+        } else {
+            theme.text_primary
+        }))
+        .bg(background);
+    if heading {
+        style = style
+            .fg(rgb(theme.accent_highlight))
+            .add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn style_for_display_item(
+    item: &mdtui_render::DisplayItem,
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Style {
+    if matches!(item.action, Some(DisplayAction::FollowLink { .. })) {
+        return Style::default()
+            .fg(rgb(theme.link))
+            .bg(background)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    base_document_style(theme, background, heading, numbered_row)
+}
+
+fn style_for_inline_fragment(
+    fragment: InlinePaintStyle,
+    theme: &Theme,
+    background: Color,
+    heading: bool,
+    numbered_row: bool,
+) -> Style {
+    let mut style = base_document_style(theme, background, heading, numbered_row);
+    if fragment.link {
+        style = style.fg(rgb(theme.link)).add_modifier(Modifier::UNDERLINED);
+    }
+    if fragment.code {
+        style = style.bg(rgb(theme.panel_raised));
+    }
+    if fragment.bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if fragment.italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if fragment.strike {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if fragment.superscript || fragment.subscript {
+        style = style
+            .fg(rgb(theme.accent_highlight))
+            .add_modifier(Modifier::BOLD);
+    }
+    style
+}
+
+fn is_numbered_marker(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some((number, _)) = trimmed.split_once('.') else {
+        return false;
+    };
+    number.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn pad_width(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - len))
+    }
+}
+
+fn to_superscript_char(ch: char) -> char {
+    match ch {
+        '0' => '⁰',
+        '1' => '¹',
+        '2' => '²',
+        '3' => '³',
+        '4' => '⁴',
+        '5' => '⁵',
+        '6' => '⁶',
+        '7' => '⁷',
+        '8' => '⁸',
+        '9' => '⁹',
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'n' => 'ⁿ',
+        'i' => 'ⁱ',
+        _ => ch,
+    }
+}
+
+fn to_subscript_char(ch: char) -> char {
+    match ch {
+        '0' => '₀',
+        '1' => '₁',
+        '2' => '₂',
+        '3' => '₃',
+        '4' => '₄',
+        '5' => '₅',
+        '6' => '₆',
+        '7' => '₇',
+        '8' => '₈',
+        '9' => '₉',
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        '(' => '₍',
+        ')' => '₎',
+        'a' => 'ₐ',
+        'e' => 'ₑ',
+        'h' => 'ₕ',
+        'i' => 'ᵢ',
+        'j' => 'ⱼ',
+        'k' => 'ₖ',
+        'l' => 'ₗ',
+        'm' => 'ₘ',
+        'n' => 'ₙ',
+        'o' => 'ₒ',
+        'p' => 'ₚ',
+        'r' => 'ᵣ',
+        's' => 'ₛ',
+        't' => 'ₜ',
+        'u' => 'ᵤ',
+        'v' => 'ᵥ',
+        'x' => 'ₓ',
+        _ => ch,
+    }
 }
 
 fn selection_rects(state: &TuiState, rendered: &Rendered) -> Vec<mdtui_render::Rect> {
@@ -2394,14 +3122,18 @@ fn style_code_toolbar(line: &str, theme: &Theme) -> Line<'static> {
             "copy".to_string(),
             Style::default()
                 .fg(rgb(theme.link))
-                .bg(rgb(theme.panel_bg))
+                .bg(rgb(theme.app_bg))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(after.to_string(), code_border(theme)),
     ])
 }
 
-fn style_code_body(line: &str, theme: &Theme) -> Line<'static> {
+fn style_code_body(
+    line: &str,
+    theme: &Theme,
+    code_source: Option<(String, usize)>,
+) -> Line<'static> {
     let content = line.trim_start_matches('│');
     let Some((number, rest)) = content.split_once("│ ") else {
         return Line::from(Span::styled(line.to_string(), code_text(theme)));
@@ -2412,9 +3144,117 @@ fn style_code_body(line: &str, theme: &Theme) -> Line<'static> {
         Span::styled(number.to_string(), code_gutter(theme)),
         Span::styled("│ ".to_string(), code_gutter_divider(theme)),
     ];
-    spans.extend(highlight_code(&rest, theme));
+    if let Some((source, scroll)) = code_source {
+        spans.extend(highlight_code_window(
+            &source,
+            scroll,
+            rest.chars().count(),
+            theme,
+        ));
+    } else {
+        spans.extend(highlight_code(&rest, theme));
+    }
     spans.push(Span::styled(" │".to_string(), code_border(theme)));
     Line::from(spans)
+}
+
+fn code_source_for_row(
+    index: usize,
+    rendered: &Rendered,
+    document: &mdtui_core::Document,
+    scrolls: &[(usize, usize)],
+) -> Option<(String, usize)> {
+    let item = rendered.display.items.iter().find(|item| {
+        item.rect.y as usize == index
+            && item.kind == DisplayKind::TextRun
+            && item.rect.x == 6
+            && matches!(
+                item.cursor,
+                Some(Cursor::Text {
+                    block: _,
+                    offset: _
+                })
+            )
+    })?;
+    let Cursor::Text { block, offset } = item.cursor? else {
+        return None;
+    };
+    let DocBlock::CodeBlock { text, .. } = document.blocks.get(block)? else {
+        return None;
+    };
+    let source = code_line_for_offset(text, offset)?.to_string();
+    Some((
+        source,
+        scrolls
+            .iter()
+            .find(|(scroll_block, _)| *scroll_block == block)
+            .map(|(_, scroll)| *scroll)
+            .unwrap_or(0),
+    ))
+}
+
+fn code_line_for_offset(text: &str, offset: usize) -> Option<&str> {
+    let mut current = 0usize;
+    for line in text.lines() {
+        if current == offset {
+            return Some(line);
+        }
+        current += line.chars().count() + 1;
+    }
+    None
+}
+
+fn highlight_code_window(
+    source: &str,
+    scroll: usize,
+    visible_width: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let highlighted = highlight_code(source, theme);
+    slice_highlighted_spans(highlighted, scroll, visible_width, code_text(theme))
+}
+
+fn slice_highlighted_spans(
+    spans: Vec<Span<'static>>,
+    start: usize,
+    visible_width: usize,
+    fill_style: Style,
+) -> Vec<Span<'static>> {
+    let end = start.saturating_add(visible_width);
+    let mut offset = 0usize;
+    let mut painted = 0usize;
+    let mut out = Vec::new();
+    for span in spans {
+        let span_text = span.content.to_string();
+        let span_len = span_text.chars().count();
+        let span_end = offset.saturating_add(span_len);
+        if span_end <= start {
+            offset = span_end;
+            continue;
+        }
+        if offset >= end {
+            break;
+        }
+        let local_start = start.saturating_sub(offset);
+        let local_end = span_len.min(end.saturating_sub(offset));
+        if local_end > local_start {
+            let text = span_text
+                .chars()
+                .skip(local_start)
+                .take(local_end - local_start)
+                .collect::<String>();
+            painted += text.chars().count();
+            out.push(Span::styled(text, span.style));
+        }
+        offset = span_end;
+    }
+    if painted < visible_width {
+        out.push(Span::styled(
+            " ".repeat(visible_width - painted),
+            fill_style,
+        ));
+    }
+    out
 }
 
 fn highlight_code(source: &str, theme: &Theme) -> Vec<Span<'static>> {
@@ -3384,15 +4224,11 @@ fn rgb(hex: &str) -> Color {
 }
 
 fn code_border(theme: &Theme) -> Style {
-    Style::default()
-        .fg(rgb(theme.border_strong))
-        .bg(rgb(theme.panel_raised))
+    Style::default().fg(rgb(theme.border)).bg(rgb(theme.app_bg))
 }
 
 fn code_gutter_border(theme: &Theme) -> Style {
-    Style::default()
-        .fg(rgb(theme.border_strong))
-        .bg(rgb(theme.panel_bg))
+    Style::default().fg(rgb(theme.border)).bg(rgb(theme.app_bg))
 }
 
 fn code_gutter_divider(theme: &Theme) -> Style {
@@ -3785,6 +4621,304 @@ mod tests {
         assert_eq!(
             buffer.cell((18, 2)).expect("content edge cell").symbol(),
             " "
+        );
+    }
+
+    #[test]
+    fn inline_marks_render_with_terminal_modifiers() {
+        let state = TuiState::new(
+            App::from_markdown("x.md", "**bold** *ital* ~~gone~~ <sup>2</sup> <sub>2</sub>"),
+            None,
+        );
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 4,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(50, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+        let line = &rendered.lines[0];
+        let bold_x = line.find("bold").expect("bold segment") as u16;
+        let ital_x = line.find("ital").expect("italic segment") as u16;
+        let gone_x = line.find("gone").expect("strike segment") as u16;
+
+        assert!(
+            buffer
+                .cell((1 + bold_x, 1))
+                .expect("bold cell")
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        assert!(
+            buffer
+                .cell((1 + ital_x, 1))
+                .expect("italic cell")
+                .modifier
+                .contains(Modifier::ITALIC)
+        );
+        assert!(
+            buffer
+                .cell((1 + gone_x, 1))
+                .expect("strike cell")
+                .modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert!(
+            (1..area.width.saturating_sub(1))
+                .filter_map(|x| buffer.cell((x, 1)))
+                .any(|cell| cell.symbol() == "²")
+        );
+        assert!(
+            (1..area.width.saturating_sub(1))
+                .filter_map(|x| buffer.cell((x, 1)))
+                .any(|cell| cell.symbol() == "₂")
+        );
+    }
+
+    #[test]
+    fn horizontal_code_scroll_keeps_keyword_highlight() {
+        let theme = Theme::dark_amber();
+        let spans = highlight_code_window("return value", 2, 10, &theme);
+        let first = spans.first().expect("highlighted keyword slice");
+        assert_eq!(first.content.to_string(), "turn");
+        assert_eq!(first.style.fg, Some(rgb(theme.accent_primary)));
+    }
+
+    #[test]
+    fn clicking_toc_row_follows_heading_link() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "## Table of contents\n\n1. [Project identity](#project-identity)\n\n# Project identity",
+            ),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 60,
+            height: 12,
+        };
+        state.app.render_options = RenderOptions {
+            width: 28,
+            heading_width: 28,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let toc_item = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| matches!(item.action, Some(DisplayAction::FollowLink { block: 2 })))
+            .cloned()
+            .expect("toc row");
+        state.last_rendered = Some(rendered);
+        let column = state.last_doc_area.x + 1 + toc_item.rect.x;
+        let row = state.last_doc_area.y + 1 + toc_item.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 2,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn explorer_and_outline_sidebar_are_wider() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "body"), None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw ui");
+
+        assert_eq!(state.last_explorer_area.width, 43);
+        assert_eq!(state.last_outline_area.width, 43);
+    }
+
+    #[test]
+    fn dragging_panel_scrollbar_updates_scroll() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "one\n\ntwo\n\nthree\n\nfour\n\nfive\n\nsix\n\nseven\n\neight",
+            ),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 40,
+            height: 6,
+        };
+        state.last_rendered = Some(render_document(
+            &state.app.editor.document,
+            RenderOptions {
+                width: 24,
+                heading_width: 24,
+                kitty_graphics: false,
+                show_status: false,
+                ..RenderOptions::default()
+            },
+        ));
+        let column = state.last_doc_area.x + state.last_doc_area.width.saturating_sub(1);
+        let start_row = state.last_doc_area.y + 2;
+        let end_row = state.last_doc_area.y + state.last_doc_area.height.saturating_sub(2);
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: start_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column,
+                row: end_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column,
+                row: end_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(state.scroll > 0);
+        assert!(state.panel_scroll_drag.is_none());
+    }
+
+    #[test]
+    fn explorer_mode_controls_live_on_top_border() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "body"), None);
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 43,
+            height: 10,
+        };
+        let (lines, hits) = explorer_lines(
+            None,
+            &state.app.file_name,
+            state.explorer_mode,
+            &state.collapsed_dirs,
+            &theme,
+        );
+        state.explorer_hits = hits;
+        state.last_explorer_area = area;
+        let mut terminal = Terminal::new(TestBackend::new(43, 10)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_explorer(frame, area, &mut state, &lines, 0, &theme))
+            .expect("draw explorer");
+        let flat = state
+            .explorer_mode_hits
+            .iter()
+            .find(|hit| matches!(hit.action, ExplorerAction::ToggleMode(ExplorerMode::Flat)))
+            .expect("flat hit");
+        let column = area.x + flat.start;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: area.y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(matches!(state.explorer_mode, ExplorerMode::Flat));
+    }
+
+    #[test]
+    fn ordered_list_rows_use_blue_numbers_and_accent_text() {
+        let state = TuiState::new(App::from_markdown("x.md", "1. alpha"), None);
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 4,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            buffer.cell((1, 1)).expect("number cell").fg,
+            rgb(theme.link)
+        );
+        assert_eq!(
+            buffer.cell((4, 1)).expect("text cell").fg,
+            rgb(theme.accent_highlight)
+        );
+    }
+
+    #[test]
+    fn code_chrome_uses_page_background_and_light_border() {
+        let state = TuiState::new(
+            App::from_markdown("x.md", "```rust\nfn main() {}\n```"),
+            None,
+        );
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_headline_fallback(&state, &mut rendered);
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 8,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+
+        assert_eq!(
+            buffer.cell((1, 1)).expect("top border cell").bg,
+            rgb(theme.app_bg)
+        );
+        assert_eq!(
+            buffer.cell((1, 1)).expect("top border cell").fg,
+            rgb(theme.border)
         );
     }
 }
