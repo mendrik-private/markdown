@@ -93,7 +93,7 @@ struct StatusHit {
     action: StatusAction,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StylePopupAction {
     Bold,
     Italic,
@@ -101,6 +101,8 @@ enum StylePopupAction {
     Code,
     Superscript,
     Subscript,
+    Clear,
+    Quote,
 }
 
 impl StylePopupAction {
@@ -112,6 +114,8 @@ impl StylePopupAction {
             Self::Code => "Ctrl+E",
             Self::Superscript => "Ctrl+.",
             Self::Subscript => "Ctrl+,",
+            Self::Clear => "Enter",
+            Self::Quote => "Enter",
         }
     }
 
@@ -123,6 +127,8 @@ impl StylePopupAction {
             Self::Code => "Code",
             Self::Superscript => "Superscript",
             Self::Subscript => "Subscript",
+            Self::Clear => "Clear style",
+            Self::Quote => "Block quote",
         }
     }
 }
@@ -149,6 +155,45 @@ struct TabHit {
     close_start: u16,
     close_end: u16,
     name: String,
+}
+
+#[derive(Clone, Debug)]
+enum TabControlAction {
+    NewFile,
+    OpenMenu,
+}
+
+#[derive(Clone, Debug)]
+struct TabControlHit {
+    start: u16,
+    end: u16,
+    action: TabControlAction,
+}
+
+#[derive(Clone, Debug)]
+enum FilePopup {
+    Menu,
+    NewFile { input: String },
+    RenameFile { input: String, path: PathBuf },
+    DeleteFile { path: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+enum FilePopupAction {
+    Create,
+    Rename,
+    Delete,
+    Cancel,
+    OpenRename,
+    OpenDelete,
+}
+
+#[derive(Clone, Debug)]
+struct FilePopupHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    action: FilePopupAction,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,7 +314,11 @@ struct TuiState {
     outline_hits: Vec<OutlineHit>,
     status_hits: Vec<StatusHit>,
     tab_hits: Vec<TabHit>,
+    tab_control_hits: Vec<TabControlHit>,
     hidden_tabs: HashSet<String>,
+    file_popup: Option<FilePopup>,
+    file_popup_hits: Vec<FilePopupHit>,
+    last_file_popup: Option<Rect>,
     code_thumb_drag: Option<CodeThumbDrag>,
     panel_scroll_drag: Option<PanelScrollDrag>,
     wrap_slider_track: Option<WrapSliderTrack>,
@@ -285,7 +334,7 @@ struct TuiState {
 impl TuiState {
     fn new(app: App, path: Option<PathBuf>) -> Self {
         let (headline_raster_tx, headline_raster_rx) = mpsc::channel();
-        Self {
+        let mut state = Self {
             app,
             path,
             scroll: 0,
@@ -315,7 +364,11 @@ impl TuiState {
             outline_hits: Vec::new(),
             status_hits: Vec::new(),
             tab_hits: Vec::new(),
+            tab_control_hits: Vec::new(),
             hidden_tabs: HashSet::new(),
+            file_popup: None,
+            file_popup_hits: Vec::new(),
+            last_file_popup: None,
             code_thumb_drag: None,
             panel_scroll_drag: None,
             wrap_slider_track: None,
@@ -326,7 +379,9 @@ impl TuiState {
             pending_headline_jobs: HashSet::new(),
             headline_raster_tx,
             headline_raster_rx,
-        }
+        };
+        load_view_state(&mut state);
+        state
     }
 
     fn save(&mut self) {
@@ -410,7 +465,42 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         return false;
     }
 
-    if has_selection(state) && key.modifiers.is_empty() {
+    if state.file_popup.is_some() {
+        match key.code {
+            KeyCode::Esc => state.file_popup = None,
+            KeyCode::Enter => confirm_file_popup(state),
+            KeyCode::Char('n') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
+                open_new_file_popup(state)
+            }
+            KeyCode::Char('r') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
+                open_rename_file_popup(state)
+            }
+            KeyCode::Char('d') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
+                open_delete_file_popup(state)
+            }
+            KeyCode::Backspace => {
+                if let Some(FilePopup::NewFile { input } | FilePopup::RenameFile { input, .. }) =
+                    state.file_popup.as_mut()
+                {
+                    input.pop();
+                }
+            }
+            KeyCode::Char(ch)
+                if is_plain_text_key(key) || ch == '/' || ch == '.' || ch == '-' || ch == '_' =>
+            {
+                if let Some(FilePopup::NewFile { input } | FilePopup::RenameFile { input, .. }) =
+                    state.file_popup.as_mut()
+                {
+                    input.push(ch);
+                }
+            }
+            _ => {}
+        }
+        state.file_popup_hits.clear();
+        return false;
+    }
+
+    if has_selection(state) && state.app.editor.show_style_popover && key.modifiers.is_empty() {
         match key.code {
             KeyCode::Left => {
                 step_style_popup_selection(state, -1);
@@ -439,16 +529,19 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.preferred_column = None;
             state.app.render_options.columns = 1;
             state.message = "column mode 1".to_string();
+            persist_view_state(state);
         }
         KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.preferred_column = None;
             state.app.render_options.columns = 2;
             state.message = "column mode 2".to_string();
+            persist_view_state(state);
         }
         KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.preferred_column = None;
             state.app.render_options.columns = 3;
             state.message = "column mode 3".to_string();
+            persist_view_state(state);
         }
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.editor.undo();
@@ -662,8 +755,27 @@ fn ensure_cursor_visible(state: &mut TuiState) {
 }
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
+    if let Some(popup) = state.last_file_popup {
+        if mouse.column >= popup.x
+            && mouse.column < popup.x.saturating_add(popup.width)
+            && mouse.row >= popup.y
+            && mouse.row < popup.y.saturating_add(popup.height)
+        {
+            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+                click_file_popup(state, popup, mouse.column, mouse.row);
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            state.file_popup = None;
+            state.file_popup_hits.clear();
+        }
+    }
     if state.last_style_popup.is_some()
-        && !matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left))
+        && !matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
+        )
         && state.style_popup_hover.is_some()
     {
         state.style_popup_hover = None;
@@ -675,13 +787,18 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         && mouse.row < popup.y.saturating_add(popup.height)
     {
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => click_style_popup(state, popup, mouse.column, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                click_style_popup(state, popup, mouse.column, mouse.row)
+            }
             MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
                 hover_style_popup(state, popup, mouse.column, mouse.row);
             }
             _ => {}
         }
         return;
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        hide_style_popup(state);
     }
     if state.style_popup_hover.take().is_some() {
         state.dirty = true;
@@ -777,6 +894,16 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let local_x = mouse.column.saturating_sub(state.last_tabs_area.x);
             if let Some(hit) = state
+                .tab_control_hits
+                .iter()
+                .find(|hit| local_x >= hit.start && local_x < hit.end)
+                .cloned()
+            {
+                match hit.action {
+                    TabControlAction::NewFile => open_new_file_popup(state),
+                    TabControlAction::OpenMenu => state.file_popup = Some(FilePopup::Menu),
+                }
+            } else if let Some(hit) = state
                 .tab_hits
                 .iter()
                 .find(|hit| local_x >= hit.start && local_x < hit.end)
@@ -1080,7 +1207,8 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
             rendered
         })
     } else {
-        let mut rendered = render_document(&state.app.editor.document, state.app.render_options.clone());
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
         materialize_active_headline_fallback(state, &mut rendered);
         state.last_render_key = Some(render_key);
         state.last_rendered = Some(rendered.clone());
@@ -1109,6 +1237,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         &state.app.editor.document.blocks,
         cursor_block(state.app.editor.cursor),
         &theme,
+        sidebar_split[1].width.saturating_sub(2),
     );
     state.outline_hits = outline_hits;
     state.outline_scroll = clamp_scroll(
@@ -1136,7 +1265,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     draw_tabs(frame, tabs_area, state, &theme);
     draw_status(frame, status_area, state, &rendered, &theme);
 
-    if has_selection(state) {
+    if has_selection(state) && state.app.editor.show_style_popover {
         let selection_rects = selection_rects(state, &rendered);
         state.last_style_popup = Some(draw_style_popover(
             frame,
@@ -1153,6 +1282,12 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     }
     if state.show_help {
         draw_help(frame, area, &theme);
+    }
+    if state.file_popup.is_some() {
+        state.last_file_popup = Some(draw_file_popup(frame, area, state, &theme));
+    } else {
+        state.last_file_popup = None;
+        state.file_popup_hits.clear();
     }
 
     if let Some((x, y)) = cursor_position(&state.app.editor.cursor, &rendered.display.items) {
@@ -1174,6 +1309,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
         return;
     }
     state.tab_hits.clear();
+    state.tab_control_hits.clear();
 
     let top_y = area.y;
     let label_y = area.y + if area.height > 1 { 1 } else { 0 };
@@ -1306,6 +1442,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
 
     let controls_width = "  +  ⋮ ".chars().count() as u16;
     let mut controls_x = right.saturating_sub(controls_width.saturating_add(1));
+    let start = controls_x.saturating_sub(area.x);
     put(
         buf,
         &mut controls_x,
@@ -1316,6 +1453,16 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
             .fg(rgb(theme.text_secondary))
             .bg(rgb(theme.panel_bg)),
     );
+    state.tab_control_hits.push(TabControlHit {
+        start: start.saturating_add(2),
+        end: start.saturating_add(3),
+        action: TabControlAction::NewFile,
+    });
+    state.tab_control_hits.push(TabControlHit {
+        start: start.saturating_add(5),
+        end: start.saturating_add(6),
+        action: TabControlAction::OpenMenu,
+    });
 }
 
 fn draw_explorer(
@@ -1797,63 +1944,177 @@ fn draw_style_popover(
     state: &mut TuiState,
     theme: &Theme,
 ) -> Rect {
-    let chips = [
-        ("B", StylePopupAction::Bold),
-        ("I", StylePopupAction::Italic),
-        ("S", StylePopupAction::Strike),
-        ("</>", StylePopupAction::Code),
-        ("x^", StylePopupAction::Superscript),
-        ("x_", StylePopupAction::Subscript),
-    ];
-    let shortcuts = "Ctrl-B  Ctrl-I  Ctrl-Shift-X  Ctrl-E  Ctrl-.  Ctrl-,";
-    let label_row = chips
-        .iter()
-        .map(|(label, _)| format!("[{label}]"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    let content_width = label_row.chars().count().max(shortcuts.chars().count());
-    let width = (content_width as u16)
-        .saturating_add(4)
-        .min(area.width.max(4));
-    let height = 5;
+    let chips = style_popup_cells();
+    let width = popup_line_width(&chips);
+    let height = 3;
     let popup = anchored_style_popup(area, doc_area, scroll, selection_rects, width, height);
     state.style_popup_hits.clear();
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(label_row.clone()),
-            Line::from(shortcuts),
-            Line::from("Inline Style"),
-        ])
-        .block(
-            Block::default()
-                .border_type(BorderType::Rounded)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(rgb(theme.border_strong)))
-                .style(Style::default().bg(rgb(theme.panel_raised))),
-        )
-        .style(
-            Style::default()
-                .fg(rgb(theme.text_primary))
-                .bg(rgb(theme.panel_raised)),
-        ),
-        popup,
-    );
-    let mut x = 0u16;
-    for (index, (label, action)) in chips.iter().enumerate() {
-        let chip = format!("[{label}]");
-        state.style_popup_hits.push(StylePopupHit {
-            row: 1,
-            start: x,
-            end: x.saturating_add(chip.chars().count() as u16),
-            action: *action,
-        });
-        x = x.saturating_add(chip.chars().count() as u16);
-        if index + 1 < chips.len() {
-            x = x.saturating_add(2);
-        }
+    let border_style = Style::default()
+        .fg(rgb(theme.text_muted))
+        .bg(rgb(theme.panel_bg));
+    let fill_style = Style::default().bg(rgb(theme.panel_bg));
+    frame.buffer_mut().set_style(popup, fill_style);
+    let active = active_style_popup_action(state);
+    let footer = format!(" {} - {} ", active.shortcut(), active.label());
+    let footer_inner = build_footer_line(usize::from(width.saturating_sub(2)), &footer);
+    let top = build_popup_top_line(&chips);
+    let bottom = format!("└{footer_inner}┘");
+    for (row, line) in [(0u16, top), (2u16, bottom)] {
+        let y = popup.y + row;
+        let mut x = popup.x;
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            popup.x + popup.width,
+            &line,
+            border_style,
+        );
     }
+    render_popup_middle(frame.buffer_mut(), popup, state, theme, &chips);
+    populate_style_popup_hits(state, &chips);
     popup
+}
+
+#[derive(Clone, Copy)]
+struct StylePopupCell {
+    label: &'static str,
+    width: u16,
+    action: Option<StylePopupAction>,
+}
+
+fn style_popup_cells() -> [StylePopupCell; 8] {
+    [
+        StylePopupCell {
+            label: "B",
+            width: 3,
+            action: Some(StylePopupAction::Bold),
+        },
+        StylePopupCell {
+            label: "I",
+            width: 3,
+            action: Some(StylePopupAction::Italic),
+        },
+        StylePopupCell {
+            label: "S",
+            width: 3,
+            action: Some(StylePopupAction::Strike),
+        },
+        StylePopupCell {
+            label: "</>",
+            width: 5,
+            action: Some(StylePopupAction::Code),
+        },
+        StylePopupCell {
+            label: "x^",
+            width: 4,
+            action: Some(StylePopupAction::Superscript),
+        },
+        StylePopupCell {
+            label: "x_",
+            width: 4,
+            action: Some(StylePopupAction::Subscript),
+        },
+        StylePopupCell {
+            label: "clr",
+            width: 5,
+            action: Some(StylePopupAction::Clear),
+        },
+        StylePopupCell {
+            label: ">",
+            width: 3,
+            action: Some(StylePopupAction::Quote),
+        },
+    ]
+}
+
+fn popup_line_width(cells: &[StylePopupCell]) -> u16 {
+    2 + cells.iter().map(|cell| cell.width).sum::<u16>() + cells.len().saturating_sub(1) as u16
+}
+
+fn build_popup_top_line(cells: &[StylePopupCell]) -> String {
+    let mut out = String::from("┌");
+    for (index, cell) in cells.iter().enumerate() {
+        out.push_str(&"─".repeat(cell.width as usize));
+        out.push(if index + 1 == cells.len() {
+            '┐'
+        } else {
+            '┬'
+        });
+    }
+    out
+}
+
+fn build_footer_line(inner_width: usize, footer: &str) -> String {
+    let footer_width = footer.chars().count().min(inner_width);
+    let leading = inner_width.saturating_sub(footer_width) / 2;
+    let trailing = inner_width.saturating_sub(footer_width + leading);
+    format!(
+        "{}{}{}",
+        "─".repeat(leading),
+        footer.chars().take(footer_width).collect::<String>(),
+        "─".repeat(trailing)
+    )
+}
+
+fn populate_style_popup_hits(state: &mut TuiState, cells: &[StylePopupCell]) {
+    let mut x = 0u16;
+    for cell in cells {
+        if let Some(action) = cell.action {
+            state.style_popup_hits.push(StylePopupHit {
+                row: 1,
+                start: x,
+                end: x.saturating_add(cell.width),
+                action,
+            });
+        }
+        x = x.saturating_add(cell.width + 1);
+    }
+}
+
+fn render_popup_middle(
+    buf: &mut Buffer,
+    popup: Rect,
+    state: &TuiState,
+    theme: &Theme,
+    cells: &[StylePopupCell],
+) {
+    let y = popup.y + 1;
+    let right = popup.x + popup.width;
+    let border_style = Style::default()
+        .fg(rgb(theme.text_muted))
+        .bg(rgb(theme.panel_bg));
+    let idle_style = Style::default()
+        .fg(rgb(theme.accent_primary))
+        .bg(rgb(theme.panel_bg));
+    let active_style = Style::default()
+        .fg(rgb(theme.panel_bg))
+        .bg(rgb(theme.accent_highlight))
+        .add_modifier(Modifier::BOLD);
+    let mut x = popup.x;
+    put(buf, &mut x, y, right, "│", border_style);
+    for cell in cells {
+        let action = cell.action;
+        let selected = action == Some(active_style_popup_action(state));
+        let style = if selected { active_style } else { idle_style };
+        let label = if cell.label.chars().count() >= cell.width as usize {
+            cell.label.to_string()
+        } else {
+            let left = (usize::from(cell.width) - cell.label.chars().count()) / 2;
+            let right_pad = usize::from(cell.width)
+                .saturating_sub(cell.label.chars().count())
+                .saturating_sub(left);
+            format!(
+                "{}{}{}",
+                " ".repeat(left),
+                cell.label,
+                " ".repeat(right_pad)
+            )
+        };
+        put(buf, &mut x, y, right, &label, style);
+        put(buf, &mut x, y, right, "│", border_style);
+    }
 }
 
 fn anchored_style_popup(
@@ -1921,11 +2182,11 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
     let mut lines = Vec::new();
     for index in 0..viewport {
         let ch = if index >= start && index < start + thumb {
-            "█"
+            "▒"
         } else {
             "│"
         };
-        let style = if ch == "█" {
+        let style = if ch == "▒" {
             Style::default()
                 .fg(rgb(theme.accent_highlight))
                 .bg(rgb(theme.panel_bg))
@@ -2033,9 +2294,251 @@ fn click_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
     else {
         return;
     };
+    state.style_popup_selected = action;
+    state.style_popup_hover = Some(action);
     apply_style_popup_action(state, action);
     state.dirty = true;
     state.message = "style toggled".to_string();
+}
+
+fn hover_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let hover = state
+        .style_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action);
+    if state.style_popup_hover != hover {
+        state.style_popup_hover = hover;
+        state.dirty = true;
+    }
+}
+
+fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Theme) -> Rect {
+    state.file_popup_hits.clear();
+    let Some(popup_kind) = state.file_popup.clone() else {
+        return Rect::default();
+    };
+    let (title, body, actions, width, height) = match &popup_kind {
+        FilePopup::Menu => (
+            " file ",
+            vec![
+                " [n] new file".to_string(),
+                " [r] rename file".to_string(),
+                " [d] delete file".to_string(),
+            ],
+            vec![
+                ("new", FilePopupAction::OpenRename), // placeholder overwritten below
+                ("rename", FilePopupAction::OpenRename),
+                ("delete", FilePopupAction::OpenDelete),
+            ],
+            28,
+            7,
+        ),
+        FilePopup::NewFile { input } => (
+            " new file ",
+            vec![
+                " name".to_string(),
+                format!(" {}", pad_width(input, 28)),
+                " [enter] create  [esc] cancel".to_string(),
+            ],
+            vec![
+                ("create", FilePopupAction::Create),
+                ("cancel", FilePopupAction::Cancel),
+            ],
+            32,
+            7,
+        ),
+        FilePopup::RenameFile { input, .. } => (
+            " rename file ",
+            vec![
+                " name".to_string(),
+                format!(" {}", pad_width(input, 28)),
+                " [enter] rename  [esc] cancel".to_string(),
+            ],
+            vec![
+                ("rename", FilePopupAction::Rename),
+                ("cancel", FilePopupAction::Cancel),
+            ],
+            32,
+            7,
+        ),
+        FilePopup::DeleteFile { path } => (
+            " delete file ",
+            vec![
+                " delete this file?".to_string(),
+                format!(" {}", file_leaf(&path.display().to_string())),
+                " [enter] delete  [esc] cancel".to_string(),
+            ],
+            vec![
+                ("delete", FilePopupAction::Delete),
+                ("cancel", FilePopupAction::Cancel),
+            ],
+            32,
+            7,
+        ),
+    };
+    let popup = centered(area, width.min(area.width), height.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(rgb(theme.accent_primary))
+                .bg(rgb(theme.panel_raised))
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(rgb(theme.panel_raised)))
+        .border_style(
+            Style::default()
+                .fg(rgb(theme.text_muted))
+                .bg(rgb(theme.panel_raised)),
+        );
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.buffer_mut().set_style(
+        inner,
+        Style::default()
+            .fg(rgb(theme.text_primary))
+            .bg(rgb(theme.panel_raised)),
+    );
+    for (row, line) in body.iter().enumerate() {
+        if row as u16 >= inner.height {
+            break;
+        }
+        frame.buffer_mut().set_stringn(
+            inner.x,
+            inner.y + row as u16,
+            line,
+            usize::from(inner.width),
+            if row == 1
+                && !matches!(
+                    state.file_popup,
+                    Some(FilePopup::DeleteFile { .. }) | Some(FilePopup::Menu)
+                )
+            {
+                Style::default()
+                    .fg(rgb(theme.accent_highlight))
+                    .bg(rgb(theme.app_bg))
+            } else {
+                Style::default()
+                    .fg(rgb(theme.text_primary))
+                    .bg(rgb(theme.panel_raised))
+            },
+        );
+    }
+    match popup_kind {
+        FilePopup::Menu => {
+            state.file_popup_hits.push(FilePopupHit {
+                row: 1,
+                start: 1,
+                end: inner.width.saturating_sub(1),
+                action: FilePopupAction::Create,
+            });
+            state.file_popup_hits.push(FilePopupHit {
+                row: 2,
+                start: 1,
+                end: inner.width.saturating_sub(1),
+                action: FilePopupAction::OpenRename,
+            });
+            state.file_popup_hits.push(FilePopupHit {
+                row: 3,
+                start: 1,
+                end: inner.width.saturating_sub(1),
+                action: FilePopupAction::OpenDelete,
+            });
+        }
+        _ => {
+            let actions_y = inner.y + inner.height.saturating_sub(1);
+            let action_text = actions
+                .iter()
+                .map(|(label, _)| format!("[{label}]"))
+                .collect::<Vec<_>>()
+                .join("  ");
+            frame.buffer_mut().set_stringn(
+                inner.x,
+                actions_y,
+                &action_text,
+                usize::from(inner.width),
+                Style::default()
+                    .fg(rgb(theme.text_secondary))
+                    .bg(rgb(theme.panel_raised)),
+            );
+            let mut cursor = 0u16;
+            for (label, action) in actions {
+                let len = label.chars().count() as u16 + 2;
+                state.file_popup_hits.push(FilePopupHit {
+                    row: actions_y.saturating_sub(popup.y),
+                    start: cursor,
+                    end: cursor.saturating_add(len),
+                    action,
+                });
+                cursor = cursor.saturating_add(len + 2);
+            }
+        }
+    }
+    popup
+}
+
+fn click_file_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let Some(action) = state
+        .file_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action.clone())
+    else {
+        return;
+    };
+    match action {
+        FilePopupAction::Create => {
+            if matches!(state.file_popup, Some(FilePopup::Menu)) {
+                open_new_file_popup(state);
+            } else {
+                confirm_file_popup(state);
+            }
+        }
+        FilePopupAction::Rename => confirm_file_popup(state),
+        FilePopupAction::Delete => confirm_file_popup(state),
+        FilePopupAction::Cancel => state.file_popup = None,
+        FilePopupAction::OpenRename => open_rename_file_popup(state),
+        FilePopupAction::OpenDelete => open_delete_file_popup(state),
+    }
+}
+
+fn active_style_popup_action(state: &TuiState) -> StylePopupAction {
+    state
+        .style_popup_hover
+        .unwrap_or(state.style_popup_selected)
+}
+
+fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
+    let actions = [
+        StylePopupAction::Bold,
+        StylePopupAction::Italic,
+        StylePopupAction::Strike,
+        StylePopupAction::Code,
+        StylePopupAction::Superscript,
+        StylePopupAction::Subscript,
+        StylePopupAction::Clear,
+        StylePopupAction::Quote,
+    ];
+    let current = actions
+        .iter()
+        .position(|action| *action == state.style_popup_selected)
+        .unwrap_or(0) as i32;
+    let next = (current + delta).rem_euclid(actions.len() as i32) as usize;
+    state.style_popup_selected = actions[next];
+    state.message = format!(
+        "{} - {}",
+        state.style_popup_selected.shortcut(),
+        state.style_popup_selected.label()
+    );
+    state.dirty = true;
 }
 
 fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
@@ -2043,9 +2546,22 @@ fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
         StylePopupAction::Bold => state.app.apply_bold(),
         StylePopupAction::Italic => state.app.apply_italic(),
         StylePopupAction::Strike => state.app.apply_strike(),
-        StylePopupAction::Code => state.app.apply_code(),
+        StylePopupAction::Code => {
+            if state.app.editor.selection_covers_active_text()
+                || matches!(state.app.editor.cursor, Cursor::Text { block, .. } if matches!(
+                    state.app.editor.document.blocks.get(block),
+                    Some(DocBlock::CodeBlock { .. })
+                ))
+            {
+                state.app.apply_code_block();
+            } else {
+                state.app.apply_code();
+            }
+        }
         StylePopupAction::Superscript => state.app.apply_superscript(),
         StylePopupAction::Subscript => state.app.apply_subscript(),
+        StylePopupAction::Clear => state.app.clear_styles(),
+        StylePopupAction::Quote => state.app.apply_block_quote(),
     }
 }
 
@@ -2073,11 +2589,13 @@ fn run_status_action(state: &mut TuiState, action: &StatusAction) {
         StatusAction::SetWrapWidth(width) => {
             state.wrap_width = width.clamp(24, 120);
             state.message = format!("wrap width {}", state.wrap_width);
+            persist_view_state(state);
         }
         StatusAction::SetColumns(columns) => {
             state.app.render_options.columns = columns.clamp(1, 3);
             state.scroll = 0;
             state.message = format!("column mode {}", state.app.render_options.columns);
+            persist_view_state(state);
         }
     }
 }
@@ -2135,6 +2653,178 @@ fn close_tab(state: &mut TuiState, name: &str) {
         }
     } else {
         state.message = format!("closed {name}");
+    }
+}
+
+fn open_new_file_popup(state: &mut TuiState) {
+    state.file_popup = Some(FilePopup::NewFile {
+        input: String::new(),
+    });
+    state.file_popup_hits.clear();
+}
+
+fn open_rename_file_popup(state: &mut TuiState) {
+    let Some(path) = state.path.clone() else {
+        state.message = "rename unavailable".to_string();
+        return;
+    };
+    let input = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("note.md")
+        .to_string();
+    state.file_popup = Some(FilePopup::RenameFile { input, path });
+    state.file_popup_hits.clear();
+}
+
+fn open_delete_file_popup(state: &mut TuiState) {
+    let Some(path) = state.path.clone() else {
+        state.message = "delete unavailable".to_string();
+        return;
+    };
+    state.file_popup = Some(FilePopup::DeleteFile { path });
+    state.file_popup_hits.clear();
+}
+
+fn confirm_file_popup(state: &mut TuiState) {
+    let Some(popup) = state.file_popup.clone() else {
+        return;
+    };
+    match popup {
+        FilePopup::Menu => {}
+        FilePopup::NewFile { input } => {
+            if let Err(error) = create_file_from_input(state, &input) {
+                state.message = format!("create failed: {error}");
+            }
+        }
+        FilePopup::RenameFile { input, path } => {
+            if let Err(error) = rename_file_from_input(state, &path, &input) {
+                state.message = format!("rename failed: {error}");
+            }
+        }
+        FilePopup::DeleteFile { path } => {
+            if let Err(error) = delete_file(state, &path) {
+                state.message = format!("delete failed: {error}");
+            }
+        }
+    }
+}
+
+fn create_file_from_input(state: &mut TuiState, input: &str) -> io::Result<()> {
+    let Some(path) = named_path_for_input(state, input) else {
+        state.message = "name required".to_string();
+        return Ok(());
+    };
+    if path.exists() {
+        state.message = "file already exists".to_string();
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, "")?;
+    state.file_popup = None;
+    open_file(state, &path);
+    state.message = format!("created {}", file_leaf(&path.display().to_string()));
+    Ok(())
+}
+
+fn rename_file_from_input(state: &mut TuiState, old_path: &Path, input: &str) -> io::Result<()> {
+    let Some(new_path) = named_path_for_input(state, input) else {
+        state.message = "name required".to_string();
+        return Ok(());
+    };
+    if new_path == old_path {
+        state.file_popup = None;
+        return Ok(());
+    }
+    if new_path.exists() {
+        state.message = "file already exists".to_string();
+        return Ok(());
+    }
+    if let Some(parent) = new_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(old_path, &new_path)?;
+    let old_name = file_leaf(&old_path.display().to_string());
+    let new_name = file_leaf(&new_path.display().to_string());
+    if state.hidden_tabs.remove(&old_name) {
+        state.hidden_tabs.insert(new_name.clone());
+    }
+    state.file_popup = None;
+    open_file(state, &new_path);
+    state.message = format!("renamed {old_name} -> {new_name}");
+    Ok(())
+}
+
+fn delete_file(state: &mut TuiState, path: &Path) -> io::Result<()> {
+    let mut files = Vec::new();
+    collect_markdown_files(&workspace_root_for(state.path.as_deref()), &mut files);
+    let replacement = files.into_iter().find(|candidate| candidate != path);
+    if state.path.as_deref() == Some(path) && replacement.is_none() {
+        state.message = "cannot delete last file".to_string();
+        return Ok(());
+    }
+    fs::remove_file(path)?;
+    let name = file_leaf(&path.display().to_string());
+    state.hidden_tabs.remove(&name);
+    state.file_popup = None;
+    if let Some(next) = replacement {
+        open_file(state, &next);
+    }
+    state.message = format!("deleted {name}");
+    Ok(())
+}
+
+fn named_path_for_input(state: &TuiState, input: &str) -> Option<PathBuf> {
+    let trimmed = input.trim().trim_start_matches("./");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut path = workspace_root_for(state.path.as_deref()).join(trimmed);
+    if path.extension().is_none() {
+        path.set_extension("md");
+    }
+    Some(path)
+}
+
+fn view_state_path(state: &TuiState) -> PathBuf {
+    workspace_root_for(state.path.as_deref()).join(".mdtui-view")
+}
+
+fn load_view_state(state: &mut TuiState) {
+    let Ok(content) = fs::read_to_string(view_state_path(state)) else {
+        return;
+    };
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("wrap_width=") {
+            if let Ok(width) = value.parse::<u16>() {
+                state.wrap_width = width.clamp(24, 120);
+            }
+        } else if let Some(value) = line.strip_prefix("columns=")
+            && let Ok(columns) = value.parse::<u16>()
+        {
+            state.app.render_options.columns = columns.clamp(1, 3) as u8;
+        }
+    }
+}
+
+fn persist_view_state(state: &TuiState) {
+    let path = view_state_path(state);
+    let _ = fs::write(
+        path,
+        format!(
+            "wrap_width={}\ncolumns={}\n",
+            state.wrap_width, state.app.render_options.columns
+        ),
+    );
+}
+
+fn hide_style_popup(state: &mut TuiState) {
+    if state.app.editor.show_style_popover {
+        state.app.editor.show_style_popover = false;
+        state.style_popup_hover = None;
+        state.dirty = true;
     }
 }
 
@@ -2383,6 +3073,7 @@ fn outline_lines(
     blocks: &[DocBlock],
     active_block: usize,
     theme: &Theme,
+    width: u16,
 ) -> (Vec<Line<'static>>, Vec<OutlineHit>) {
     let headings = blocks
         .iter()
@@ -2403,19 +3094,24 @@ fn outline_lines(
     let mut lines = Vec::new();
     let mut hits = Vec::new();
     for (index, level, text) in headings {
-        let row = lines.len() as u16;
         let active = active_block == index;
         let bg = if active {
             theme.active_row
         } else {
             theme.panel_bg
         };
-        let title_style = Style::default()
-            .fg(rgb(if active {
+        let depth = level.saturating_sub(1);
+        let title_color = rgb(&mix_hex(
+            if active {
                 theme.accent_highlight
             } else {
                 theme.accent_primary
-            }))
+            },
+            theme.panel_bg,
+            u16::from(depth).saturating_mul(10),
+        ));
+        let title_style = Style::default()
+            .fg(title_color)
             .bg(rgb(bg))
             .add_modifier(if active {
                 Modifier::BOLD
@@ -2427,26 +3123,41 @@ fn outline_lines(
             .bg(rgb(bg))
             .add_modifier(Modifier::BOLD);
         let indent = "  ".repeat(level.saturating_sub(1) as usize);
-        let line = if let Some((prefix, title)) = split_heading_number(&text) {
-            Line::from(vec![
-                Span::styled(
-                    indent,
-                    Style::default().fg(rgb(theme.text_muted)).bg(rgb(bg)),
-                ),
-                Span::styled(
-                    format!("{prefix:>width$} ", width = max_prefix),
-                    prefix_style,
-                ),
-                Span::styled(title.to_string(), title_style),
-            ])
+        let (prefix_marker, title_text) = if let Some((prefix, title)) = split_heading_number(&text)
+        {
+            (
+                format!("{prefix:>width$} ", width = max_prefix),
+                title.to_string(),
+            )
         } else {
-            Line::from(vec![
-                Span::styled(format!("{indent}• "), prefix_style),
-                Span::styled(text, title_style),
-            ])
+            ("• ".to_string(), text)
         };
-        lines.push(line);
-        hits.push(OutlineHit { row, block: index });
+        let prefix_text = format!("{indent}{prefix_marker}");
+        let prefix_width = prefix_text.chars().count();
+        let available = usize::from(width).saturating_sub(prefix_width).max(8);
+        let wrapped = wrap_outline_text(&title_text, available);
+        for (wrap_index, part) in wrapped.iter().enumerate() {
+            let row = lines.len() as u16;
+            if wrap_index == 0 {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        indent.clone(),
+                        Style::default().fg(rgb(theme.text_muted)).bg(rgb(bg)),
+                    ),
+                    Span::styled(prefix_marker.clone(), prefix_style),
+                    Span::styled(part.clone(), title_style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        " ".repeat(prefix_width),
+                        Style::default().fg(rgb(theme.text_muted)).bg(rgb(bg)),
+                    ),
+                    Span::styled(part.clone(), title_style),
+                ]));
+            }
+            hits.push(OutlineHit { row, block: index });
+        }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -2564,7 +3275,7 @@ fn style_rendered_line(
             .fg(rgb(theme.accent_highlight))
             .add_modifier(Modifier::BOLD);
     } else if is_heading_rule(line) {
-        style = Style::default().fg(rgb(theme.border_strong)).bg(background);
+        style = Style::default().fg(rgb(theme.border)).bg(background);
     } else if let Some(spans) = styled_text_spans_for_row(
         index,
         line,
@@ -2770,6 +3481,29 @@ fn adornment_spans(
                 .add_modifier(Modifier::BOLD),
         )];
     }
+    if text == "[_]" || text == "[✗]" {
+        return vec![
+            Span::styled(
+                "[".to_string(),
+                Style::default().fg(rgb(theme.text_muted)).bg(background),
+            ),
+            Span::styled(
+                text.chars().nth(1).unwrap_or('_').to_string(),
+                Style::default()
+                    .fg(rgb(if text == "[✗]" {
+                        theme.error
+                    } else {
+                        theme.accent_highlight
+                    }))
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "]".to_string(),
+                Style::default().fg(rgb(theme.text_muted)).bg(background),
+            ),
+        ];
+    }
     vec![Span::styled(
         text.to_string(),
         base_document_style(theme, background, heading, numbered_row, blockquote_row),
@@ -2783,7 +3517,7 @@ fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'stat
             Style::default()
                 .fg(rgb(theme.link))
                 .bg(background)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                .add_modifier(Modifier::UNDERLINED),
         )];
     };
     let Some((title, dots)) = head.rsplit_once(' ') else {
@@ -2792,16 +3526,16 @@ fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'stat
             Style::default()
                 .fg(rgb(theme.link))
                 .bg(background)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                .add_modifier(Modifier::UNDERLINED),
         )];
     };
     vec![
         Span::styled(
             title.to_string(),
             Style::default()
-                .fg(rgb(theme.accent_highlight))
+                .fg(rgb(theme.link))
                 .bg(background)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                .add_modifier(Modifier::UNDERLINED),
         ),
         Span::styled(
             format!(" {dots} "),
@@ -2811,10 +3545,7 @@ fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'stat
         ),
         Span::styled(
             number.to_string(),
-            Style::default()
-                .fg(rgb(theme.link))
-                .bg(background)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            Style::default().fg(rgb(theme.link)).bg(background),
         ),
     ]
 }
@@ -3157,8 +3888,54 @@ fn pad_width(text: &str, width: usize) -> String {
     }
 }
 
+fn wrap_outline_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if current.is_empty() {
+        lines.push(String::new());
+    } else {
+        lines.push(current);
+    }
+    lines
+}
+
 fn to_superscript_char(ch: char) -> char {
     match ch {
+        'A' => 'ᴬ',
+        'B' => 'ᴮ',
+        'D' => 'ᴰ',
+        'E' => 'ᴱ',
+        'G' => 'ᴳ',
+        'H' => 'ᴴ',
+        'I' => 'ᴵ',
+        'J' => 'ᴶ',
+        'K' => 'ᴷ',
+        'L' => 'ᴸ',
+        'M' => 'ᴹ',
+        'N' => 'ᴺ',
+        'O' => 'ᴼ',
+        'P' => 'ᴾ',
+        'R' => 'ᴿ',
+        'T' => 'ᵀ',
+        'U' => 'ᵁ',
+        'V' => 'ⱽ',
+        'W' => 'ᵂ',
         '0' => '⁰',
         '1' => '¹',
         '2' => '²',
@@ -3174,8 +3951,31 @@ fn to_superscript_char(ch: char) -> char {
         '=' => '⁼',
         '(' => '⁽',
         ')' => '⁾',
+        'a' => 'ᵃ',
+        'b' => 'ᵇ',
+        'c' => 'ᶜ',
+        'd' => 'ᵈ',
+        'e' => 'ᵉ',
+        'f' => 'ᶠ',
+        'g' => 'ᵍ',
+        'h' => 'ʰ',
         'n' => 'ⁿ',
         'i' => 'ⁱ',
+        'j' => 'ʲ',
+        'k' => 'ᵏ',
+        'l' => 'ˡ',
+        'm' => 'ᵐ',
+        'o' => 'ᵒ',
+        'p' => 'ᵖ',
+        'r' => 'ʳ',
+        's' => 'ˢ',
+        't' => 'ᵗ',
+        'u' => 'ᵘ',
+        'v' => 'ᵛ',
+        'w' => 'ʷ',
+        'x' => 'ˣ',
+        'y' => 'ʸ',
+        'z' => 'ᶻ',
         _ => ch,
     }
 }
@@ -3197,6 +3997,7 @@ fn to_subscript_char(ch: char) -> char {
         '=' => '₌',
         '(' => '₍',
         ')' => '₎',
+        'A' => 'ₐ',
         'a' => 'ₐ',
         'e' => 'ₑ',
         'h' => 'ₕ',
@@ -4530,6 +5331,20 @@ fn rgb(hex: &str) -> Color {
     Color::Rgb(red, green, blue)
 }
 
+fn mix_hex(foreground: &str, background: &str, percent_background: u16) -> String {
+    let percent = percent_background.min(100) as u32;
+    let fg = foreground.trim_start_matches('#');
+    let bg = background.trim_start_matches('#');
+    let mut mixed = String::from("#");
+    for index in [0usize, 2, 4] {
+        let fg_channel = u8::from_str_radix(&fg[index..index + 2], 16).unwrap_or(0) as u32;
+        let bg_channel = u8::from_str_radix(&bg[index..index + 2], 16).unwrap_or(0) as u32;
+        let value = (fg_channel * (100 - percent) + bg_channel * percent) / 100;
+        mixed.push_str(&format!("{value:02x}"));
+    }
+    mixed
+}
+
 fn code_border(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.border))
@@ -5326,6 +6141,76 @@ mod tests {
         );
 
         assert!(popup.y < doc_area.y + 1 + 10);
+    }
+
+    #[test]
+    fn style_popup_active_chip_uses_inverted_colors() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha"), None);
+        state.app.editor.select_all();
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        let doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 40,
+            height: 8,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_style_popover(
+                    frame,
+                    area,
+                    doc_area,
+                    0,
+                    &[mdtui_render::Rect {
+                        x: 0,
+                        y: 2,
+                        width: 5,
+                        height: 1,
+                    }],
+                    &mut state,
+                    &theme,
+                );
+            })
+            .expect("draw style popup");
+        let popup = anchored_style_popup(
+            area,
+            doc_area,
+            0,
+            &[mdtui_render::Rect {
+                x: 0,
+                y: 2,
+                width: 5,
+                height: 1,
+            }],
+            popup_line_width(&style_popup_cells()),
+            3,
+        );
+        let buffer = terminal.backend().buffer();
+        let cell = buffer
+            .cell((popup.x + 2, popup.y + 1))
+            .expect("active bold cell");
+        assert_eq!(cell.fg, rgb(theme.panel_bg));
+        assert_eq!(cell.bg, rgb(theme.accent_highlight));
+    }
+
+    #[test]
+    fn popup_code_action_turns_full_selection_into_code_block() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha beta"), None);
+        state.app.editor.select_all();
+
+        apply_style_popup_action(&mut state, StylePopupAction::Code);
+
+        assert!(matches!(
+            state.app.editor.document.blocks[0],
+            DocBlock::CodeBlock { .. }
+        ));
     }
 
     #[test]

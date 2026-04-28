@@ -513,6 +513,99 @@ impl Editor {
         self.push_tx(vec![Op::WrapInline { selection, mark }]);
     }
 
+    pub fn clear_styles(&mut self) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let Some((start, end)) = same_owner_offsets(selection) else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        self.record_undo();
+        match selection.anchor {
+            Cursor::Text { block, .. } => {
+                if let Some(block) = self.document.blocks.get_mut(block) {
+                    clear_block_styles(block, start, end);
+                }
+            }
+            Cursor::ListItem { block, item, .. } => {
+                if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
+                    && let Some(list_item) = list.items.get_mut(item)
+                    && let Some(block) = list_item.blocks.get_mut(0)
+                {
+                    clear_block_styles(block, start, end);
+                }
+            }
+            Cursor::TableCell {
+                block, row, col, ..
+            } => {
+                if let Some(Block::Table(table)) = self.document.blocks.get_mut(block)
+                    && let Some(block) = table
+                        .rows
+                        .get_mut(row)
+                        .and_then(|row| row.cells.get_mut(col))
+                        .and_then(|cell| cell.blocks.get_mut(0))
+                {
+                    clear_block_styles(block, start, end);
+                }
+            }
+            Cursor::Checkbox { .. } => {}
+        }
+        self.document.version += 1;
+    }
+
+    pub fn toggle_block_quote(&mut self) {
+        let Cursor::Text { block, offset } = self.cursor else {
+            return;
+        };
+        let Some(current) = self.document.blocks.get(block).cloned() else {
+            return;
+        };
+        self.record_undo();
+        self.document.blocks[block] = match current {
+            Block::BlockQuote(blocks) => blocks
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Block::Paragraph(vec![Inline::Text(String::new())])),
+            other => Block::BlockQuote(vec![Block::Paragraph(vec![Inline::Text(
+                other.rendered_text(),
+            )])]),
+        };
+        self.cursor = Cursor::Text { block, offset };
+        self.document.version += 1;
+    }
+
+    pub fn toggle_code_block(&mut self) {
+        let Cursor::Text { block, offset } = self.cursor else {
+            return;
+        };
+        let Some(current) = self.document.blocks.get(block).cloned() else {
+            return;
+        };
+        self.record_undo();
+        self.document.blocks[block] = match current {
+            Block::CodeBlock { text, .. } => Block::Paragraph(vec![Inline::Text(text)]),
+            other => Block::CodeBlock {
+                language: None,
+                text: other.rendered_text(),
+            },
+        };
+        self.cursor = Cursor::Text { block, offset };
+        self.document.version += 1;
+    }
+
+    pub fn selection_covers_active_text(&self) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let Some((start, end)) = same_owner_offsets(selection) else {
+            return false;
+        };
+        start == 0 && end == self.active_text_len()
+    }
+
     pub fn toggle_checkbox(&mut self, block: usize, item: usize) {
         let can_toggle = matches!(
             self.document.blocks.get(block),
@@ -1218,6 +1311,29 @@ fn wrap_block_range(block: &mut Block, start: usize, end: usize, mark: InlineMar
     *inlines = chunks_to_inlines(&next);
 }
 
+fn clear_block_styles(block: &mut Block, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    match block {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => {
+            let chunks = inline_chunks(inlines);
+            *inlines = chunks_to_inlines(&clear_styles_in_chunks(&chunks, start, end));
+        }
+        Block::BlockQuote(blocks) => {
+            *block = Block::Paragraph(vec![Inline::Text(
+                blocks
+                    .first()
+                    .map_or_else(String::new, Block::rendered_text),
+            )]);
+        }
+        Block::CodeBlock { text, .. } => {
+            *block = Block::Paragraph(vec![Inline::Text(text.clone())]);
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InlineChunk {
     text: String,
@@ -1399,6 +1515,44 @@ fn apply_mark_to_chunks(
                 with_chunk_mark(chunk.marks, mark, remove),
                 chunk.link.as_ref(),
             );
+        }
+        if !suffix.is_empty() {
+            push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
+        }
+        offset = chunk_end;
+    }
+    out
+}
+
+fn clear_styles_in_chunks(chunks: &[InlineChunk], start: usize, end: usize) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end <= overlap_start {
+            push_inline_chunk(
+                &mut out,
+                chunk.text.clone(),
+                chunk.marks,
+                chunk.link.as_ref(),
+            );
+            offset = chunk_end;
+            continue;
+        }
+
+        let leading = overlap_start.saturating_sub(offset);
+        let selected = overlap_end - overlap_start;
+        let (prefix, rest) = split_chars(&chunk.text, leading);
+        let (middle, suffix) = split_chars(&rest, selected);
+
+        if !prefix.is_empty() {
+            push_inline_chunk(&mut out, prefix, chunk.marks, chunk.link.as_ref());
+        }
+        if !middle.is_empty() {
+            push_inline_chunk(&mut out, middle, ActiveMarks::default(), None);
         }
         if !suffix.is_empty() {
             push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
@@ -1627,6 +1781,63 @@ mod tests {
         assert_eq!(
             editor.document.blocks,
             vec![Block::Paragraph(vec![Inline::Text("H2O".to_string())])]
+        );
+    }
+
+    #[test]
+    fn clear_styles_strips_selected_inline_markup() {
+        let mut editor = paragraph_editor(vec![
+            Inline::Strong(vec![Inline::Text("ab".to_string())]),
+            Inline::Text("cd".to_string()),
+        ]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 3,
+            },
+        );
+
+        editor.clear_styles();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("abcd".to_string())])]
+        );
+    }
+
+    #[test]
+    fn toggle_block_quote_wraps_and_unwraps_current_block() {
+        let mut editor = paragraph_editor(vec![Inline::Text("quoted".to_string())]);
+        editor.select_all();
+
+        editor.toggle_block_quote();
+        assert!(matches!(editor.document.blocks[0], Block::BlockQuote(_)));
+
+        editor.toggle_block_quote();
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("quoted".to_string())])]
+        );
+    }
+
+    #[test]
+    fn toggle_code_block_wraps_and_unwraps_current_block() {
+        let mut editor = paragraph_editor(vec![Inline::Text("fn main() {}".to_string())]);
+        editor.select_all();
+
+        editor.toggle_code_block();
+        assert!(matches!(editor.document.blocks[0], Block::CodeBlock { .. }));
+
+        editor.toggle_code_block();
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text(
+                "fn main() {}".to_string()
+            )])]
         );
     }
 }

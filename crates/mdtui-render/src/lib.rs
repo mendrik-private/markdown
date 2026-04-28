@@ -920,13 +920,29 @@ fn toc_entries_for_list(list: &List, headings: &[HeadingTarget]) -> Option<Vec<T
                 item: item_index,
                 block: heading.block,
                 title: if heading.title.is_empty() {
-                    inline_text(children)
+                    strip_toc_numbering(&inline_text(children))
                 } else {
-                    heading.title.clone()
+                    strip_toc_numbering(&heading.title)
                 },
             })
         })
         .collect()
+}
+
+fn strip_toc_numbering(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some((prefix, rest)) = trimmed.split_once(' ') else {
+        return trimmed.to_string();
+    };
+    if prefix.ends_with('.')
+        && prefix[..prefix.len().saturating_sub(1)]
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+    {
+        rest.trim_start().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn slugify_heading(text: &str) -> String {
