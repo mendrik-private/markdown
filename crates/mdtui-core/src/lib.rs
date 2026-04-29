@@ -163,6 +163,47 @@ pub enum InlineMark {
     Subscript,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextColor {
+    Accent,
+    Red,
+    Yellow,
+    Green,
+    Teal,
+    Blue,
+    Purple,
+    Pink,
+}
+
+impl TextColor {
+    fn tag_name(self) -> &'static str {
+        match self {
+            Self::Accent => "accent",
+            Self::Red => "red",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Teal => "teal",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+            Self::Pink => "pink",
+        }
+    }
+
+    fn from_tag_name(tag: &str) -> Option<Self> {
+        match tag {
+            "accent" => Some(Self::Accent),
+            "red" => Some(Self::Red),
+            "yellow" => Some(Self::Yellow),
+            "green" => Some(Self::Green),
+            "teal" => Some(Self::Teal),
+            "blue" => Some(Self::Blue),
+            "purple" => Some(Self::Purple),
+            "pink" => Some(Self::Pink),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct List {
     pub ordered: bool,
@@ -264,6 +305,10 @@ pub enum Alignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cursor {
     Text {
+        block: usize,
+        offset: usize,
+    },
+    CodeLanguage {
         block: usize,
         offset: usize,
     },
@@ -415,6 +460,7 @@ impl Editor {
     pub fn logical_position(&self) -> (usize, usize) {
         match self.cursor {
             Cursor::Text { block, offset } => (block + 1, offset + 1),
+            Cursor::CodeLanguage { block, offset } => (block + 1, offset + 1),
             Cursor::ListItem {
                 block,
                 item,
@@ -476,6 +522,21 @@ impl Editor {
         }]);
     }
 
+    pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (start, end) = same_owner_offsets(selection)?;
+        if start == end {
+            return None;
+        }
+        Some(
+            self.active_text()
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect(),
+        )
+    }
+
     pub fn enter(&mut self) {
         match self.cursor {
             Cursor::ListItem {
@@ -487,6 +548,7 @@ impl Editor {
                 self.record_undo();
                 self.insert_text_at_cursor("\n");
             }
+            Cursor::CodeLanguage { block, .. } => self.cursor = Cursor::Text { block, offset: 0 },
             Cursor::Text { block, offset } => self.split_text_block(block, offset),
             Cursor::Checkbox { .. } => {}
         }
@@ -572,6 +634,51 @@ impl Editor {
         self.push_tx(vec![Op::WrapInline { selection, mark }]);
     }
 
+    pub fn apply_text_color(&mut self, color: TextColor) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let Some((start, end)) = same_owner_offsets(selection) else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        self.record_undo();
+        match selection.anchor {
+            Cursor::Text { block, .. } => {
+                if let Some(block) = self.document.blocks.get_mut(block) {
+                    wrap_block_color(block, start, end, color);
+                }
+            }
+            Cursor::CodeLanguage { .. } => {}
+            Cursor::ListItem { block, item, .. } => {
+                if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
+                    && let Some(list_item) = list.items.get_mut(item)
+                    && let Some(block) = list_item.blocks.get_mut(0)
+                {
+                    wrap_block_color(block, start, end, color);
+                }
+            }
+            Cursor::TableCell {
+                block, row, col, ..
+            } => {
+                if let Some(Block::Table(table)) = self.document.blocks.get_mut(block)
+                    && let Some(block) = table
+                        .rows
+                        .get_mut(row)
+                        .and_then(|row| row.cells.get_mut(col))
+                        .and_then(|cell| cell.blocks.get_mut(0))
+                {
+                    wrap_block_color(block, start, end, color);
+                }
+            }
+            Cursor::Checkbox { .. } => {}
+        }
+        self.show_style_popover = true;
+        self.document.version += 1;
+    }
+
     pub fn clear_styles(&mut self) {
         let Some(selection) = self.selection else {
             return;
@@ -590,6 +697,7 @@ impl Editor {
                     clear_block_styles(block, start, end);
                 }
             }
+            Cursor::CodeLanguage { .. } => {}
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
                     && let Some(list_item) = list.items.get_mut(item)
@@ -620,23 +728,27 @@ impl Editor {
     }
 
     pub fn apply_link(&mut self, target: impl Into<String>) {
-        let Some(selection) = self.selection else {
+        let (owner_cursor, start, end) = if let Some(selection) = self.selection
+            && let Some((start, end)) = same_owner_offsets(selection)
+            && start < end
+        {
+            (selection.anchor, start, end)
+        } else if let Some((start, end, _)) =
+            current_link_info(&self.document, self.cursor, self.selection)
+        {
+            (self.cursor, start, end)
+        } else {
             return;
         };
-        let Some((start, end)) = same_owner_offsets(selection) else {
-            return;
-        };
-        if start == end {
-            return;
-        }
         let target = target.into();
         self.record_undo();
-        match selection.anchor {
+        match owner_cursor {
             Cursor::Text { block, .. } => {
                 if let Some(block) = self.document.blocks.get_mut(block) {
                     wrap_block_link(block, start, end, &target);
                 }
             }
+            Cursor::CodeLanguage { .. } => {}
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
                     && let Some(list_item) = list.items.get_mut(item)
@@ -662,7 +774,18 @@ impl Editor {
         }
         self.show_style_popover = true;
         self.document.version += 1;
-        self.push_tx(vec![Op::WrapLink { selection, target }]);
+        self.push_tx(vec![Op::WrapLink {
+            selection: Selection {
+                anchor: cursor_with_offset(owner_cursor, start),
+                head: cursor_with_offset(owner_cursor, end),
+            },
+            target,
+        }]);
+    }
+
+    pub fn current_link_target(&self) -> Option<String> {
+        current_link_info(&self.document, self.cursor, self.selection)
+            .map(|(_, _, link)| link.target)
     }
 
     pub fn toggle_block_quote(&mut self) {
@@ -878,6 +1001,15 @@ impl Editor {
     pub fn active_text(&self) -> String {
         match self.cursor {
             Cursor::Text { block, .. } => editable_text_of_block(self.document.blocks.get(block)),
+            Cursor::CodeLanguage { block, .. } => self
+                .document
+                .blocks
+                .get(block)
+                .and_then(|block| match block {
+                    Block::CodeBlock { language, .. } => Some(language.clone().unwrap_or_default()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             Cursor::ListItem { block, item, .. } => self
                 .document
                 .blocks
@@ -1080,23 +1212,33 @@ impl Editor {
     }
 
     fn next_text_cursor(&self) -> Cursor {
-        let Cursor::Text { block, .. } = self.cursor else {
-            return self.cursor;
-        };
-        let next_block = (block + 1).min(self.document.blocks.len().saturating_sub(1));
-        Cursor::Text {
-            block: next_block,
-            offset: 0,
+        match self.cursor {
+            Cursor::CodeLanguage { block, .. } => Cursor::Text { block, offset: 0 },
+            Cursor::Text { block, .. } => {
+                let next_block = (block + 1).min(self.document.blocks.len().saturating_sub(1));
+                Cursor::Text {
+                    block: next_block,
+                    offset: 0,
+                }
+            }
+            _ => self.cursor,
         }
     }
 
     fn previous_text_cursor(&self) -> Cursor {
-        let Cursor::Text { block, .. } = self.cursor else {
-            return self.cursor;
-        };
-        Cursor::Text {
-            block: block.saturating_sub(1),
-            offset: 0,
+        match self.cursor {
+            Cursor::CodeLanguage { block, .. } => Cursor::Text {
+                block: block.saturating_sub(1),
+                offset: 0,
+            },
+            Cursor::Text { block, .. } => match self.document.blocks.get(block) {
+                Some(Block::CodeBlock { .. }) => Cursor::CodeLanguage { block, offset: 0 },
+                _ => Cursor::Text {
+                    block: block.saturating_sub(1),
+                    offset: 0,
+                },
+            },
+            _ => self.cursor,
         }
     }
 
@@ -1121,6 +1263,13 @@ impl Editor {
     fn set_active_text(&mut self, text: String) -> ActiveTextChange {
         match self.cursor {
             Cursor::Text { block, .. } => set_block_text(&mut self.document.blocks, block, text),
+            Cursor::CodeLanguage { block, .. } => {
+                if let Some(Block::CodeBlock { language, .. }) = self.document.blocks.get_mut(block)
+                {
+                    *language = if text.is_empty() { None } else { Some(text) };
+                }
+                ActiveTextChange::Updated
+            }
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
                     && let Some(list_item) = list.items.get_mut(item)
@@ -1138,7 +1287,7 @@ impl Editor {
                         .get_mut(row)
                         .and_then(|row| row.cells.get_mut(col))
                 {
-                    cell.blocks = vec![Block::Paragraph(vec![Inline::Text(text)])];
+                    cell.blocks = vec![Block::Paragraph(parse_inline_input(&text))];
                 }
                 ActiveTextChange::Updated
             }
@@ -1167,6 +1316,7 @@ impl Editor {
     fn cursor_offset(&self) -> usize {
         match self.cursor {
             Cursor::Text { offset, .. }
+            | Cursor::CodeLanguage { offset, .. }
             | Cursor::ListItem { offset, .. }
             | Cursor::TableCell { offset, .. } => offset,
             Cursor::Checkbox { .. } => 0,
@@ -1176,6 +1326,7 @@ impl Editor {
     fn with_offset(&self, offset: usize) -> Cursor {
         match self.cursor {
             Cursor::Text { block, .. } => Cursor::Text { block, offset },
+            Cursor::CodeLanguage { block, .. } => Cursor::CodeLanguage { block, offset },
             Cursor::ListItem { block, item, .. } => Cursor::ListItem {
                 block,
                 item,
@@ -1234,6 +1385,7 @@ impl Editor {
                     wrap_block_range(block, start, end, mark);
                 }
             }
+            Cursor::CodeLanguage { .. } => {}
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
                     && let Some(list_item) = list.items.get_mut(item)
@@ -1265,6 +1417,7 @@ impl Editor {
             Cursor::Text { block, .. } => {
                 self.document.blocks.get(block).and_then(block_style_chunks)
             }
+            Cursor::CodeLanguage { .. } => None,
             Cursor::ListItem { block, item, .. } => self
                 .document
                 .blocks
@@ -1288,6 +1441,15 @@ impl Editor {
         match self.cursor {
             Cursor::Text { block, .. } => {
                 delete_range_in_block(&mut self.document.blocks, block, start, end)
+            }
+            Cursor::CodeLanguage { block, .. } => {
+                if let Some(Block::CodeBlock { language, .. }) = self.document.blocks.get_mut(block)
+                {
+                    let next =
+                        delete_range_chars(language.as_deref().unwrap_or_default(), start, end);
+                    *language = if next.is_empty() { None } else { Some(next) };
+                }
+                ActiveTextChange::Updated
             }
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
@@ -1501,7 +1663,7 @@ pub fn inline_text(inlines: &[Inline]) -> String {
                 if matches!(
                     text.trim().to_ascii_lowercase().as_str(),
                     "<sup>" | "</sup>" | "<sub>" | "</sub>"
-                ) => {}
+                ) || is_text_color_tag(text.trim()) => {}
             Inline::HtmlInline(text) => out.push_str(text),
             Inline::Emphasis(children)
             | Inline::Strong(children)
@@ -1560,20 +1722,50 @@ fn set_block_text(blocks: &mut Vec<Block>, block: usize, text: String) -> Active
     };
     match current {
         Block::Paragraph(_) => {
+            if let Some((checked, item_text)) = checkbox_shortcut(&text) {
+                blocks[block] = Block::List(List {
+                    ordered: false,
+                    tight: false,
+                    items: vec![ListItem {
+                        checked: Some(checked),
+                        blocks: vec![Block::Paragraph(parse_inline_input(&item_text))],
+                    }],
+                });
+                return ActiveTextChange::Deleted(Cursor::ListItem {
+                    block,
+                    item: 0,
+                    offset: char_len(&item_text),
+                });
+            }
             if let Some(Block::Paragraph(inlines)) = blocks.get_mut(block) {
-                *inlines = vec![Inline::Text(text)];
+                *inlines = parse_inline_input(&text);
             }
             ActiveTextChange::Updated
         }
         Block::Heading { .. } => {
-            if let Some(Block::Heading { inlines, .. }) = blocks.get_mut(block) {
-                *inlines = vec![Inline::Text(text)];
+            if let Some(Block::Heading { level, inlines }) = blocks.get_mut(block) {
+                let text = if matches!(*level, 1 | 2) {
+                    single_line_text(&text)
+                } else {
+                    text
+                };
+                *inlines = parse_inline_input(&text);
             }
             ActiveTextChange::Updated
         }
         Block::CodeBlock { .. } => {
             if let Some(Block::CodeBlock { text: code, .. }) = blocks.get_mut(block) {
                 *code = text;
+            }
+            ActiveTextChange::Updated
+        }
+        Block::BlockQuote(_) => {
+            if let Some(Block::BlockQuote(quoted)) = blocks.get_mut(block) {
+                if let [Block::Paragraph(inlines)] = quoted.as_mut_slice() {
+                    *inlines = parse_inline_input(&text);
+                } else {
+                    *quoted = vec![Block::Paragraph(parse_inline_input(&text))];
+                }
             }
             ActiveTextChange::Updated
         }
@@ -1600,13 +1792,18 @@ fn set_block_text(blocks: &mut Vec<Block>, block: usize, text: String) -> Active
 }
 
 fn set_list_item_text(list_item: &mut ListItem, text: String) {
+    if let Some((checked, item_text)) = checkbox_shortcut(&text) {
+        list_item.checked = Some(checked);
+        list_item.blocks = vec![Block::Paragraph(parse_inline_input(&item_text))];
+        return;
+    }
     if let [Block::Paragraph(inlines)] = list_item.blocks.as_mut_slice()
         && let [Inline::Link { children, .. }] = inlines.as_mut_slice()
     {
-        *children = vec![Inline::Text(text)];
+        *children = parse_inline_input(&text);
         return;
     }
-    list_item.blocks = vec![Block::Paragraph(vec![Inline::Text(text)])];
+    list_item.blocks = vec![Block::Paragraph(parse_inline_input(&text))];
 }
 
 fn remove_block(blocks: &mut Vec<Block>, block: usize) -> ActiveTextChange {
@@ -1648,6 +1845,7 @@ fn same_owner_offsets(selection: Selection) -> Option<(usize, usize)> {
 fn owner(cursor: Cursor) -> Option<(usize, usize, usize)> {
     match cursor {
         Cursor::Text { block, .. } => Some((block, usize::MAX, usize::MAX)),
+        Cursor::CodeLanguage { block, .. } => Some((block, usize::MAX - 1, usize::MAX - 1)),
         Cursor::ListItem { block, item, .. } => Some((block, item, usize::MAX)),
         Cursor::TableCell {
             block, row, col, ..
@@ -1659,6 +1857,7 @@ fn owner(cursor: Cursor) -> Option<(usize, usize, usize)> {
 fn offset(cursor: Cursor) -> usize {
     match cursor {
         Cursor::Text { offset, .. }
+        | Cursor::CodeLanguage { offset, .. }
         | Cursor::ListItem { offset, .. }
         | Cursor::TableCell { offset, .. } => offset,
         Cursor::Checkbox { .. } => 0,
@@ -1668,6 +1867,7 @@ fn offset(cursor: Cursor) -> usize {
 fn cursor_with_offset(cursor: Cursor, offset: usize) -> Cursor {
     match cursor {
         Cursor::Text { block, .. } => Cursor::Text { block, offset },
+        Cursor::CodeLanguage { block, .. } => Cursor::CodeLanguage { block, offset },
         Cursor::ListItem { block, item, .. } => Cursor::ListItem {
             block,
             item,
@@ -1716,9 +1916,32 @@ fn wrap_block_range(block: &mut Block, start: usize, end: usize, mark: InlineMar
     *inlines = chunks_to_inlines(&next);
 }
 
+fn wrap_block_color(block: &mut Block, start: usize, end: usize, color: TextColor) {
+    if start >= end {
+        return;
+    }
+    let inlines = match block {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => inlines,
+        Block::BlockQuote(blocks) => match blocks.as_mut_slice() {
+            [Block::Paragraph(inlines)] => inlines,
+            _ => return,
+        },
+        _ => return,
+    };
+    let chunks = inline_chunks(inlines);
+    if chunks.is_empty() {
+        return;
+    }
+    *inlines = chunks_to_inlines(&apply_color_to_chunks(&chunks, start, end, color));
+}
+
 fn block_style_chunks(block: &Block) -> Option<Vec<InlineChunk>> {
     match block {
         Block::Paragraph(inlines) | Block::Heading { inlines, .. } => Some(inline_chunks(inlines)),
+        Block::BlockQuote(blocks) => match blocks.as_slice() {
+            [Block::Paragraph(inlines)] => Some(inline_chunks(inlines)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1755,11 +1978,11 @@ fn clear_block_styles(block: &mut Block, start: usize, end: usize) {
             *inlines = chunks_to_inlines(&clear_styles_in_chunks(&chunks, start, end));
         }
         Block::BlockQuote(blocks) => {
-            *block = Block::Paragraph(vec![Inline::Text(
+            *blocks = vec![Block::Paragraph(vec![Inline::Text(
                 blocks
                     .first()
                     .map_or_else(String::new, Block::rendered_text),
-            )]);
+            )])];
         }
         Block::CodeBlock { text, .. } => {
             *block = Block::Paragraph(vec![Inline::Text(text.clone())]);
@@ -1782,6 +2005,20 @@ fn delete_range_in_block(
             if let Some(inlines) = paragraph_like_inlines_mut(blocks.get_mut(block)) {
                 let chunks = inline_chunks(inlines);
                 *inlines = chunks_to_inlines(&delete_range_in_chunks(&chunks, start, end));
+            }
+            ActiveTextChange::Updated
+        }
+        Block::BlockQuote(_) => {
+            if let Some(inlines) = paragraph_like_inlines_mut(blocks.get_mut(block)) {
+                let chunks = inline_chunks(inlines);
+                *inlines = chunks_to_inlines(&delete_range_in_chunks(&chunks, start, end));
+            } else {
+                let next = blocks
+                    .get(block)
+                    .map(Block::rendered_text)
+                    .map(|text| delete_range_chars(&text, start, end))
+                    .unwrap_or_default();
+                return set_block_text(blocks, block, next);
             }
             ActiveTextChange::Updated
         }
@@ -1883,6 +2120,7 @@ struct ActiveMarks {
     code: bool,
     superscript: bool,
     subscript: bool,
+    color: Option<TextColor>,
 }
 
 fn inline_chunks(inlines: &[Inline]) -> Vec<InlineChunk> {
@@ -1943,6 +2181,10 @@ fn flatten_inline_chunks(
                     current.subscript = true;
                 } else if tag.eq_ignore_ascii_case("</sub>") {
                     current.subscript = false;
+                } else if let Some(color) = parse_text_color_open_tag(tag) {
+                    current.color = Some(color);
+                } else if tag.eq_ignore_ascii_case("</span>") {
+                    current.color = None;
                 } else {
                     push_inline_chunk(out, html.clone(), current, link);
                 }
@@ -2081,6 +2323,51 @@ fn clear_styles_in_chunks(chunks: &[InlineChunk], start: usize, end: usize) -> V
         }
         if !middle.is_empty() {
             push_inline_chunk(&mut out, middle, ActiveMarks::default(), None);
+        }
+        if !suffix.is_empty() {
+            push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
+        }
+        offset = chunk_end;
+    }
+    out
+}
+
+fn apply_color_to_chunks(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+    color: TextColor,
+) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end <= overlap_start {
+            push_inline_chunk(
+                &mut out,
+                chunk.text.clone(),
+                chunk.marks,
+                chunk.link.as_ref(),
+            );
+            offset = chunk_end;
+            continue;
+        }
+
+        let leading = overlap_start.saturating_sub(offset);
+        let selected = overlap_end - overlap_start;
+        let (prefix, rest) = split_chars(&chunk.text, leading);
+        let (middle, suffix) = split_chars(&rest, selected);
+
+        if !prefix.is_empty() {
+            push_inline_chunk(&mut out, prefix, chunk.marks, chunk.link.as_ref());
+        }
+        if !middle.is_empty() {
+            let mut marks = chunk.marks;
+            marks.color = Some(color);
+            push_inline_chunk(&mut out, middle, marks, chunk.link.as_ref());
         }
         if !suffix.is_empty() {
             push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
@@ -2232,6 +2519,7 @@ fn chunk_has_styles(chunk: &InlineChunk) -> bool {
         || chunk.marks.code
         || chunk.marks.superscript
         || chunk.marks.subscript
+        || chunk.marks.color.is_some()
 }
 
 fn shared_link_meta(chunks: &[InlineChunk]) -> Option<LinkMeta> {
@@ -2266,8 +2554,111 @@ fn chunks_to_inlines_without_link(chunks: &[InlineChunk]) -> Vec<Inline> {
 fn paragraph_like_inlines_mut(block: Option<&mut Block>) -> Option<&mut Vec<Inline>> {
     match block? {
         Block::Paragraph(inlines) | Block::Heading { inlines, .. } => Some(inlines),
+        Block::BlockQuote(blocks) => match blocks.as_mut_slice() {
+            [Block::Paragraph(inlines)] => Some(inlines),
+            _ => None,
+        },
         _ => None,
     }
+}
+
+fn current_link_info(
+    document: &Document,
+    cursor: Cursor,
+    selection: Option<Selection>,
+) -> Option<(usize, usize, LinkMeta)> {
+    let owner_cursor = selection.map_or(cursor, |selection| selection.head);
+    let chunks = cursor_style_chunks(document, owner_cursor)?;
+    if let Some(selection) = selection
+        && let Some((start, end)) = same_owner_offsets(selection)
+        && owner(selection.anchor) == owner(selection.head)
+        && start < end
+    {
+        return link_span_for_range(&chunks, start, end);
+    }
+    link_span_for_cursor(&chunks, offset(cursor))
+}
+
+fn cursor_style_chunks(document: &Document, cursor: Cursor) -> Option<Vec<InlineChunk>> {
+    match cursor {
+        Cursor::Text { block, .. } => document.blocks.get(block).and_then(block_style_chunks),
+        Cursor::CodeLanguage { .. } | Cursor::Checkbox { .. } => None,
+        Cursor::ListItem { block, item, .. } => document
+            .blocks
+            .get(block)
+            .and_then(|block| list_item_style_chunks(block, item)),
+        Cursor::TableCell {
+            block, row, col, ..
+        } => document
+            .blocks
+            .get(block)
+            .and_then(|block| table_cell_style_chunks(block, row, col)),
+    }
+}
+
+fn link_span_for_cursor(chunks: &[InlineChunk], cursor: usize) -> Option<(usize, usize, LinkMeta)> {
+    if chunks.is_empty() {
+        return None;
+    }
+    let probe = cursor.saturating_sub(1);
+    let point = usize::from(cursor > 0);
+    link_span_for_offsets(chunks, probe, probe + point.max(1), true)
+}
+
+fn link_span_for_range(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize, LinkMeta)> {
+    if start >= end {
+        return None;
+    }
+    link_span_for_offsets(chunks, start, end, false)
+}
+
+fn link_span_for_offsets(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+    point_mode: bool,
+) -> Option<(usize, usize, LinkMeta)> {
+    let mut starts = Vec::with_capacity(chunks.len());
+    let mut ends = Vec::with_capacity(chunks.len());
+    let mut first = None;
+    let mut last = None;
+    let mut meta = None;
+    let mut offset = 0usize;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        starts.push(offset);
+        ends.push(chunk_end);
+        let overlaps = if point_mode {
+            start >= offset && start < chunk_end
+        } else {
+            chunk_end > start && offset < end
+        };
+        if overlaps {
+            let link = chunk.link.clone()?;
+            if meta.as_ref().is_some_and(|current| current != &link) {
+                return None;
+            }
+            meta = Some(link);
+            first.get_or_insert(index);
+            last = Some(index);
+        }
+        offset = chunk_end;
+    }
+    let meta = meta?;
+    let mut start_index = first?;
+    let mut end_index = last?;
+    while start_index > 0 && chunks[start_index - 1].link.as_ref() == Some(&meta) {
+        start_index -= 1;
+    }
+    while end_index + 1 < chunks.len() && chunks[end_index + 1].link.as_ref() == Some(&meta) {
+        end_index += 1;
+    }
+    Some((starts[start_index], ends[end_index], meta))
 }
 
 fn chunks_to_inlines(chunks: &[InlineChunk]) -> Vec<Inline> {
@@ -2307,6 +2698,9 @@ fn inlines_for_chunk(chunk: &InlineChunk) -> Vec<Inline> {
     if chunk.marks.subscript {
         children = wrap_html_inline(children, "sub");
     }
+    if let Some(color) = chunk.marks.color {
+        children = wrap_color_inline(children, color);
+    }
     if let Some(link) = &chunk.link {
         children = vec![Inline::Link {
             target: link.target.clone(),
@@ -2325,6 +2719,17 @@ fn wrap_html_inline(children: Vec<Inline>, tag: &str) -> Vec<Inline> {
     wrapped
 }
 
+fn wrap_color_inline(children: Vec<Inline>, color: TextColor) -> Vec<Inline> {
+    let mut wrapped = Vec::with_capacity(children.len() + 2);
+    wrapped.push(Inline::HtmlInline(format!(
+        "<span color=\"{}\">",
+        color.tag_name()
+    )));
+    wrapped.extend(children);
+    wrapped.push(Inline::HtmlInline("</span>".to_string()));
+    wrapped
+}
+
 fn merge_adjacent_text(inlines: Vec<Inline>) -> Vec<Inline> {
     let mut merged = Vec::new();
     for inline in inlines {
@@ -2334,6 +2739,152 @@ fn merge_adjacent_text(inlines: Vec<Inline>) -> Vec<Inline> {
         }
     }
     merged
+}
+
+fn parse_inline_input(source: &str) -> Vec<Inline> {
+    let mut inlines = Vec::new();
+    let mut rest = source;
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix("**")
+            && let Some(end) = stripped.find("**")
+        {
+            inlines.push(Inline::Strong(parse_inline_input(&stripped[..end])));
+            rest = &stripped[end + 2..];
+            continue;
+        }
+        if let Some(stripped) = rest.strip_prefix("~~")
+            && let Some(end) = stripped.find("~~")
+        {
+            inlines.push(Inline::Strike(parse_inline_input(&stripped[..end])));
+            rest = &stripped[end + 2..];
+            continue;
+        }
+        if let Some(stripped) = rest.strip_prefix('`')
+            && let Some(end) = stripped.find('`')
+        {
+            inlines.push(Inline::InlineCode(stripped[..end].to_string()));
+            rest = &stripped[end + 1..];
+            continue;
+        }
+        if let Some((inline, consumed)) = parse_link_or_image_inline(rest) {
+            inlines.push(inline);
+            rest = &rest[consumed..];
+            continue;
+        }
+        if let Some((inline, consumed)) = parse_autolink_inline(rest) {
+            inlines.push(inline);
+            rest = &rest[consumed..];
+            continue;
+        }
+        if let Some(stripped) = rest.strip_prefix('*')
+            && let Some(end) = stripped.find('*')
+        {
+            inlines.push(Inline::Emphasis(parse_inline_input(&stripped[..end])));
+            rest = &stripped[end + 1..];
+            continue;
+        }
+        if rest.starts_with('<')
+            && let Some(end) = rest.find('>')
+        {
+            inlines.push(Inline::HtmlInline(rest[..=end].to_string()));
+            rest = &rest[end + 1..];
+            continue;
+        }
+        let next = next_inline_markup(rest).unwrap_or(rest.len());
+        inlines.push(Inline::Text(rest[..next].to_string()));
+        rest = &rest[next..];
+    }
+    if inlines.is_empty() {
+        vec![Inline::Text(String::new())]
+    } else {
+        merge_adjacent_text(inlines)
+    }
+}
+
+fn parse_link_or_image_inline(rest: &str) -> Option<(Inline, usize)> {
+    let image = rest.starts_with("![");
+    let body = if image {
+        &rest[2..]
+    } else {
+        rest.strip_prefix('[')?
+    };
+    let close = body.find("](")?;
+    let label = &body[..close];
+    let after = &body[close + 2..];
+    let end = after.find(')')?;
+    let target = after[..end].to_string();
+    let consumed = if image { 2 } else { 1 } + close + 2 + end + 1;
+    let inline = if image {
+        Inline::Image {
+            src: target,
+            alt: label.to_string(),
+            title: None,
+        }
+    } else {
+        Inline::Link {
+            target,
+            title: None,
+            children: parse_inline_input(label),
+        }
+    };
+    Some((inline, consumed))
+}
+
+fn parse_autolink_inline(rest: &str) -> Option<(Inline, usize)> {
+    if !rest.starts_with("https://") && !rest.starts_with("http://") {
+        return None;
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    let trimmed = candidate.trim_end_matches(|ch: char| ".;,!?".contains(ch));
+    if trimmed == "https://" || trimmed == "http://" {
+        return None;
+    }
+    Some((
+        Inline::Link {
+            target: trimmed.to_string(),
+            title: None,
+            children: vec![Inline::Text(trimmed.to_string())],
+        },
+        trimmed.len(),
+    ))
+}
+
+fn next_inline_markup(rest: &str) -> Option<usize> {
+    ["**", "~~", "`", "![", "[", "*", "<", "https://", "http://"]
+        .iter()
+        .filter_map(|needle| rest.find(needle))
+        .filter(|index| *index > 0)
+        .min()
+}
+
+fn checkbox_shortcut(text: &str) -> Option<(bool, String)> {
+    let (checked, rest) = if let Some(rest) = text.strip_prefix("[_]") {
+        (false, rest)
+    } else if let Some(rest) = text.strip_prefix("[x]") {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix("[X]") {
+        (true, rest)
+    } else {
+        return None;
+    };
+    if !rest.is_empty() && !rest.starts_with(' ') {
+        return None;
+    }
+    Some((checked, rest.trim_start().to_string()))
+}
+
+fn parse_text_color_open_tag(tag: &str) -> Option<TextColor> {
+    let value = tag.strip_prefix("<span color=\"")?.strip_suffix("\">")?;
+    TextColor::from_tag_name(&value.to_ascii_lowercase())
+}
+
+fn is_text_color_tag(tag: &str) -> bool {
+    tag.eq_ignore_ascii_case("</span>") || parse_text_color_open_tag(tag).is_some()
+}
+
+fn single_line_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn recent_transactions(editor: &Editor, limit: usize) -> VecDeque<Transaction> {
@@ -2507,6 +3058,23 @@ mod tests {
             vec![Block::Paragraph(vec![Inline::Text("abcd".to_string())])]
         );
         assert_eq!(editor.selection.and_then(same_owner_offsets), Some((0, 3)));
+    }
+
+    #[test]
+    fn selected_text_returns_same_owner_slice() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello world".to_string())]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        assert_eq!(editor.selected_text().as_deref(), Some("ello"));
     }
 
     #[test]
@@ -2960,5 +3528,164 @@ mod tests {
                 Inline::Text(" world".to_string()),
             ])]
         );
+    }
+
+    #[test]
+    fn applying_link_at_cursor_updates_existing_link_target() {
+        let mut editor = Editor::new(Document::new(vec![Block::Paragraph(vec![
+            Inline::Link {
+                target: "https://old.example".to_string(),
+                title: None,
+                children: vec![Inline::Text("hello".to_string())],
+            },
+            Inline::Text(" world".to_string()),
+        ])]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 3,
+        });
+
+        assert_eq!(
+            editor.current_link_target().as_deref(),
+            Some("https://old.example")
+        );
+
+        editor.apply_link("https://new.example");
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Link {
+                    target: "https://new.example".to_string(),
+                    title: None,
+                    children: vec![Inline::Text("hello".to_string())],
+                },
+                Inline::Text(" world".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn typing_and_deleting_inside_blockquote_updates_quoted_text() {
+        let mut editor = Editor::new(Document::new(vec![Block::BlockQuote(vec![
+            Block::Paragraph(vec![Inline::Text("quote".to_string())]),
+        ])]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        editor.press_char('d');
+        editor.backspace();
+        editor.delete();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::BlockQuote(vec![Block::Paragraph(vec![
+                Inline::Text("quote".to_string())
+            ])])]
+        );
+    }
+
+    #[test]
+    fn typing_checkbox_shortcut_turns_paragraph_into_task_item() {
+        let mut editor = paragraph_editor(vec![Inline::Text(String::new())]);
+        for ch in "[x]".chars() {
+            editor.press_char(ch);
+        }
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::List(List {
+                ordered: false,
+                tight: false,
+                items: vec![ListItem {
+                    checked: Some(true),
+                    blocks: vec![Block::Paragraph(vec![Inline::Text(String::new())])],
+                }],
+            })]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::ListItem {
+                block: 0,
+                item: 0,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn typing_backtick_wrapped_text_creates_inline_code() {
+        let mut editor = paragraph_editor(vec![Inline::Text(String::new())]);
+        for ch in "`code`".chars() {
+            editor.press_char(ch);
+        }
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::InlineCode(
+                "code".to_string()
+            )])]
+        );
+    }
+
+    #[test]
+    fn typing_url_autolinks_plain_text() {
+        let mut editor = paragraph_editor(vec![Inline::Text(String::new())]);
+        for ch in "https://example.com".chars() {
+            editor.press_char(ch);
+        }
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Link {
+                target: "https://example.com".to_string(),
+                title: None,
+                children: vec![Inline::Text("https://example.com".to_string())],
+            }])]
+        );
+    }
+
+    #[test]
+    fn applying_text_color_wraps_selected_text_in_color_span() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello".to_string())]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        editor.apply_text_color(TextColor::Red);
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::HtmlInline("<span color=\"red\">".to_string()),
+                Inline::Text("hello".to_string()),
+                Inline::HtmlInline("</span>".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
+    fn h1_h2_text_is_forced_to_single_line() {
+        let mut editor = Editor::new(Document::new(vec![Block::Heading {
+            level: 1,
+            inlines: vec![Inline::Text("Title".to_string())],
+        }]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        editor.paste_plain_text("\nAgain");
+
+        assert_eq!(editor.document.blocks[0].rendered_text(), "Title Again");
     }
 }

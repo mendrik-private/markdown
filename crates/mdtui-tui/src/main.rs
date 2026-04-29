@@ -28,12 +28,12 @@ use fontdue::{
 };
 use image::{ColorType, ImageEncoder, Rgba, RgbaImage, codecs::png::PngEncoder};
 use mdtui_core::{
-    Block as DocBlock, Cursor, Direction, Inline, Table, default_cursor_for_block,
+    Block as DocBlock, Cursor, Direction, Inline, Table, TextColor, default_cursor_for_block,
     editable_block_fallback,
 };
 use mdtui_render::{
-    DisplayAction, DisplayKind, RenderOptions, Rendered, Theme, action_at, hit_test_or_nearest,
-    render_document,
+    DisplayAction, DisplayKind, RenderOptions, Rendered, Theme, action_at, hit_test,
+    hit_test_or_nearest, render_document,
 };
 use mdtui_tui::App;
 use ratatui::{
@@ -49,8 +49,8 @@ use ratatui::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
-const HEADLINE_RASTER_VERSION: u32 = 9;
-const HEADLINE_DEBUG_SLAB: bool = true;
+const HEADLINE_RASTER_VERSION: u32 = 10;
+const HEADLINE_DEBUG_SLAB: bool = false;
 const DOCUMENT_LEFT_PAD: u16 = 1;
 const SPECIAL_EDIT_DELAY: Duration = Duration::from_millis(200);
 const STYLE_POPUP_DELAY: Duration = Duration::from_millis(500);
@@ -109,8 +109,8 @@ enum StylePopupAction {
     Bold,
     Italic,
     Code,
-    Superscript,
-    Subscript,
+    Strike,
+    TextColor,
     Link,
     Clear,
     Quote,
@@ -122,8 +122,8 @@ impl StylePopupAction {
             Self::Bold => "Ctrl+B",
             Self::Italic => "Ctrl+I",
             Self::Code => "Ctrl+E",
-            Self::Superscript => "Ctrl+.",
-            Self::Subscript => "Ctrl+,",
+            Self::Strike => "Ctrl+Shift+X",
+            Self::TextColor => "Enter",
             Self::Link => "Enter",
             Self::Clear => "Enter",
             Self::Quote => "Enter",
@@ -135,8 +135,8 @@ impl StylePopupAction {
             Self::Bold => "Bold",
             Self::Italic => "Italic",
             Self::Code => "Code",
-            Self::Superscript => "Superscript",
-            Self::Subscript => "Subscript",
+            Self::Strike => "Strike",
+            Self::TextColor => "Text color",
             Self::Link => "Link",
             Self::Clear => "Remove styling",
             Self::Quote => "Block quote",
@@ -155,6 +155,14 @@ struct StylePopupHit {
 #[derive(Clone, Debug)]
 enum LinkPopup {
     Edit { input: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColorPopupHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    color: TextColor,
 }
 
 #[derive(Clone, Debug)]
@@ -185,12 +193,14 @@ enum SpacerPromptAction {
 struct BaseRenderCacheKey {
     version: u64,
     options: RenderOptions,
+    collapsed_headings: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RenderCacheKey {
     version: u64,
     options: RenderOptions,
+    collapsed_headings: Vec<usize>,
     active_fallback_block: Option<EditableTarget>,
 }
 
@@ -228,6 +238,9 @@ struct PendingEditableTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CursorLane {
+    CodeLanguage {
+        block: usize,
+    },
     Text {
         block: usize,
     },
@@ -454,12 +467,14 @@ struct TuiState {
     last_style_popup: Option<Rect>,
     style_popup_hits: Vec<StylePopupHit>,
     style_popup_selected: StylePopupAction,
+    style_popup_show_selection: bool,
     style_popup_hover: Option<StylePopupAction>,
     style_popup_not_before: Option<Instant>,
     explorer_mode: ExplorerMode,
     explorer_scroll: u16,
     outline_scroll: u16,
     collapsed_dirs: HashSet<PathBuf>,
+    collapsed_headings: HashSet<usize>,
     explorer_hits: Vec<ExplorerHit>,
     explorer_mode_hits: Vec<ExplorerModeHit>,
     outline_hits: Vec<OutlineHit>,
@@ -473,6 +488,10 @@ struct TuiState {
     last_file_popup: Option<Rect>,
     link_popup: Option<LinkPopup>,
     last_link_popup: Option<Rect>,
+    color_popup_hits: Vec<ColorPopupHit>,
+    last_color_popup: Option<Rect>,
+    color_popup_selected: TextColor,
+    color_popup_hover: Option<TextColor>,
     heading_popup: Option<HeadingPopup>,
     heading_popup_hits: Vec<HeadingPopupHit>,
     last_heading_popup: Option<Rect>,
@@ -534,12 +553,14 @@ impl TuiState {
             last_style_popup: None,
             style_popup_hits: Vec::new(),
             style_popup_selected: StylePopupAction::Bold,
+            style_popup_show_selection: false,
             style_popup_hover: None,
             style_popup_not_before: None,
             explorer_mode: ExplorerMode::Nested,
             explorer_scroll: 0,
             outline_scroll: 0,
             collapsed_dirs: HashSet::new(),
+            collapsed_headings: HashSet::new(),
             explorer_hits: Vec::new(),
             explorer_mode_hits: Vec::new(),
             outline_hits: Vec::new(),
@@ -553,6 +574,10 @@ impl TuiState {
             last_file_popup: None,
             link_popup: None,
             last_link_popup: None,
+            color_popup_hits: Vec::new(),
+            last_color_popup: None,
+            color_popup_selected: TextColor::Accent,
+            color_popup_hover: None,
             heading_popup: None,
             heading_popup_hits: Vec::new(),
             last_heading_popup: None,
@@ -673,11 +698,15 @@ fn drain_headline_raster_results(state: &mut TuiState) -> bool {
 fn process_event(state: &mut TuiState, event: Event) -> bool {
     match event {
         Event::Key(key) if should_handle_key(state, key) => handle_key(state, key),
+        Event::Paste(text) => {
+            paste_document_text(state, &text);
+            false
+        }
         Event::Mouse(mouse) => {
             handle_mouse(state, mouse);
             false
         }
-        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => false,
+        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => false,
         Event::Key(_) => false,
     }
 }
@@ -813,10 +842,38 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         return false;
     }
 
+    if state.last_color_popup.is_some() && key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Left => {
+                close_color_popup(state);
+                return false;
+            }
+            KeyCode::Up => {
+                step_color_popup_selection(state, -1);
+                state.color_popup_hover = None;
+                return false;
+            }
+            KeyCode::Down => {
+                step_color_popup_selection(state, 1);
+                state.color_popup_hover = None;
+                return false;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                apply_color_popup_selection(state);
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     if has_selection(state) && state.app.editor.show_style_popover && key.modifiers.is_empty() {
         match key.code {
             KeyCode::Esc => {
                 hide_style_popup(state);
+                return false;
+            }
+            KeyCode::Right if active_style_popup_action(state) == StylePopupAction::TextColor => {
+                open_color_popup(state);
                 return false;
             }
             KeyCode::Up => {
@@ -898,6 +955,8 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => state.save(),
+        KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && copy_selected_text(state) => {}
         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.preferred_column = None;
             state.app.render_options.columns = 1;
@@ -945,16 +1004,6 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.apply_code();
-            state.preferred_column = None;
-            state.dirty = true;
-        }
-        KeyCode::Char('.') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.app.apply_superscript();
-            state.preferred_column = None;
-            state.dirty = true;
-        }
-        KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.app.apply_subscript();
             state.preferred_column = None;
             state.dirty = true;
         }
@@ -1086,7 +1135,8 @@ fn editor_backspace_should_consume(state: &TuiState) -> bool {
     has_selection(state)
         || active_editable_target(state).is_some()
         || match state.app.editor.cursor {
-            Cursor::Text { offset, .. }
+            Cursor::CodeLanguage { offset, .. }
+            | Cursor::Text { offset, .. }
             | Cursor::ListItem { offset, .. }
             | Cursor::TableCell { offset, .. } => offset > 0,
             Cursor::Checkbox { .. } => true,
@@ -1189,27 +1239,151 @@ fn sync_navigation_render_options(state: &mut TuiState) {
 
 fn current_base_render(state: &mut TuiState) -> Arc<Rendered> {
     sync_navigation_render_options(state);
+    let collapsed_headings = sorted_heading_blocks(&state.collapsed_headings);
     let base_render_key = BaseRenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
+        collapsed_headings: collapsed_headings.clone(),
     };
     if state.last_base_render_key.as_ref() == Some(&base_render_key) {
         state.last_base_rendered.clone().unwrap_or_else(|| {
-            let rendered = Arc::new(render_document(
-                &state.app.editor.document,
-                state.app.render_options.clone(),
-            ));
+            let rendered = Arc::new(render_visible_document(state));
             state.last_base_rendered = Some(rendered.clone());
             rendered
         })
     } else {
-        let rendered = Arc::new(render_document(
-            &state.app.editor.document,
-            state.app.render_options.clone(),
-        ));
+        let rendered = Arc::new(render_visible_document(state));
         state.last_base_render_key = Some(base_render_key);
         state.last_base_rendered = Some(rendered.clone());
         rendered
+    }
+}
+
+fn sorted_heading_blocks(collapsed: &HashSet<usize>) -> Vec<usize> {
+    let mut headings = collapsed.iter().copied().collect::<Vec<_>>();
+    headings.sort_unstable();
+    headings
+}
+
+fn render_visible_document(state: &TuiState) -> Rendered {
+    let visible =
+        visible_block_indices(&state.app.editor.document.blocks, &state.collapsed_headings);
+    if visible.len() == state.app.editor.document.blocks.len() {
+        return render_document(&state.app.editor.document, state.app.render_options.clone());
+    }
+    let mut document = mdtui_core::Document {
+        blocks: visible
+            .iter()
+            .filter_map(|&index| state.app.editor.document.blocks.get(index).cloned())
+            .collect(),
+        version: state.app.editor.document.version,
+    };
+    if document.blocks.is_empty() {
+        document = mdtui_core::Document::default();
+    }
+    let mut rendered = render_document(&document, state.app.render_options.clone());
+    remap_rendered_blocks(&mut rendered, &visible);
+    rendered
+}
+
+fn visible_block_indices(blocks: &[DocBlock], collapsed_headings: &HashSet<usize>) -> Vec<usize> {
+    let mut visible = Vec::new();
+    let mut index = 0usize;
+    while index < blocks.len() {
+        visible.push(index);
+        if collapsed_headings.contains(&index)
+            && let Some(level) = heading_level_for_block(blocks.get(index))
+        {
+            index += 1;
+            while index < blocks.len() {
+                let Some(next_level) = heading_level_for_block(blocks.get(index)) else {
+                    index += 1;
+                    continue;
+                };
+                if next_level <= level {
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        index += 1;
+    }
+    visible
+}
+
+fn heading_level_for_block(block: Option<&DocBlock>) -> Option<u8> {
+    match block {
+        Some(DocBlock::Heading { level, .. }) => Some(*level),
+        _ => None,
+    }
+}
+
+fn remap_rendered_blocks(rendered: &mut Rendered, mapping: &[usize]) {
+    for item in &mut rendered.display.items {
+        if let Some(cursor) = item.cursor {
+            item.cursor = Some(remap_cursor_block(cursor, mapping));
+        }
+        item.action = item.action.clone().map(|action| match action {
+            DisplayAction::CopyCodeBlock { block } => DisplayAction::CopyCodeBlock {
+                block: mapping[block],
+            },
+            DisplayAction::FollowLink { block } => DisplayAction::FollowLink {
+                block: mapping[block],
+            },
+            DisplayAction::ScrollCodeBlock {
+                block,
+                track_start,
+                track_width,
+                thumb_width,
+                content_width,
+                visible_width,
+            } => DisplayAction::ScrollCodeBlock {
+                block: mapping[block],
+                track_start,
+                track_width,
+                thumb_width,
+                content_width,
+                visible_width,
+            },
+        });
+    }
+}
+
+fn remap_cursor_block(cursor: Cursor, mapping: &[usize]) -> Cursor {
+    match cursor {
+        Cursor::Text { block, offset } => Cursor::Text {
+            block: mapping[block],
+            offset,
+        },
+        Cursor::CodeLanguage { block, offset } => Cursor::CodeLanguage {
+            block: mapping[block],
+            offset,
+        },
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } => Cursor::ListItem {
+            block: mapping[block],
+            item,
+            offset,
+        },
+        Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        } => Cursor::TableCell {
+            block: mapping[block],
+            row,
+            col,
+            offset,
+        },
+        Cursor::Checkbox { block, item } => Cursor::Checkbox {
+            block: mapping[block],
+            item,
+        },
     }
 }
 
@@ -1219,6 +1393,7 @@ fn current_navigation_render(state: &mut TuiState) -> Arc<Rendered> {
     let render_key = RenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
+        collapsed_headings: sorted_heading_blocks(&state.collapsed_headings),
         active_fallback_block: active_editable_target(state),
     };
     let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
@@ -1398,6 +1573,27 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
             state.last_link_popup = None;
         }
     }
+    if let Some(popup) = state.last_color_popup {
+        if mouse.column >= popup.x
+            && mouse.column < popup.x.saturating_add(popup.width)
+            && mouse.row >= popup.y
+            && mouse.row < popup.y.saturating_add(popup.height)
+        {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    click_color_popup(state, popup, mouse.column, mouse.row)
+                }
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                    hover_color_popup(state, popup, mouse.column, mouse.row)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            close_color_popup(state);
+        }
+    }
     if let Some(popup) = state.last_heading_popup {
         if mouse.column >= popup.x
             && mouse.column < popup.x.saturating_add(popup.width)
@@ -1471,6 +1667,9 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         hide_style_popup(state);
     }
     if state.style_popup_hover.take().is_some() {
+        state.dirty = true;
+    }
+    if state.color_popup_hover.take().is_some() {
         state.dirty = true;
     }
 
@@ -1838,6 +2037,57 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     }
 }
 
+#[allow(dead_code)]
+fn heading_block_at_row(state: &TuiState, row: u16) -> Option<usize> {
+    let rendered = state.last_rendered.as_ref()?;
+    visible_heading_rows(rendered, &state.app.editor.document.blocks)
+        .into_iter()
+        .find_map(|(block, block_row)| (block_row == row).then_some(block))
+}
+
+#[allow(dead_code)]
+fn toggle_heading_collapse(state: &mut TuiState, block: usize) {
+    if !matches!(
+        state.app.editor.document.blocks.get(block),
+        Some(DocBlock::Heading { .. })
+    ) {
+        return;
+    }
+    let collapsing = state.collapsed_headings.insert(block);
+    if !collapsing {
+        state.collapsed_headings.remove(&block);
+    } else if hidden_by_collapsed_heading(
+        &state.app.editor.document.blocks,
+        &state.collapsed_headings,
+        cursor_block(state.app.editor.cursor),
+    ) {
+        clear_pending_edit_target(state);
+        clear_spacer_cursor(state);
+        state
+            .app
+            .editor
+            .set_cursor(Cursor::Text { block, offset: 0 });
+    }
+    state.last_base_rendered = None;
+    state.last_base_render_key = None;
+    state.last_rendered = None;
+    state.last_render_key = None;
+    state.last_styled_lines = None;
+    state.last_styled_key = None;
+    state.last_nav_index = None;
+    state.last_nav_key = None;
+    state.dirty = true;
+}
+
+#[allow(dead_code)]
+fn hidden_by_collapsed_heading(
+    blocks: &[DocBlock],
+    collapsed_headings: &HashSet<usize>,
+    target_block: usize,
+) -> bool {
+    !visible_block_indices(blocks, collapsed_headings).contains(&target_block)
+}
+
 fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     let theme = Theme::dark_amber();
     let area = frame.area();
@@ -1898,24 +2148,20 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         show_status: false,
         ..state.app.render_options.clone()
     };
+    let collapsed_headings = sorted_heading_blocks(&state.collapsed_headings);
     let base_render_key = BaseRenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
+        collapsed_headings: collapsed_headings.clone(),
     };
     let base_rendered = if state.last_base_render_key.as_ref() == Some(&base_render_key) {
         state.last_base_rendered.clone().unwrap_or_else(|| {
-            let rendered = Arc::new(render_document(
-                &state.app.editor.document,
-                state.app.render_options.clone(),
-            ));
+            let rendered = Arc::new(render_visible_document(state));
             state.last_base_rendered = Some(rendered.clone());
             rendered
         })
     } else {
-        let rendered = Arc::new(render_document(
-            &state.app.editor.document,
-            state.app.render_options.clone(),
-        ));
+        let rendered = Arc::new(render_visible_document(state));
         state.last_base_render_key = Some(base_render_key);
         state.last_base_rendered = Some(rendered.clone());
         rendered
@@ -1923,6 +2169,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     let render_key = RenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
+        collapsed_headings,
         active_fallback_block: active_editable_target(state),
     };
     let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
@@ -2086,6 +2333,12 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else {
         state.last_style_popup = None;
         state.style_popup_hits.clear();
+    }
+    if state.last_style_popup.is_some() && state.last_color_popup.is_some() {
+        state.last_color_popup = Some(draw_color_popup(frame, area, state, &theme));
+    } else {
+        state.last_color_popup = None;
+        state.color_popup_hits.clear();
     }
     if state.show_help {
         draw_help(frame, area, &theme);
@@ -2616,6 +2869,54 @@ fn draw_document_with_lines(
     );
 }
 
+#[allow(dead_code)]
+fn draw_heading_collapse_chevrons(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &TuiState,
+    rendered: &Rendered,
+    theme: &Theme,
+) {
+    let gutter_x = document_content_left(area).saturating_sub(1);
+    let top = state.scroll;
+    let bottom = top.saturating_add(area.height.saturating_sub(2));
+    let style = Style::default()
+        .fg(rgb(theme.text_secondary))
+        .bg(rgb(theme.panel_bg));
+    for (block, row) in visible_heading_rows(rendered, &state.app.editor.document.blocks) {
+        if row < top || row >= bottom {
+            continue;
+        }
+        let chevron = if state.collapsed_headings.contains(&block) {
+            "▸"
+        } else {
+            "▾"
+        };
+        let screen_y = document_content_top(area).saturating_add(row.saturating_sub(top));
+        buf.set_string(gutter_x, screen_y, chevron, style);
+    }
+}
+
+#[allow(dead_code)]
+fn visible_heading_rows(rendered: &Rendered, blocks: &[DocBlock]) -> Vec<(usize, u16)> {
+    let mut rows: HashMap<usize, u16> = HashMap::new();
+    for item in &rendered.display.items {
+        let Some(cursor) = item.cursor else {
+            continue;
+        };
+        let block = cursor_block(cursor);
+        if !matches!(blocks.get(block), Some(DocBlock::Heading { .. })) {
+            continue;
+        }
+        rows.entry(block)
+            .and_modify(|row| *row = (*row).min(item.rect.y))
+            .or_insert(item.rect.y);
+    }
+    let mut rows = rows.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(block, _)| *block);
+    rows
+}
+
 fn draw_status(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2917,7 +3218,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             body,
         )]),
         Line::from(vec![Span::styled(
-            " Ctrl-1/2/3 columns · Ctrl-click selects a whole block or table cell",
+            " Tab/Shift-Tab panes · Ctrl-click selects a whole block or table cell",
             body,
         )]),
         Line::from(vec![Span::styled(" Editing ", section)]),
@@ -2926,7 +3227,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             body,
         )]),
         Line::from(vec![Span::styled(
-            " Ctrl-Shift-X strike · Ctrl-./, super/sub · spacer rows: H then 1-6, T/C/Q/P/L/D",
+            " Ctrl-Shift-X strike · Ctrl-C copy selection · paste inserts plain text",
+            body,
+        )]),
+        Line::from(vec![Span::styled(
+            " spacer rows: H then 1-6, T/C/Q/P/L/D",
             body,
         )]),
         Line::from(vec![Span::styled(" Tables & lists ", section)]),
@@ -3024,12 +3329,12 @@ fn style_popup_items() -> [StylePopupEntry; 9] {
             action: StylePopupAction::Code,
         }),
         StylePopupEntry::Action(StylePopupItem {
-            label: "Superscript",
-            action: StylePopupAction::Superscript,
+            label: "Strike",
+            action: StylePopupAction::Strike,
         }),
         StylePopupEntry::Action(StylePopupItem {
-            label: "Subscript",
-            action: StylePopupAction::Subscript,
+            label: "Text color",
+            action: StylePopupAction::TextColor,
         }),
         StylePopupEntry::Action(StylePopupItem {
             label: "Block quote",
@@ -3057,6 +3362,94 @@ fn style_popup_width(items: &[StylePopupEntry]) -> u16 {
         .max()
         .unwrap_or(0) as u16
         + 4
+}
+
+fn text_color_items() -> [(TextColor, &'static str); 8] {
+    [
+        (TextColor::Accent, "Accent"),
+        (TextColor::Red, "Red"),
+        (TextColor::Yellow, "Yellow"),
+        (TextColor::Green, "Green"),
+        (TextColor::Teal, "Teal"),
+        (TextColor::Blue, "Blue"),
+        (TextColor::Purple, "Purple"),
+        (TextColor::Pink, "Pink"),
+    ]
+}
+
+fn draw_color_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    theme: &Theme,
+) -> Rect {
+    let Some(style_popup) = state.last_style_popup else {
+        return Rect::default();
+    };
+    let items = text_color_items();
+    let width = 16u16;
+    let height = items.len() as u16 + 2;
+    let popup = Rect {
+        x: style_popup
+            .x
+            .saturating_add(style_popup.width)
+            .saturating_add(1)
+            .min(area.x.saturating_add(area.width.saturating_sub(width))),
+        y: style_popup
+            .y
+            .min(area.y.saturating_add(area.height.saturating_sub(height))),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(rgb(theme.border_strong)))
+            .style(Style::default().bg(rgb(theme.panel_bg))),
+        popup,
+    );
+    state.color_popup_hits.clear();
+    for (index, (color, label)) in items.iter().enumerate() {
+        let y = popup.y + 1 + index as u16;
+        let selected = active_color_popup_choice(state) == *color;
+        let row_style = if selected {
+            Style::default()
+                .fg(rgb(theme.panel_bg))
+                .bg(rgb(theme.accent_highlight))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(rgb(theme.text_primary))
+                .bg(rgb(theme.panel_bg))
+        };
+        let swatch_style = row_style.fg(rgb(text_color_hex(theme, *color)));
+        let mut x = popup.x + 1;
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            popup.x + popup.width - 1,
+            " ■ ",
+            swatch_style,
+        );
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            popup.x + popup.width - 1,
+            &pad_width(label, usize::from(popup.width.saturating_sub(6))),
+            row_style,
+        );
+        state.color_popup_hits.push(ColorPopupHit {
+            row: index as u16 + 1,
+            start: 1,
+            end: popup.width.saturating_sub(1),
+            color: *color,
+        });
+    }
+    popup
 }
 
 fn populate_style_popup_hits(state: &mut TuiState, items: &[StylePopupEntry], popup: Rect) {
@@ -3096,7 +3489,7 @@ fn render_popup_items(
         match item {
             StylePopupEntry::Action(item) => {
                 let mut x = popup.x + 1;
-                let selected = item.action == active_style_popup_action(state);
+                let selected = highlighted_style_popup_action(state) == Some(item.action);
                 let style = if selected { active_style } else { idle_style };
                 let label = format!(
                     " {}",
@@ -3241,6 +3634,28 @@ fn run_action(state: &mut TuiState, action: DisplayAction) {
     }
 }
 
+fn copy_selected_text(state: &mut TuiState) -> bool {
+    let Some(text) = state.app.editor.selected_text() else {
+        return false;
+    };
+    match copy_osc52(&text) {
+        Ok(()) => state.message = "selection copied".to_string(),
+        Err(error) => state.message = format!("copy failed: {error}"),
+    }
+    true
+}
+
+fn paste_document_text(state: &mut TuiState, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    clear_spacer_cursor(state);
+    clear_pending_edit_target(state);
+    state.app.editor.paste_plain_text(text);
+    state.preferred_column = None;
+    state.dirty = true;
+}
+
 fn follow_link_to_block(state: &mut TuiState, block: usize, message: &str) {
     state.preferred_column = None;
     state.cursor_row_hint = None;
@@ -3308,6 +3723,7 @@ fn click_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
         return;
     };
     state.style_popup_selected = action;
+    state.style_popup_show_selection = false;
     state.style_popup_hover = Some(action);
     apply_style_popup_action(state, action);
     state.dirty = true;
@@ -3324,6 +3740,76 @@ fn hover_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
         .map(|hit| hit.action);
     if state.style_popup_hover != hover {
         state.style_popup_hover = hover;
+        state.dirty = true;
+    }
+}
+
+fn active_color_popup_choice(state: &TuiState) -> TextColor {
+    state
+        .color_popup_hover
+        .unwrap_or(state.color_popup_selected)
+}
+
+fn open_color_popup(state: &mut TuiState) {
+    state.last_color_popup = Some(Rect::default());
+    state.color_popup_hover = None;
+    state.color_popup_hits.clear();
+    state.dirty = true;
+}
+
+fn close_color_popup(state: &mut TuiState) {
+    state.last_color_popup = None;
+    state.color_popup_hover = None;
+    state.color_popup_hits.clear();
+    state.dirty = true;
+}
+
+fn step_color_popup_selection(state: &mut TuiState, delta: i32) {
+    let items = text_color_items();
+    let current = items
+        .iter()
+        .position(|(color, _)| *color == state.color_popup_selected)
+        .unwrap_or(0) as i32;
+    let next = (current + delta).rem_euclid(items.len() as i32) as usize;
+    state.color_popup_selected = items[next].0;
+    state.message = format!("text color - {}", items[next].1.to_ascii_lowercase());
+    state.dirty = true;
+}
+
+fn apply_color_popup_selection(state: &mut TuiState) {
+    let color = active_color_popup_choice(state);
+    state.app.apply_text_color(color);
+    close_color_popup(state);
+    state.message = "text color applied".to_string();
+    state.dirty = true;
+}
+
+fn click_color_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let Some(color) = state
+        .color_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.color)
+    else {
+        return;
+    };
+    state.color_popup_selected = color;
+    state.color_popup_hover = Some(color);
+    apply_color_popup_selection(state);
+}
+
+fn hover_color_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let hover = state
+        .color_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.color);
+    if state.color_popup_hover != hover {
+        state.color_popup_hover = hover;
         state.dirty = true;
     }
 }
@@ -3762,6 +4248,14 @@ fn active_style_popup_action(state: &TuiState) -> StylePopupAction {
         .unwrap_or(state.style_popup_selected)
 }
 
+fn highlighted_style_popup_action(state: &TuiState) -> Option<StylePopupAction> {
+    state.style_popup_hover.or_else(|| {
+        state
+            .style_popup_show_selection
+            .then_some(state.style_popup_selected)
+    })
+}
+
 fn active_heading_popup_level(state: &TuiState) -> u8 {
     state
         .heading_popup_hover
@@ -3799,8 +4293,8 @@ fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
         StylePopupAction::Bold,
         StylePopupAction::Italic,
         StylePopupAction::Code,
-        StylePopupAction::Superscript,
-        StylePopupAction::Subscript,
+        StylePopupAction::Strike,
+        StylePopupAction::TextColor,
         StylePopupAction::Quote,
         StylePopupAction::Link,
         StylePopupAction::Clear,
@@ -3811,6 +4305,7 @@ fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
         .unwrap_or(0) as i32;
     let next = (current + delta).rem_euclid(actions.len() as i32) as usize;
     state.style_popup_selected = actions[next];
+    state.style_popup_show_selection = true;
     state.message = format!(
         "{} - {}",
         state.style_popup_selected.shortcut(),
@@ -3835,8 +4330,8 @@ fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
                 state.app.apply_code();
             }
         }
-        StylePopupAction::Superscript => state.app.apply_superscript(),
-        StylePopupAction::Subscript => state.app.apply_subscript(),
+        StylePopupAction::Strike => state.app.apply_strike(),
+        StylePopupAction::TextColor => open_color_popup(state),
         StylePopupAction::Link => open_link_popup(state),
         StylePopupAction::Clear => state.app.clear_styles(),
         StylePopupAction::Quote => state.app.apply_block_quote(),
@@ -4318,7 +4813,11 @@ fn confirm_file_popup(state: &mut TuiState) {
 
 fn open_link_popup(state: &mut TuiState) {
     state.link_popup = Some(LinkPopup::Edit {
-        input: "https://".to_string(),
+        input: state
+            .app
+            .editor
+            .current_link_target()
+            .unwrap_or_else(|| "https://".to_string()),
     });
     state.last_link_popup = None;
 }
@@ -4458,8 +4957,10 @@ fn persist_view_state(state: &TuiState) {
 
 fn hide_style_popup(state: &mut TuiState) {
     state.style_popup_not_before = None;
+    close_color_popup(state);
     if state.app.editor.show_style_popover {
         state.app.editor.show_style_popover = false;
+        state.style_popup_show_selection = false;
         state.style_popup_hover = None;
         state.dirty = true;
     }
@@ -4467,6 +4968,7 @@ fn hide_style_popup(state: &mut TuiState) {
 
 fn schedule_style_popup_delay(state: &mut TuiState) {
     if has_selection(state) && state.app.editor.show_style_popover {
+        state.style_popup_show_selection = false;
         state.style_popup_not_before = Some(Instant::now() + STYLE_POPUP_DELAY);
         state.last_style_popup = None;
         state.style_popup_hits.clear();
@@ -4545,7 +5047,7 @@ fn explorer_lines(
         ExplorerMode::Nested => {
             let root_count = markdown_count(&root);
             let collapsed = collapsed_dirs.contains(&root);
-            let chevron = if collapsed { "▸" } else { "▾" };
+            let chevron = if collapsed { "🞂" } else { "🞃" };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{chevron} "),
@@ -4630,7 +5132,7 @@ fn walk_dir_nested(
                 continue;
             }
             let collapsed = collapsed_dirs.contains(&entry_path);
-            let chevron = if collapsed { "▸" } else { "▾" };
+            let chevron = if collapsed { "🞂" } else { "🞃" };
             lines.push(Line::from(vec![
                 Span::styled(
                     indent.clone(),
@@ -5113,6 +5615,7 @@ struct InlinePaintStyle {
     link: bool,
     superscript: bool,
     subscript: bool,
+    color: Option<TextColor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5143,8 +5646,12 @@ fn styled_text_spans_for_row(
         .iter()
         .any(|item| item.kind == DisplayKind::Adornment && item.text.starts_with("▌ "));
     let numbered_row = !toc_row
-        && row_items.first().is_some_and(|item| {
-            item.kind == DisplayKind::Adornment && is_numbered_marker(&item.text)
+        && row_items.iter().any(|item| match item.cursor {
+            Some(Cursor::ListItem { block, .. }) => matches!(
+                state.app.editor.document.blocks.get(block),
+                Some(DocBlock::List(list)) if list.ordered
+            ),
+            _ => item.kind == DisplayKind::Adornment && is_numbered_marker(&item.text),
         });
     let row_style = RowSpanContext {
         background,
@@ -5360,6 +5867,7 @@ fn styled_fragments_for_item(
         return Some(Vec::new());
     }
     match cursor {
+        Cursor::CodeLanguage { .. } => None,
         Cursor::Text { block, offset } => {
             styled_fragments_for_block(document.blocks.get(block)?, offset, visible_len)
         }
@@ -5502,6 +6010,14 @@ fn flatten_inlines(inlines: &[Inline], current: InlinePaintStyle, out: &mut Vec<
                 }
                 if tag.eq_ignore_ascii_case("</sub>") {
                     current.subscript = false;
+                    continue;
+                }
+                if let Some(color) = parse_text_color_open_tag(tag) {
+                    current.color = Some(color);
+                    continue;
+                }
+                if tag.eq_ignore_ascii_case("</span>") {
+                    current.color = None;
                     continue;
                 }
                 push_fragment(out, html.clone(), current);
@@ -5648,6 +6164,9 @@ fn style_for_inline_fragment(
     blockquote_row: bool,
 ) -> Style {
     let mut style = base_document_style(theme, background, heading, numbered_row, blockquote_row);
+    if let Some(color) = fragment.color {
+        style = style.fg(rgb(text_color_hex(theme, color)));
+    }
     if fragment.link {
         style = style.fg(rgb(theme.link)).add_modifier(Modifier::UNDERLINED);
     }
@@ -5849,19 +6368,20 @@ fn compare_cursors(a: Cursor, b: Cursor) -> std::cmp::Ordering {
 
 fn cursor_sort_key(cursor: Cursor) -> (usize, u8, usize, usize, usize) {
     match cursor {
-        Cursor::Text { block, offset } => (block, 0, 0, 0, offset),
+        Cursor::CodeLanguage { block, offset } => (block, 0, 0, 0, offset),
+        Cursor::Text { block, offset } => (block, 1, 0, 0, offset),
         Cursor::ListItem {
             block,
             item,
             offset,
-        } => (block, 1, item, 0, offset),
+        } => (block, 2, item, 0, offset),
         Cursor::TableCell {
             block,
             row,
             col,
             offset,
-        } => (block, 2, row, col, offset),
-        Cursor::Checkbox { block, item } => (block, 1, item, 0, 0),
+        } => (block, 3, row, col, offset),
+        Cursor::Checkbox { block, item } => (block, 2, item, 0, 0),
     }
 }
 
@@ -5903,6 +6423,10 @@ fn selection_rect_for_item(
 
 fn advance_cursor(cursor: Cursor, width: usize) -> Option<Cursor> {
     Some(match cursor {
+        Cursor::CodeLanguage { block, offset } => Cursor::CodeLanguage {
+            block,
+            offset: offset + width,
+        },
         Cursor::Text { block, offset } => Cursor::Text {
             block,
             offset: offset + width,
@@ -6378,7 +6902,8 @@ impl DisplayNavIndex {
             };
             let lane = cursor_lane(cursor);
             let segment = match cursor {
-                Cursor::Text { offset, .. }
+                Cursor::CodeLanguage { offset, .. }
+                | Cursor::Text { offset, .. }
                 | Cursor::ListItem { offset, .. }
                 | Cursor::TableCell { offset, .. } => CursorSegment {
                     start: offset,
@@ -6424,6 +6949,7 @@ fn display_item_block(item: &mdtui_render::DisplayItem) -> Option<usize> {
 
 fn cursor_lane(cursor: Cursor) -> CursorLane {
     match cursor {
+        Cursor::CodeLanguage { block, .. } => CursorLane::CodeLanguage { block },
         Cursor::Text { block, .. } => CursorLane::Text { block },
         Cursor::ListItem { block, item, .. } => CursorLane::ListItem { block, item },
         Cursor::TableCell {
@@ -6441,7 +6967,8 @@ fn cursor_position(
     let lane = cursor_lane(*cursor);
     let segments = index.lanes.get(&lane)?;
     match *cursor {
-        Cursor::Text { offset, .. }
+        Cursor::CodeLanguage { offset, .. }
+        | Cursor::Text { offset, .. }
         | Cursor::ListItem { offset, .. }
         | Cursor::TableCell { offset, .. } => {
             let mut matches = segments
@@ -6481,9 +7008,27 @@ fn visual_cursor_position(state: &TuiState, index: &DisplayNavIndex) -> Option<(
             .find(|(_, candidate)| **candidate == insert_index)
             .map(|(row, _)| (0, *row))
             .or_else(|| state.cursor_row_hint.map(|row| (0, row)))
+    } else if cursor_is_in_inactive_kitty_heading(state) {
+        None
     } else {
         cursor_position(&state.app.editor.cursor, index, state.cursor_row_hint)
     }
+}
+
+fn cursor_is_in_inactive_kitty_heading(state: &TuiState) -> bool {
+    if !state.kitty_graphics {
+        return false;
+    }
+    let Cursor::Text { block, .. } = state.app.editor.cursor else {
+        return false;
+    };
+    if !matches!(
+        state.app.editor.document.blocks.get(block),
+        Some(DocBlock::Heading { level: 1 | 2, .. })
+    ) {
+        return false;
+    }
+    active_editable_target(state) != Some(EditableTarget::Block(block))
 }
 
 fn clear_spacer_cursor(state: &mut TuiState) {
@@ -6511,15 +7056,31 @@ enum DocumentTarget {
 fn document_target_at(state: &TuiState, x: u16, y: u16) -> Option<DocumentTarget> {
     let rendered = state.last_rendered.as_ref()?;
     let nav_index = state.last_nav_index.as_ref()?;
-    hit_test_or_nearest(x, y, &rendered.display)
-        .map(DocumentTarget::Cursor)
-        .or_else(|| {
-            nav_index
-                .spacer_rows
-                .get(&y)
-                .copied()
-                .map(DocumentTarget::Spacer)
-        })
+    let direct = hit_test(x, y, &rendered.display);
+    let nearest = if direct.is_none() && row_has_table_cells(y, &rendered.display, nav_index) {
+        None
+    } else {
+        hit_test_or_nearest(x, y, &rendered.display)
+    };
+    nearest.map(DocumentTarget::Cursor).or_else(|| {
+        nav_index
+            .spacer_rows
+            .get(&y)
+            .copied()
+            .map(DocumentTarget::Spacer)
+    })
+}
+
+fn row_has_table_cells(
+    y: u16,
+    display: &mdtui_render::DisplayList,
+    index: &DisplayNavIndex,
+) -> bool {
+    index.rows.get(&y).is_some_and(|items| {
+        items
+            .iter()
+            .any(|&item_index| matches!(display.items[item_index].kind, DisplayKind::TableGrid))
+    })
 }
 
 fn select_document_target(state: &mut TuiState, target: DocumentTarget) {
@@ -6546,6 +7107,18 @@ fn whole_target_selection(
     cursor: Cursor,
 ) -> Option<(Cursor, Cursor)> {
     match cursor {
+        Cursor::CodeLanguage { block, .. } => {
+            let len = match document.blocks.get(block)? {
+                DocBlock::CodeBlock { language, .. } => {
+                    language.as_deref().unwrap_or_default().chars().count()
+                }
+                _ => return None,
+            };
+            Some((
+                Cursor::CodeLanguage { block, offset: 0 },
+                Cursor::CodeLanguage { block, offset: len },
+            ))
+        }
         Cursor::Text { block, .. } => {
             let len = document.blocks.get(block).map(|doc_block| {
                 editable_block_fallback(doc_block).map_or_else(
@@ -6673,6 +7246,10 @@ fn nearest_cursor_on_row(
 
 fn map_cursor_within_item(cursor: Cursor, x: u16, start: u16, width: u16) -> Cursor {
     match cursor {
+        Cursor::CodeLanguage { block, offset } => Cursor::CodeLanguage {
+            block,
+            offset: offset + usize::from(x.saturating_sub(start).min(width)),
+        },
         Cursor::Text { block, offset } => Cursor::Text {
             block,
             offset: offset + usize::from(x.saturating_sub(start).min(width)),
@@ -6744,10 +7321,11 @@ fn visible_headline_commands(
         if item.kind != DisplayKind::HeadlinePlacement {
             continue;
         }
-        if item
-            .cursor
-            .is_some_and(|cursor| cursor_block(cursor) == cursor_block(state.app.editor.cursor))
-        {
+        let Some(cursor) = item.cursor else {
+            continue;
+        };
+        let block = cursor_block(cursor);
+        if active_editable_target(state) == Some(EditableTarget::Block(block)) {
             continue;
         }
         let rows = item.rect.height.max(2);
@@ -6828,20 +7406,21 @@ fn headline_png(text: &str, level: u8, cols: u16, rows: u16) -> io::Result<Vec<u
     let cell_h = 48u32;
     let width = u32::from(cols.max(8)) * cell_w;
     let height = u32::from(rows).max(2) * cell_h;
-    let mut img = RgbaImage::from_pixel(width, height, Rgba([15, 12, 8, 255]));
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+    let text = single_line_headline_text(text);
     if HEADLINE_DEBUG_SLAB {
         draw_headline_debug_slab(&mut img, cols, rows);
-    } else if draw_headline_font(&mut img, text, level).is_err() {
-        let fg = Rgba([230, 168, 90, 255]);
-        let glow = Rgba([216, 154, 74, 110]);
-        let shadow = Rgba([42, 24, 15, 180]);
+    } else if draw_headline_font(&mut img, &text, level, cell_h).is_err() {
+        let fg = Rgba([234, 216, 189, 255]);
+        let accent = Rgba([241, 185, 109, 255]);
+        let shadow = Rgba([0, 0, 0, 120]);
         let scale = 2u32;
         let mut pen_x = 8u32;
         let baseline_y = 3u32;
         for ch in text.chars() {
             if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
-                draw_glyph(&mut img, glyph, pen_x + 1, baseline_y + 1, scale, shadow);
-                draw_glyph(&mut img, glyph, pen_x, baseline_y, scale, glow);
+                draw_glyph(&mut img, glyph, pen_x + 2, baseline_y + 5, scale, shadow);
+                draw_glyph(&mut img, glyph, pen_x, baseline_y, scale, accent);
                 draw_glyph(&mut img, glyph, pen_x, baseline_y, scale, fg);
             }
             pen_x = pen_x.saturating_add(8 * scale + 2);
@@ -6864,34 +7443,56 @@ fn headline_png(text: &str, level: u8, cols: u16, rows: u16) -> io::Result<Vec<u
     Ok(bytes)
 }
 
-fn draw_headline_font(image: &mut RgbaImage, text: &str, level: u8) -> io::Result<()> {
+fn draw_headline_font(
+    image: &mut RgbaImage,
+    text: &str,
+    level: u8,
+    cell_height: u32,
+) -> io::Result<()> {
     if text.is_empty() {
         return Err(io::Error::other("empty headline"));
     }
     let font = load_headline_font()?;
-    let (layout, bounds) = fit_headline_layout(&font, text, level, image.width(), image.height())?;
-    let offset_x = (-bounds.min_x).round() as i32;
-    let optical_bias = match level {
-        1 => (image.height() as f32 * 0.14).round() as i32,
-        2 => (image.height() as f32 * 0.10).round() as i32,
-        _ => (image.height() as f32 * 0.10).round() as i32,
+    let headline_height = match level {
+        1 => cell_height as f32 * 1.5,
+        2 => cell_height as f32 * 1.25,
+        _ => cell_height as f32 * 1.25,
     };
-    let offset_y = ((image.height() as f32 - bounds.height()) / 2.0 - bounds.min_y).round() as i32
-        + optical_bias;
-    let shadow = Rgba([44, 28, 12, 96]);
-    let top = Rgba([255, 220, 160, 255]);
-    let bottom = Rgba([217, 138, 82, 255]);
+    let (layout, bounds) =
+        fit_headline_layout(&font, text, image.width(), image.height(), headline_height)?;
+    let blur_radius = ((cell_height as f32 * 0.085).round() as usize).max(3);
+    let shadow_drop = ((cell_height as f32 * 0.11).round() as i32).max(4);
+    let shadow_room = shadow_drop + (blur_radius as i32 * 2);
+    let offset_x = (6.0 - bounds.min_x).round() as i32;
+    let top_pad = ((image.height() as f32 - bounds.height() - shadow_room as f32) / 2.0)
+        .max(0.0)
+        .round() as i32;
+    let offset_y = top_pad - bounds.min_y.round() as i32;
+    let top = Rgba([234, 216, 189, 255]);
+    let bottom = Rgba([241, 185, 109, 255]);
+    let mut shadow_mask = vec![0u16; image.width() as usize * image.height() as usize];
     for glyph in layout.glyphs() {
         let (metrics, bitmap) = font.rasterize_config(glyph.key);
-        paint_alpha_bitmap(
-            image,
+        add_alpha_bitmap_to_mask(
+            &mut shadow_mask,
+            image.width() as usize,
+            image.height() as usize,
             glyph.x as i32 + offset_x + 1,
-            glyph.y as i32 + offset_y + 1,
+            glyph.y as i32 + offset_y + shadow_drop,
             metrics.width,
             metrics.height,
             &bitmap,
-            shadow,
         );
+    }
+    let shadow_mask = box_blur_alpha(
+        &shadow_mask,
+        image.width() as usize,
+        image.height() as usize,
+        blur_radius,
+    );
+    composite_alpha_mask(image, &shadow_mask, Rgba([0, 0, 0, 150]));
+    for glyph in layout.glyphs() {
+        let (metrics, bitmap) = font.rasterize_config(glyph.key);
         paint_alpha_bitmap_gradient(
             image,
             glyph.x as i32 + offset_x,
@@ -6925,34 +7526,26 @@ impl HeadlineBounds {
 fn fit_headline_layout(
     font: &Font,
     text: &str,
-    level: u8,
     image_width: u32,
     image_height: u32,
+    target_height: f32,
 ) -> io::Result<(FontLayout, HeadlineBounds)> {
-    let target_height = match level {
-        1 => image_height.saturating_sub(4) as f32,
-        2 => (image_height as f32 * 0.75).round(),
-        _ => (image_height as f32 * 0.75).round(),
-    };
-    let mut size = match level {
-        1 => image_height as f32 * 1.15,
-        2 => image_height as f32 * 0.92,
-        _ => image_height as f32 * 0.92,
-    };
+    let target_width = image_width.saturating_sub(12) as f32;
+    let mut size = target_height * 1.28;
     let mut best: Option<(FontLayout, HeadlineBounds)> = None;
-    for _ in 0..18 {
+    for _ in 0..28 {
         let mut layout = FontLayout::new(CoordinateSystem::PositiveYDown);
         layout.reset(&LayoutSettings {
             x: 0.0,
             y: 0.0,
-            max_width: Some(image_width as f32),
+            max_width: None,
             max_height: Some(image_height as f32),
             ..LayoutSettings::default()
         });
         layout.append(&[font], &TextStyle::new(text, size, 0));
         let bounds = headline_bounds(font, &layout)?;
         let fits_height = bounds.height() <= target_height;
-        let fits_width = bounds.width() <= image_width as f32;
+        let fits_width = bounds.width() <= target_width;
         best = Some((layout, bounds));
         if fits_height && fits_width {
             break;
@@ -6960,6 +7553,10 @@ fn fit_headline_layout(
         size *= 0.92;
     }
     best.ok_or_else(|| io::Error::other("unable to fit headline layout"))
+}
+
+fn single_line_headline_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn headline_bounds(font: &Font, layout: &FontLayout) -> io::Result<HeadlineBounds> {
@@ -7019,28 +7616,79 @@ fn load_headline_font() -> io::Result<Font> {
     .map_err(io::Error::other)
 }
 
-fn paint_alpha_bitmap(
-    image: &mut RgbaImage,
+fn add_alpha_bitmap_to_mask(
+    mask: &mut [u16],
+    image_width: usize,
+    image_height: usize,
     x: i32,
     y: i32,
     width: usize,
     height: usize,
     bitmap: &[u8],
-    color: Rgba<u8>,
 ) {
     for row in 0..height {
         for col in 0..width {
             let px = x + col as i32;
             let py = y + row as i32;
-            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
+            if px < 0 || py < 0 || px >= image_width as i32 || py >= image_height as i32 {
                 continue;
             }
-            let coverage = bitmap[row * width + col];
+            let coverage = u16::from(bitmap[row * width + col]);
             if coverage == 0 {
                 continue;
             }
-            let alpha = (u16::from(coverage) * u16::from(color[3]) / 255) as u8;
-            let dst = image.get_pixel_mut(px as u32, py as u32);
+            let index = py as usize * image_width + px as usize;
+            mask[index] = mask[index].saturating_add(coverage).min(255);
+        }
+    }
+}
+
+fn box_blur_alpha(mask: &[u16], width: usize, height: usize, radius: usize) -> Vec<u16> {
+    if radius == 0 || width == 0 || height == 0 {
+        return mask.to_vec();
+    }
+    let mut horizontal = vec![0u16; mask.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let start = x.saturating_sub(radius);
+            let end = (x + radius).min(width.saturating_sub(1));
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for sample_x in start..=end {
+                sum += u32::from(mask[y * width + sample_x]);
+                count += 1;
+            }
+            horizontal[y * width + x] = (sum / count.max(1)) as u16;
+        }
+    }
+    let mut vertical = vec![0u16; mask.len()];
+    for y in 0..height {
+        let start_y = y.saturating_sub(radius);
+        let end_y = (y + radius).min(height.saturating_sub(1));
+        for x in 0..width {
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for sample_y in start_y..=end_y {
+                sum += u32::from(horizontal[sample_y * width + x]);
+                count += 1;
+            }
+            vertical[y * width + x] = (sum / count.max(1)) as u16;
+        }
+    }
+    vertical
+}
+
+fn composite_alpha_mask(image: &mut RgbaImage, mask: &[u16], color: Rgba<u8>) {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    for y in 0..height {
+        for x in 0..width {
+            let coverage = mask[y * width + x].min(255);
+            if coverage == 0 {
+                continue;
+            }
+            let alpha = (coverage * u16::from(color[3]) / 255) as u8;
+            let dst = image.get_pixel_mut(x as u32, y as u32);
             let inv = 255u16.saturating_sub(u16::from(alpha));
             dst[0] =
                 ((u16::from(color[0]) * u16::from(alpha) + u16::from(dst[0]) * inv) / 255) as u8;
@@ -7185,6 +7833,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 fn cursor_block(cursor: Cursor) -> usize {
     match cursor {
+        Cursor::CodeLanguage { block, .. } => block,
         Cursor::Text { block, .. } => block,
         Cursor::ListItem { block, .. } => block,
         Cursor::TableCell { block, .. } => block,
@@ -7736,6 +8385,34 @@ fn mix_hex(foreground: &str, background: &str, percent_background: u16) -> Strin
     mixed
 }
 
+fn text_color_hex(theme: &Theme, color: TextColor) -> &'static str {
+    match color {
+        TextColor::Accent => theme.accent_highlight,
+        TextColor::Red => theme.error,
+        TextColor::Yellow => theme.warning,
+        TextColor::Green => theme.success,
+        TextColor::Teal => "#7cb7a8",
+        TextColor::Blue => theme.link,
+        TextColor::Purple => "#c08bc0",
+        TextColor::Pink => "#d88aa0",
+    }
+}
+
+fn parse_text_color_open_tag(tag: &str) -> Option<TextColor> {
+    let value = tag.strip_prefix("<span color=\"")?.strip_suffix("\">")?;
+    match value.to_ascii_lowercase().as_str() {
+        "accent" => Some(TextColor::Accent),
+        "red" => Some(TextColor::Red),
+        "yellow" => Some(TextColor::Yellow),
+        "green" => Some(TextColor::Green),
+        "teal" => Some(TextColor::Teal),
+        "blue" => Some(TextColor::Blue),
+        "purple" => Some(TextColor::Purple),
+        "pink" => Some(TextColor::Pink),
+        _ => None,
+    }
+}
+
 fn code_border(theme: &Theme) -> Style {
     Style::default()
         .fg(rgb(theme.border))
@@ -7841,7 +8518,7 @@ mod tests {
 
         assert_eq!(
             state.app.editor.cursor,
-            Cursor::Text {
+            Cursor::CodeLanguage {
                 block: 1,
                 offset: 0
             }
@@ -7901,6 +8578,7 @@ mod tests {
         state.last_render_key = Some(RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
+            collapsed_headings: Vec::new(),
             active_fallback_block: None,
         });
 
@@ -8448,6 +9126,7 @@ mod tests {
         let first = RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
+            collapsed_headings: Vec::new(),
             active_fallback_block: active_editable_target(&state),
         };
         state.app.editor.set_cursor(Cursor::Text {
@@ -8457,6 +9136,7 @@ mod tests {
         let second = RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
+            collapsed_headings: Vec::new(),
             active_fallback_block: active_editable_target(&state),
         };
 
@@ -8479,6 +9159,7 @@ mod tests {
         state.last_render_key = Some(RenderCacheKey {
             version: 1,
             options: state.app.render_options.clone(),
+            collapsed_headings: Vec::new(),
             active_fallback_block: None,
         });
         state.last_rendered = Some(Arc::new(render_document(
@@ -8607,7 +9288,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_headlines_draw_debug_placeholder_rows() {
+    fn kitty_headlines_leave_terminal_rows_blank_for_graphics() {
         let mut state = TuiState::new(App::from_markdown("x.md", "# Title\n\nbody"), None);
         state.kitty_graphics = true;
         state.app.editor.set_cursor(Cursor::Text {
@@ -8642,8 +9323,18 @@ mod tests {
                 .cell((document_content_left(area), document_content_top(area)))
                 .expect("headline slot")
                 .symbol(),
-            "*"
+            " "
         );
+    }
+
+    #[test]
+    fn headline_png_is_cached_graphic_payload_not_debug_text() {
+        assert!(!HEADLINE_DEBUG_SLAB);
+
+        let png = headline_png("Ascenders Descenders gy", 1, 32, 2).expect("headline png");
+
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(png.len() > 1024);
     }
 
     #[test]
@@ -9286,6 +9977,7 @@ mod tests {
         state.last_render_key = Some(RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
+            collapsed_headings: Vec::new(),
             active_fallback_block: None,
         });
 
@@ -9354,6 +10046,49 @@ mod tests {
                 offset: "hello world".chars().count()
             }
         );
+    }
+
+    #[test]
+    fn clicking_table_border_does_not_target_a_cell() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "| A |\n| - |\n| B |"), None);
+        state.app.render_options = RenderOptions {
+            width: 30,
+            heading_width: 30,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let rendered = Arc::new(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        let cell = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| {
+                item.cursor
+                    == Some(Cursor::TableCell {
+                        block: 0,
+                        row: 0,
+                        col: 0,
+                        offset: 0,
+                    })
+            })
+            .expect("table cell");
+        state.last_rendered = Some(rendered.clone());
+        state.last_nav_index = Some(display_nav_index(&mut state, &rendered));
+
+        assert!(document_target_at(&state, cell.rect.x.saturating_sub(2), cell.rect.y).is_none());
+        assert!(matches!(
+            document_target_at(&state, cell.rect.x, cell.rect.y),
+            Some(DocumentTarget::Cursor(Cursor::TableCell {
+                block: 0,
+                row: 0,
+                col: 0,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -9427,6 +10162,41 @@ mod tests {
 
         assert!(!state.app.editor.show_style_popover);
         assert!(state.style_popup_not_before.is_none());
+    }
+
+    #[test]
+    fn paste_event_inserts_plain_text() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        process_event(&mut state, Event::Paste(" world".to_string()));
+
+        assert_eq!(
+            state.app.editor.document.blocks[0].rendered_text(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn link_popup_prefills_current_link_target() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "[hello](https://old.example) world"),
+            None,
+        );
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 2,
+        });
+
+        open_link_popup(&mut state);
+
+        assert!(matches!(
+            state.link_popup,
+            Some(LinkPopup::Edit { ref input }) if input == "https://old.example"
+        ));
     }
 
     #[test]
@@ -10126,6 +10896,7 @@ mod tests {
     fn style_popup_active_chip_uses_inverted_colors() {
         let mut state = TuiState::new(App::from_markdown("x.md", "alpha"), None);
         state.app.editor.select_all();
+        state.style_popup_show_selection = true;
         let theme = Theme::dark_amber();
         let area = Rect {
             x: 0,
@@ -10177,6 +10948,101 @@ mod tests {
             .expect("active bold cell");
         assert_eq!(cell.fg, rgb(theme.panel_bg));
         assert_eq!(cell.bg, rgb(theme.accent_highlight));
+    }
+
+    #[test]
+    fn style_popup_starts_without_default_hover_highlight() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha"), None);
+        state.app.editor.select_all();
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 12,
+        };
+        let doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 40,
+            height: 8,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw_style_popover(
+                    frame,
+                    area,
+                    doc_area,
+                    0,
+                    &[mdtui_render::Rect {
+                        x: 0,
+                        y: 2,
+                        width: 5,
+                        height: 1,
+                    }],
+                    &mut state,
+                    &theme,
+                );
+            })
+            .expect("draw style popup");
+        let popup = anchored_style_popup(
+            area,
+            doc_area,
+            0,
+            &[mdtui_render::Rect {
+                x: 0,
+                y: 2,
+                width: 5,
+                height: 1,
+            }],
+            style_popup_width(&style_popup_items()),
+            style_popup_items().len() as u16 + 2,
+        );
+        let buffer = terminal.backend().buffer();
+        let cell = buffer
+            .cell((popup.x + 2, popup.y + 1))
+            .expect("idle bold cell");
+        assert_eq!(cell.fg, rgb(theme.text_primary));
+        assert_eq!(cell.bg, rgb(theme.panel_bg));
+    }
+
+    #[test]
+    fn collapsed_heading_hides_nested_section_blocks() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "# A\n\nbody\n\n## B\n\nchild\n\n# C\n\nafter"),
+            None,
+        );
+
+        toggle_heading_collapse(&mut state, 0);
+        let rendered = current_base_render(&mut state);
+
+        assert!(rendered.lines.iter().any(|line| line.contains("A")));
+        assert!(rendered.lines.iter().any(|line| line.contains("C")));
+        assert!(rendered.lines.iter().any(|line| line.contains("after")));
+        assert!(!rendered.lines.iter().any(|line| line.contains("body")));
+        assert!(!rendered.lines.iter().any(|line| line.contains("child")));
+    }
+
+    #[test]
+    fn wrapped_numbered_list_lines_keep_numbered_text_color() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "1. alpha beta gamma delta"),
+            None,
+        );
+        state.app.render_options.width = 10;
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let lines = build_styled_document_lines(&state, &rendered, &theme);
+
+        assert!(lines.len() > 1);
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|span| span.style.fg == Some(rgb(theme.accent_highlight)))
+        );
     }
 
     #[test]

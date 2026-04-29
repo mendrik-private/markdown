@@ -1,4 +1,4 @@
-use mdtui_core::{Block, Cursor, Direction, Editor, InlineMark};
+use mdtui_core::{Block, Cursor, Direction, Editor, InlineMark, TextColor};
 use mdtui_markdown::{export_gfm, import_gfm};
 use mdtui_render::{RenderOptions, Rendered, hit_test_or_nearest, render_editor};
 
@@ -94,6 +94,10 @@ impl App {
 
     pub fn apply_link(&mut self, target: impl Into<String>) {
         self.editor.apply_link(target);
+    }
+
+    pub fn apply_text_color(&mut self, color: TextColor) {
+        self.editor.apply_text_color(color);
     }
 
     pub fn apply_code_block(&mut self) {

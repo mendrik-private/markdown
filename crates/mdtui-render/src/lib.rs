@@ -213,6 +213,10 @@ pub fn hit_test(x: u16, y: u16, display: &DisplayList) -> Option<Cursor> {
                     block,
                     offset: offset + usize::from(x.saturating_sub(item.rect.x)),
                 },
+                Cursor::CodeLanguage { block, offset } => Cursor::CodeLanguage {
+                    block,
+                    offset: offset + usize::from(x.saturating_sub(item.rect.x)),
+                },
                 Cursor::ListItem {
                     block,
                     item: list_item,
@@ -260,6 +264,10 @@ fn nearest_cursor_on_row(x: u16, y: u16, display: &DisplayList) -> Option<Cursor
         };
         let mapped = match cursor {
             Cursor::Text { block, offset } => Cursor::Text {
+                block,
+                offset: offset + usize::from(x.saturating_sub(start).min(item.rect.width)),
+            },
+            Cursor::CodeLanguage { block, offset } => Cursor::CodeLanguage {
                 block,
                 offset: offset + usize::from(x.saturating_sub(start).min(item.rect.width)),
             },
@@ -781,6 +789,21 @@ impl RenderContext {
             action: Some(DisplayAction::CopyCodeBlock { block: block_index }),
             text: copy_label.to_string(),
         });
+        self.display.items.push(DisplayItem {
+            kind: DisplayKind::TextRun,
+            rect: Rect {
+                x: 1,
+                y: y + 1,
+                width: label.trim_start().chars().count() as u16,
+                height: 1,
+            },
+            cursor: Some(Cursor::CodeLanguage {
+                block: block_index,
+                offset: 0,
+            }),
+            action: None,
+            text: label.trim_start().to_string(),
+        });
         self.lines.push(top);
         self.lines.push(toolbar);
         self.lines.push(separator);
@@ -862,7 +885,7 @@ impl RenderContext {
                 self.display.items.push(DisplayItem {
                     kind: DisplayKind::TableGrid,
                     rect: Rect {
-                        x,
+                        x: x.saturating_add(1),
                         y,
                         width: width as u16,
                         height: 1,
