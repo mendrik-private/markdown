@@ -501,6 +501,7 @@ impl Editor {
             self.record_undo();
             let change = self.set_active_text(String::new());
             self.apply_active_text_change(change, 0);
+            self.document.version += 1;
             return;
         }
 
@@ -511,13 +512,14 @@ impl Editor {
                 offset: 0,
             } => self.backspace_list_boundary(block, item),
             Cursor::TableCell { offset: 0, .. } => self.move_table_prev_cell(),
-            _ if self.cursor_offset() > 0 => {
+            _ if self.clamped_cursor_offset() > 0 => {
                 self.record_undo();
                 let old = self.active_text();
-                let offset = self.cursor_offset();
+                let offset = self.clamped_cursor_offset();
                 let new = delete_range_chars(&old, offset.saturating_sub(1), offset);
                 let change = self.set_active_text(new);
                 self.apply_active_text_change(change, offset.saturating_sub(1));
+                self.document.version += 1;
             }
             _ => {}
         }
@@ -532,15 +534,17 @@ impl Editor {
             self.record_undo();
             let change = self.set_active_text(String::new());
             self.apply_active_text_change(change, 0);
+            self.document.version += 1;
             return;
         }
-        let offset = self.cursor_offset();
+        let offset = self.clamped_cursor_offset();
         let old = self.active_text();
         if offset < char_len(&old) {
             self.record_undo();
             let new = delete_range_chars(&old, offset, offset + 1);
             let change = self.set_active_text(new);
             self.apply_active_text_change(change, offset);
+            self.document.version += 1;
         }
     }
 
@@ -1101,7 +1105,7 @@ impl Editor {
             (self.set_active_text(text.to_string()), char_len(text))
         } else {
             let old = self.active_text();
-            let offset = self.cursor_offset();
+            let offset = self.clamped_cursor_offset();
             let new = insert_chars(&old, offset, text);
             (
                 self.set_active_text(new),
@@ -1144,6 +1148,10 @@ impl Editor {
 
     fn active_text_len(&self) -> usize {
         char_len(&self.active_text())
+    }
+
+    fn clamped_cursor_offset(&self) -> usize {
+        self.cursor_offset().min(self.active_text_len())
     }
 
     fn normalize_checkbox_cursor(&mut self) {
@@ -2228,9 +2236,11 @@ mod tests {
         });
 
         assert_eq!(editor.active_text(), "-");
+        let version = editor.document.version;
 
         editor.delete();
 
+        assert!(editor.document.version > version);
         assert_eq!(
             editor.document.blocks,
             vec![
@@ -2243,6 +2253,94 @@ mod tests {
             Cursor::Text {
                 block: 1,
                 offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn backspace_on_editable_fallback_bumps_document_version() {
+        let mut editor = Editor::new(Document::new(vec![Block::ThematicBreak]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let version = editor.document.version;
+
+        editor.backspace();
+
+        assert!(editor.document.version > version);
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text(String::new())])]
+        );
+    }
+
+    #[test]
+    fn backspace_clamps_oversized_cursor_offsets_before_deleting() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello".to_string())]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 99,
+        });
+
+        editor.backspace();
+
+        assert_eq!(editor.document.blocks[0].rendered_text(), "hell");
+        assert_eq!(
+            editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: 4
+            }
+        );
+    }
+
+    #[test]
+    fn backspace_on_text_bumps_document_version() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello".to_string())]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+        let version = editor.document.version;
+
+        editor.backspace();
+
+        assert!(editor.document.version > version);
+        assert_eq!(editor.document.blocks[0].rendered_text(), "hell");
+    }
+
+    #[test]
+    fn delete_on_text_bumps_document_version() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello".to_string())]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let version = editor.document.version;
+
+        editor.delete();
+
+        assert!(editor.document.version > version);
+        assert_eq!(editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn typing_clamps_oversized_cursor_offsets_after_appending() {
+        let mut editor = paragraph_editor(vec![Inline::Text("hello".to_string())]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 99,
+        });
+
+        editor.press_char('!');
+
+        assert_eq!(editor.document.blocks[0].rendered_text(), "hello!");
+        assert_eq!(
+            editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: 6
             }
         );
     }

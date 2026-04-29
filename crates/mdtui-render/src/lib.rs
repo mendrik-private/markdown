@@ -1,4 +1,7 @@
-use std::sync::OnceLock;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use hyphenation::{Hyphenator, Language, Load, Standard};
 use mdtui_core::{
@@ -422,7 +425,8 @@ impl RenderContext {
             self.render_text_columns(block_index, &wrapped, column_width, column_height);
             return;
         }
-        let wrapped = wrap_text_block(&text, self.options.width.max(1), self.options.hyphenate);
+        let wrapped =
+            wrap_text_block_cached(&text, self.options.width.max(1), self.options.hyphenate);
         self.render_wrapped_text_block(block_index, &wrapped);
     }
 
@@ -979,11 +983,7 @@ fn toc_entries_for_list(list: &List, headings: &[HeadingTarget]) -> Option<Vec<T
             Some(TocEntry {
                 item: item_index,
                 block: heading.block,
-                title: if heading.title.is_empty() {
-                    strip_toc_numbering(&inline_text(children))
-                } else {
-                    strip_toc_numbering(&heading.title)
-                },
+                title: strip_toc_numbering(&inline_text(children)),
             })
         })
         .collect()
@@ -1169,6 +1169,37 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct WrapCacheKey {
+    text: String,
+    width: u16,
+    hyphenate: bool,
+}
+
+fn wrap_text_block_cached(text: &str, width: u16, hyphenate: bool) -> Arc<Vec<WrappedTextLine>> {
+    const MAX_WRAP_CACHE_ENTRIES: usize = 512;
+    static CACHE: OnceLock<Mutex<HashMap<WrapCacheKey, Arc<Vec<WrappedTextLine>>>>> =
+        OnceLock::new();
+
+    let key = WrapCacheKey {
+        text: text.to_string(),
+        width: width.max(1),
+        hyphenate,
+    };
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(wrapped) = cache.lock().expect("wrap cache lock").get(&key).cloned() {
+        return wrapped;
+    }
+
+    let wrapped = Arc::new(wrap_text_block(text, width, hyphenate));
+    let mut cache = cache.lock().expect("wrap cache lock");
+    if cache.len() >= MAX_WRAP_CACHE_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, wrapped.clone());
+    wrapped
+}
+
 fn wrap_text_block(text: &str, width: u16, hyphenate: bool) -> Vec<WrappedTextLine> {
     let width = usize::from(width.max(1));
     if text.is_empty() {
@@ -1290,7 +1321,7 @@ fn text_columns(
     width: u16,
     columns: usize,
     hyphenate: bool,
-) -> Option<(Vec<WrappedTextLine>, usize, usize)> {
+) -> Option<(Arc<Vec<WrappedTextLine>>, usize, usize)> {
     if columns <= 1 {
         return None;
     }
@@ -1301,7 +1332,7 @@ fn text_columns(
     if column_width < 16 {
         return None;
     }
-    let wrapped = wrap_text_block(text, column_width as u16, hyphenate);
+    let wrapped = wrap_text_block_cached(text, column_width as u16, hyphenate);
     if !column_layout_is_balanced(wrapped.len(), columns) {
         return None;
     }
@@ -1376,7 +1407,21 @@ fn hyphenated_prefix(
 }
 
 fn detected_hyphenator(text: &str) -> Option<&'static Standard> {
-    detect(text)
+    if text.is_ascii() {
+        return english_us_hyphenator();
+    }
+    let sample = if text.len() > 2048 {
+        let boundary = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= 2048)
+            .last()
+            .unwrap_or(0);
+        &text[..boundary]
+    } else {
+        text
+    };
+    detect(sample)
         .filter(|info| info.is_reliable())
         .and_then(|info| hyphenator_for_lang(info.lang()))
 }

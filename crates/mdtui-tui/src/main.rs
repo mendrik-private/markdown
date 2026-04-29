@@ -195,7 +195,7 @@ struct RenderCacheKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OutlineCacheKey {
-    version: u64,
+    signature: String,
     width: u16,
 }
 
@@ -211,6 +211,12 @@ struct ExplorerCacheKey {
 enum EditableTarget {
     Block(usize),
     ListItem { block: usize, item: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKeyKind {
+    Backspace,
+    Delete,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -355,6 +361,7 @@ struct PanelScrollDrag {
 struct RenderLineContext<'a> {
     state: &'a TuiState,
     rendered: &'a Rendered,
+    row_items: &'a HashMap<usize, Vec<&'a mdtui_render::DisplayItem>>,
     theme: &'a Theme,
 }
 
@@ -422,6 +429,7 @@ struct TuiState {
     dirty: bool,
     message: String,
     pending_edit_target: Option<PendingEditableTarget>,
+    pending_edit_key_release: Option<EditKeyKind>,
     last_tabs_area: Rect,
     last_doc_area: Rect,
     last_explorer_area: Rect,
@@ -457,6 +465,7 @@ struct TuiState {
     tab_hits: Vec<TabHit>,
     tab_control_hits: Vec<TabControlHit>,
     hidden_tabs: HashSet<String>,
+    tab_app_cache: HashMap<PathBuf, App>,
     file_popup: Option<FilePopup>,
     file_popup_hits: Vec<FilePopupHit>,
     last_file_popup: Option<Rect>,
@@ -499,6 +508,7 @@ impl TuiState {
             dirty: false,
             message: "direct editing · Ctrl-H help · Ctrl-S save · Ctrl-Q quit".to_string(),
             pending_edit_target: None,
+            pending_edit_key_release: None,
             last_tabs_area: Rect::default(),
             last_doc_area: Rect::default(),
             last_explorer_area: Rect::default(),
@@ -534,6 +544,7 @@ impl TuiState {
             tab_hits: Vec::new(),
             tab_control_hits: Vec::new(),
             hidden_tabs: HashSet::new(),
+            tab_app_cache: HashMap::new(),
             file_popup: None,
             file_popup_hits: Vec::new(),
             last_file_popup: None,
@@ -640,7 +651,7 @@ fn drain_headline_raster_results(state: &mut TuiState) -> bool {
 
 fn process_event(state: &mut TuiState, event: Event) -> bool {
     match event {
-        Event::Key(key) if should_handle_key(key) => handle_key(state, key),
+        Event::Key(key) if should_handle_key(state, key) => handle_key(state, key),
         Event::Mouse(mouse) => {
             handle_mouse(state, mouse);
             false
@@ -650,17 +661,30 @@ fn process_event(state: &mut TuiState, event: Event) -> bool {
     }
 }
 
-fn should_handle_key(key: KeyEvent) -> bool {
-    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+fn should_handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
+    match key.kind {
+        KeyEventKind::Press | KeyEventKind::Repeat => {
+            state.pending_edit_key_release = edit_key_kind_for_release_fallback(state, key);
+            true
+        }
+        KeyEventKind::Release => {
+            let Some(kind) = edit_key_kind_for_release_fallback(state, key) else {
+                return false;
+            };
+            if state.pending_edit_key_release == Some(kind) {
+                state.pending_edit_key_release = None;
+                return false;
+            }
+            true
+        }
+    }
 }
 
 fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if state.show_help {
         match key.code {
             KeyCode::Esc => state.show_help = false,
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.show_help = false
-            }
+            _ if is_ctrl_h_key(key) => state.show_help = false,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}
         }
@@ -680,7 +704,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Char('d') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
                 open_delete_file_popup(state)
             }
-            KeyCode::Backspace | KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
+            _ if is_backspace_key(key) || is_ctrl_h_key(key) => {
                 if let Some(FilePopup::NewFile { input } | FilePopup::RenameFile { input, .. }) =
                     state.file_popup.as_mut()
                 {
@@ -711,7 +735,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => state.link_popup = None,
             KeyCode::Enter => confirm_link_popup(state),
-            KeyCode::Backspace | KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
+            _ if is_backspace_key(key) || is_ctrl_h_key(key) => {
                 input.pop();
             }
             KeyCode::Char(ch)
@@ -867,9 +891,12 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.message = "column mode 3".to_string();
             persist_view_state(state);
         }
-        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.show_help = true
+        _ if is_ctrl_h_key(key) && editor_backspace_should_consume(state) => {
+            state.app.backspace();
+            state.preferred_column = None;
+            state.dirty = true;
         }
+        _ if is_ctrl_h_key(key) => state.show_help = true,
         KeyCode::Char('d')
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(state.app.editor.cursor, Cursor::TableCell { .. }) =>
@@ -924,7 +951,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.preferred_column = None;
             state.dirty = true;
         }
-        KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
+        _ if is_backspace_key(key) => {
             state.app.backspace();
             state.preferred_column = None;
             state.dirty = true;
@@ -939,12 +966,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.preferred_column = None;
             state.dirty = true;
         }
-        KeyCode::Backspace => {
-            state.app.backspace();
-            state.preferred_column = None;
-            state.dirty = true;
-        }
-        KeyCode::Delete => {
+        _ if is_delete_key(key) => {
             state.app.delete();
             state.preferred_column = None;
             state.dirty = true;
@@ -1019,6 +1041,52 @@ fn is_plain_text_key(key: KeyEvent) -> bool {
 
 fn is_text_input_char(key: KeyEvent, ch: char) -> bool {
     is_plain_text_key(key) && !ch.is_control()
+}
+
+fn is_backspace_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Backspace) || matches!(key.code, KeyCode::Char('\u{8}' | '\u{7f}'))
+}
+
+fn is_ctrl_h_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('h' | 'H') if key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn editor_backspace_should_consume(state: &TuiState) -> bool {
+    has_selection(state)
+        || active_editable_target(state).is_some()
+        || match state.app.editor.cursor {
+            Cursor::Text { offset, .. }
+            | Cursor::ListItem { offset, .. }
+            | Cursor::TableCell { offset, .. } => offset > 0,
+            Cursor::Checkbox { .. } => true,
+        }
+}
+
+fn is_delete_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Delete)
+        || matches!(key.code, KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL))
+        || matches!(key.code, KeyCode::Char('\u{4}'))
+}
+
+fn edit_key_kind_for_release_fallback(state: &TuiState, key: KeyEvent) -> Option<EditKeyKind> {
+    if is_backspace_key(key) || (is_ctrl_h_key(key) && backspace_key_should_consume(state)) {
+        Some(EditKeyKind::Backspace)
+    } else if is_delete_key(key) {
+        Some(EditKeyKind::Delete)
+    } else {
+        None
+    }
+}
+
+fn backspace_key_should_consume(state: &TuiState) -> bool {
+    popup_backspace_should_consume(state) || editor_backspace_should_consume(state)
+}
+
+fn popup_backspace_should_consume(state: &TuiState) -> bool {
+    matches!(
+        state.file_popup,
+        Some(FilePopup::NewFile { .. } | FilePopup::RenameFile { .. })
+    ) || matches!(state.link_popup, Some(LinkPopup::Edit { .. }))
 }
 
 fn spacer_prompt_action_for_key(ch: char) -> Option<SpacerPromptAction> {
@@ -1873,7 +1941,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     let active_block = cursor_block(state.app.editor.cursor);
     let outline_key = OutlineCacheKey {
-        version: state.app.editor.document.version,
+        signature: outline_signature(&state.app.editor.document.blocks),
         width: sidebar_split[1].width.saturating_sub(2),
     };
     let (outline_lines, outline_hits) = if state.last_outline_key.as_ref() == Some(&outline_key) {
@@ -2368,9 +2436,11 @@ fn build_styled_document_lines(
     } else {
         HashSet::new()
     };
+    let row_items = display_items_by_row(rendered);
     let render_context = RenderLineContext {
         state,
         rendered,
+        row_items: &row_items,
         theme,
     };
     rendered
@@ -2411,6 +2481,23 @@ fn build_styled_document_lines(
             }
         })
         .collect::<Vec<_>>()
+}
+
+fn display_items_by_row(rendered: &Rendered) -> HashMap<usize, Vec<&mdtui_render::DisplayItem>> {
+    let mut rows: HashMap<usize, Vec<&mdtui_render::DisplayItem>> = HashMap::new();
+    for item in &rendered.display.items {
+        if item.kind == DisplayKind::HeadlinePlacement
+            || item.kind == DisplayKind::CursorTarget
+            || (item.kind == DisplayKind::Adornment && item.text.trim().is_empty())
+        {
+            continue;
+        }
+        rows.entry(usize::from(item.rect.y)).or_default().push(item);
+    }
+    for items in rows.values_mut() {
+        items.sort_by_key(|item| item.rect.x);
+    }
+    rows
 }
 
 fn draw_document_with_lines(
@@ -4008,53 +4095,77 @@ fn update_wrap_width_from_slider(state: &mut TuiState, track: WrapSliderTrack, l
 }
 
 fn open_file(state: &mut TuiState, path: &Path) {
+    if state.path.as_deref() != Some(path) {
+        cache_current_tab(state);
+    }
+    if let Some(mut app) = state.tab_app_cache.get(path).cloned() {
+        app.render_options = state.app.render_options.clone();
+        state.app = app;
+        state.path = Some(path.to_path_buf());
+        reset_open_file_state(state);
+        state.message = format!("opened {}", file_leaf(&path.display().to_string()));
+        return;
+    }
     match fs::read_to_string(path) {
         Ok(source) => {
             let mut app = App::from_markdown(path.display().to_string(), &source);
             app.render_options = state.app.render_options.clone();
             state.app = app;
             state.path = Some(path.to_path_buf());
-            state
-                .hidden_tabs
-                .remove(&file_leaf(&path.display().to_string()));
-            state.scroll = 0;
-            state.preferred_column = None;
-            state.cursor_row_hint = None;
-            state.spacer_cursor = None;
-            state.last_base_rendered = None;
-            state.last_base_render_key = None;
-            state.last_rendered = None;
-            state.last_render_key = None;
-            state.last_styled_lines = None;
-            state.last_styled_key = None;
-            state.last_outline_lines = None;
-            state.last_outline_hits = None;
-            state.last_outline_key = None;
-            state.last_explorer_lines = None;
-            state.last_explorer_hits = None;
-            state.last_explorer_key = None;
-            state.last_nav_index = None;
-            state.last_nav_key = None;
-            state.file_popup = None;
-            state.file_popup_hits.clear();
-            state.last_file_popup = None;
-            state.link_popup = None;
-            state.last_link_popup = None;
-            state.heading_popup = None;
-            state.heading_popup_hits.clear();
-            state.last_heading_popup = None;
-            state.heading_popup_hover = None;
-            state.table_popup = None;
-            state.table_popup_hits.clear();
-            state.last_table_popup = None;
-            state.last_kitty_signature = None;
-            state.dirty = false;
+            reset_open_file_state(state);
             state.message = format!("opened {}", file_leaf(&path.display().to_string()));
         }
         Err(error) => {
             state.message = format!("open failed: {error}");
         }
     }
+}
+
+fn cache_current_tab(state: &mut TuiState) {
+    let Some(path) = state.path.clone() else {
+        return;
+    };
+    state.tab_app_cache.insert(path, state.app.clone());
+}
+
+fn reset_open_file_state(state: &mut TuiState) {
+    if let Some(path) = &state.path {
+        state
+            .hidden_tabs
+            .remove(&file_leaf(&path.display().to_string()));
+    }
+    state.scroll = 0;
+    state.preferred_column = None;
+    state.cursor_row_hint = None;
+    state.spacer_cursor = None;
+    state.last_base_rendered = None;
+    state.last_base_render_key = None;
+    state.last_rendered = None;
+    state.last_render_key = None;
+    state.last_styled_lines = None;
+    state.last_styled_key = None;
+    state.last_outline_lines = None;
+    state.last_outline_hits = None;
+    state.last_outline_key = None;
+    state.last_explorer_lines = None;
+    state.last_explorer_hits = None;
+    state.last_explorer_key = None;
+    state.last_nav_index = None;
+    state.last_nav_key = None;
+    state.file_popup = None;
+    state.file_popup_hits.clear();
+    state.last_file_popup = None;
+    state.link_popup = None;
+    state.last_link_popup = None;
+    state.heading_popup = None;
+    state.heading_popup_hits.clear();
+    state.last_heading_popup = None;
+    state.heading_popup_hover = None;
+    state.table_popup = None;
+    state.table_popup_hits.clear();
+    state.last_table_popup = None;
+    state.last_kitty_signature = None;
+    state.dirty = false;
 }
 
 fn activate_tab(state: &mut TuiState, name: &str) {
@@ -4610,6 +4721,43 @@ fn outline_lines(
     (lines, hits)
 }
 
+fn outline_signature(blocks: &[DocBlock]) -> String {
+    let mut signature = String::new();
+    for (index, block) in blocks.iter().enumerate() {
+        match block {
+            DocBlock::Heading { level, inlines } => {
+                signature.push_str(&format!(
+                    "h:{index}:{level}:{}\n",
+                    mdtui_core::inline_text(inlines)
+                ));
+            }
+            DocBlock::List(list) => {
+                for (item_index, item) in list.items.iter().enumerate() {
+                    let [DocBlock::Paragraph(inlines)] = item.blocks.as_slice() else {
+                        continue;
+                    };
+                    let [
+                        Inline::Link {
+                            target, children, ..
+                        },
+                    ] = inlines.as_slice()
+                    else {
+                        continue;
+                    };
+                    if target.starts_with('#') {
+                        signature.push_str(&format!(
+                            "toc:{index}:{item_index}:{target}:{}\n",
+                            mdtui_core::inline_text(children)
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    signature
+}
+
 fn outline_toc_entries(blocks: &[DocBlock]) -> Option<Vec<(usize, String)>> {
     let headings = blocks
         .iter()
@@ -4642,14 +4790,10 @@ fn outline_toc_entries(blocks: &[DocBlock]) -> Option<Vec<(usize, String)>> {
                     return None;
                 };
                 let slug = target.strip_prefix('#')?;
-                let (_, block, title) = headings
+                let (_, block, _title) = headings
                     .iter()
                     .find(|(heading_slug, _, _)| heading_slug == slug)?;
-                let title = if title.is_empty() {
-                    outline_strip_toc_numbering(&mdtui_core::inline_text(children))
-                } else {
-                    outline_strip_toc_numbering(title)
-                };
+                let title = outline_strip_toc_numbering(&mdtui_core::inline_text(children));
                 Some((
                     *block,
                     if title.is_empty() {
@@ -4848,7 +4992,7 @@ fn style_rendered_line(
         index,
         line,
         context.state,
-        context.rendered,
+        context.row_items.get(&index).map(Vec::as_slice),
         theme,
         background,
         next_line,
@@ -4892,29 +5036,18 @@ struct StyledFragment {
 }
 
 fn styled_text_spans_for_row(
-    index: usize,
+    _index: usize,
     line: &str,
     state: &TuiState,
-    rendered: &Rendered,
+    row_items: Option<&[&mdtui_render::DisplayItem]>,
     theme: &Theme,
     background: Color,
     next_line: Option<&str>,
 ) -> Option<Vec<Span<'static>>> {
-    let mut row_items = rendered
-        .display
-        .items
-        .iter()
-        .filter(|item| {
-            item.rect.y as usize == index
-                && item.kind != DisplayKind::HeadlinePlacement
-                && item.kind != DisplayKind::CursorTarget
-                && !(item.kind == DisplayKind::Adornment && item.text.trim().is_empty())
-        })
-        .collect::<Vec<_>>();
+    let row_items = row_items?;
     if row_items.is_empty() {
         return None;
     }
-    row_items.sort_by_key(|item| item.rect.x);
     let line_chars = line.chars().collect::<Vec<_>>();
     let heading = next_line.is_some_and(is_heading_rule);
     let toc_row = row_items
@@ -8157,7 +8290,7 @@ mod tests {
             state.app.render_options.clone(),
         )));
         state.last_outline_key = Some(OutlineCacheKey {
-            version: 1,
+            signature: "cached".to_string(),
             width: 32,
         });
         state.last_outline_lines = Some(Arc::new(vec![Line::from("cached outline")]));
@@ -8188,6 +8321,37 @@ mod tests {
         assert!(state.last_explorer_lines.is_none());
         assert!(state.last_explorer_hits.is_none());
         assert!(state.last_kitty_signature.is_none());
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn tab_switch_reuses_cached_edited_app() {
+        let root = std::env::temp_dir().join(format!("mdtui-tab-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let first = root.join("first.md");
+        let second = root.join("second.md");
+        fs::write(&first, "first").expect("write first file");
+        fs::write(&second, "second").expect("write second file");
+
+        let mut state = TuiState::new(
+            App::from_markdown(first.to_string_lossy(), "first"),
+            Some(first.clone()),
+        );
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+        state.app.type_char('!');
+
+        open_file(&mut state, &second);
+        open_file(&mut state, &first);
+
+        assert_eq!(
+            state.app.editor.document.blocks[0].rendered_text(),
+            "first!"
+        );
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
         let _ = fs::remove_dir(root);
@@ -8557,6 +8721,33 @@ mod tests {
     }
 
     #[test]
+    fn edited_toc_title_renders_from_link_text_not_heading() {
+        let mut app = App::from_markdown(
+            "x.md",
+            "1. [Project identity](#project-identity)\n\n# Project identity",
+        );
+        app.editor.set_cursor(Cursor::ListItem {
+            block: 0,
+            item: 0,
+            offset: "Project identity".chars().count(),
+        });
+        app.type_char('!');
+
+        let rendered = render_document(
+            &app.editor.document,
+            RenderOptions {
+                width: 36,
+                heading_width: 36,
+                kitty_graphics: false,
+                show_status: false,
+                ..RenderOptions::default()
+            },
+        );
+
+        assert!(rendered.lines[0].contains("Project identity!"));
+    }
+
+    #[test]
     fn toc_titles_use_normal_text_color() {
         let state = TuiState::new(
             App::from_markdown(
@@ -8921,6 +9112,141 @@ mod tests {
     }
 
     #[test]
+    fn backspace_invalidates_cached_rendered_text() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+        let rendered = current_base_render(&mut state);
+        assert!(rendered.text().contains("hello"));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+        );
+        let rendered = current_base_render(&mut state);
+
+        assert!(rendered.text().contains("hell"));
+        assert!(!rendered.text().contains("hello"));
+    }
+
+    #[test]
+    fn modified_del_char_is_treated_as_backspace() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('\u{7f}'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+    }
+
+    #[test]
+    fn ctrl_h_deletes_when_terminal_reports_backspace_that_way() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+        assert!(!state.show_help);
+    }
+
+    fn release_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn release_only_backspace_deletes_when_terminal_reports_no_press_event() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        process_event(
+            &mut state,
+            Event::Key(release_key(KeyCode::Backspace, KeyModifiers::empty())),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+    }
+
+    #[test]
+    fn release_only_ctrl_h_deletes_when_terminal_reports_backspace_that_way() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        process_event(
+            &mut state,
+            Event::Key(release_key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+        assert!(!state.show_help);
+    }
+
+    #[test]
+    fn backspace_press_and_release_deletes_once() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        process_event(
+            &mut state,
+            Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())),
+        );
+        process_event(
+            &mut state,
+            Event::Key(release_key(KeyCode::Backspace, KeyModifiers::empty())),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+    }
+
+    #[test]
+    fn modified_ctrl_h_deletes_when_terminal_adds_modifier_noise() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('H'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+        assert!(!state.show_help);
+    }
+
+    #[test]
     fn delete_key_deletes_forward() {
         let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
         state.app.editor.set_cursor(Cursor::Text {
@@ -8931,6 +9257,113 @@ mod tests {
         handle_key(
             &mut state,
             KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn delete_invalidates_cached_rendered_text() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let rendered = current_base_render(&mut state);
+        assert!(rendered.text().contains("hello"));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()),
+        );
+        let rendered = current_base_render(&mut state);
+
+        assert!(rendered.text().contains("ello"));
+        assert!(!rendered.text().contains("hello"));
+    }
+
+    #[test]
+    fn release_only_delete_deletes_when_terminal_reports_no_press_event() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        process_event(
+            &mut state,
+            Event::Key(release_key(KeyCode::Delete, KeyModifiers::empty())),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn delete_press_and_release_deletes_once() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        process_event(
+            &mut state,
+            Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty())),
+        );
+        process_event(
+            &mut state,
+            Event::Key(release_key(KeyCode::Delete, KeyModifiers::empty())),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn modified_ctrl_d_deletes_when_terminal_adds_modifier_noise() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('D'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn raw_ctrl_d_char_deletes_forward() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('\u{4}'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_forward_when_terminal_reports_delete_that_way() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
         );
 
         assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
