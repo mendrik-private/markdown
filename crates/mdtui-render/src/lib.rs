@@ -8,6 +8,7 @@ use mdtui_core::{
     Block, Cursor, Document, Editor, Inline, List, ListItem, Selection, Table, UiFocus, char_len,
     inline_text, split_chars,
 };
+use unicode_width::UnicodeWidthStr;
 use whatlang::{Lang, detect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,11 +163,55 @@ pub fn render_document(document: &Document, options: RenderOptions) -> Rendered 
             ctx.lines.push(String::new());
         }
     }
-    Rendered {
+    let mut rendered = Rendered {
         lines: ctx.lines,
         display: ctx.display,
         kitty_commands: ctx.kitty_commands,
+    };
+    collapse_empty_line_runs(&mut rendered);
+    rendered
+}
+
+fn collapse_empty_line_runs(rendered: &mut Rendered) {
+    if rendered.lines.len() < 2 {
+        return;
     }
+    let mut row_has_items = vec![false; rendered.lines.len()];
+    for item in &rendered.display.items {
+        if let Some(row) = row_has_items.get_mut(usize::from(item.rect.y)) {
+            *row = true;
+        }
+    }
+    let mut row_map = vec![0u16; rendered.lines.len()];
+    let mut collapsed = Vec::with_capacity(rendered.lines.len());
+    let mut index = 0usize;
+    while index < rendered.lines.len() {
+        if !rendered.lines[index].is_empty() {
+            row_map[index] = collapsed.len() as u16;
+            collapsed.push(rendered.lines[index].clone());
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < rendered.lines.len() && rendered.lines[index].is_empty() {
+            index += 1;
+        }
+        let end = index;
+        let keep = (start..end)
+            .find(|row| row_has_items[*row])
+            .unwrap_or(start);
+        let new_row = collapsed.len() as u16;
+        for mapped in &mut row_map[start..end] {
+            *mapped = new_row;
+        }
+        collapsed.push(rendered.lines[keep].clone());
+    }
+    for item in &mut rendered.display.items {
+        if let Some(mapped) = row_map.get(usize::from(item.rect.y)) {
+            item.rect.y = *mapped;
+        }
+    }
+    rendered.lines = collapsed;
 }
 
 fn block_gap_after(current: &Block, next: &Block) -> bool {
@@ -635,7 +680,7 @@ impl RenderContext {
         for (item_index, item) in list.items.iter().enumerate() {
             let marker = list_marker(list, item, item_index);
             let text = item.rendered_text();
-            let marker_width = marker.chars().count() as u16;
+            let marker_width = display_width(&marker) as u16;
             let wrap_width = self.options.width.saturating_sub(marker_width).max(1);
             let wrapped = wrap(&text, wrap_width);
             let indent = " ".repeat(usize::from(marker_width));
@@ -664,7 +709,7 @@ impl RenderContext {
                     rect: Rect {
                         x: marker_width,
                         y,
-                        width: part.chars().count() as u16,
+                        width: display_width(part) as u16,
                         height: 1,
                     },
                     cursor: Some(Cursor::ListItem {
@@ -749,14 +794,14 @@ impl RenderContext {
 
     fn render_code(&mut self, block_index: usize, language: Option<&str>, text: &str) {
         let width = usize::from(self.options.width.max(36));
-        let copy_label = "copy";
-        let button_inner = copy_label.chars().count();
+        let copy_label = "📋";
+        let button_inner = display_width(copy_label);
         let content_width = width.saturating_sub(button_inner + 5);
         let body_width = width.saturating_sub(8);
         let scroll = code_horizontal_scroll_for(block_index, &self.options.code_horizontal_scrolls);
         let content_max_width = text
             .lines()
-            .map(|line| line.chars().count())
+            .map(|line| display_width(line))
             .max()
             .unwrap_or(0);
         let has_horizontal_overflow = content_max_width > body_width;
@@ -769,7 +814,6 @@ impl RenderContext {
             "─".repeat(content_width),
             "─".repeat(button_inner + 2)
         );
-        let toolbar = format!("│{label:<content_width$}│ {copy_label:^button_inner$} │");
         let separator = format!(
             "├{}┴{}┤",
             "─".repeat(content_width),
@@ -794,7 +838,7 @@ impl RenderContext {
             rect: Rect {
                 x: 1,
                 y: y + 1,
-                width: label.trim_start().chars().count() as u16,
+                width: display_width(label.trim_start()) as u16,
                 height: 1,
             },
             cursor: Some(Cursor::CodeLanguage {
@@ -805,28 +849,27 @@ impl RenderContext {
             text: label.trim_start().to_string(),
         });
         self.lines.push(top);
-        self.lines.push(toolbar);
+        self.lines
+            .push(format!("│{}│ {} │", pad(&label, content_width), copy_label));
         self.lines.push(separator);
 
         let mut offset = 0usize;
         for (index, line) in text.lines().enumerate() {
             let y = self.lines.len() as u16;
             let number = format!("{:>3}", index + 1);
-            let clipped = if line.chars().count() > scroll {
-                clip_exact(
-                    line.chars().skip(scroll).collect::<String>().as_str(),
-                    body_width,
-                )
+            let clipped = if char_len(line) > scroll {
+                let visible = line.chars().skip(scroll).collect::<String>();
+                take_display_prefix(&visible, body_width).0
             } else {
                 String::new()
             };
-            let formatted = format!("│{number}│ {clipped:<body_width$} │");
+            let formatted = format!("│{number}│ {} │", pad(&clipped, body_width));
             self.display.items.push(DisplayItem {
                 kind: DisplayKind::TextRun,
                 rect: Rect {
                     x: 6,
                     y,
-                    width: clipped.chars().count() as u16,
+                    width: display_width(&clipped) as u16,
                     height: 1,
                 },
                 cursor: Some(Cursor::Text {
@@ -881,13 +924,13 @@ impl RenderContext {
                     .get(col)
                     .map_or_else(String::new, |cell| cell.rendered_text());
                 let clipped = compact(&text, width);
-                let x = line.chars().count() as u16;
+                let x = display_width(&line) as u16;
                 self.display.items.push(DisplayItem {
                     kind: DisplayKind::TableGrid,
                     rect: Rect {
                         x: x.saturating_add(1),
                         y,
-                        width: width as u16,
+                        width: display_width(&clipped).min(width) as u16,
                         height: 1,
                     },
                     cursor: Some(Cursor::TableCell {
@@ -955,9 +998,9 @@ impl RenderContext {
 fn list_marker(list: &List, item: &ListItem, index: usize) -> String {
     if let Some(checked) = item.checked {
         if checked {
-            "[✗] ".to_string()
+            "☑ ".to_string()
         } else {
-            "[_] ".to_string()
+            "☐ ".to_string()
         }
     } else if list.ordered {
         format!("{}. ", index + 1)
@@ -1053,7 +1096,7 @@ fn table_widths(table: &Table) -> Vec<usize> {
                 .rows
                 .iter()
                 .filter_map(|row| row.cells.get(col))
-                .map(|cell| cell.rendered_text().chars().count().clamp(4, 32))
+                .map(|cell| display_width(&cell.rendered_text()).clamp(4, 32))
                 .max()
                 .unwrap_or(4)
         })
@@ -1075,19 +1118,15 @@ fn table_rule(left: char, mid: char, right: char, widths: &[usize]) -> String {
 }
 
 fn compact(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
+    if display_width(text) <= max {
         text.to_string()
     } else if max <= 1 {
         "…".to_string()
     } else {
-        let mut out = text.chars().take(max - 1).collect::<String>();
+        let mut out = take_display_prefix(text, max - 1).0;
         out.push('…');
         out
     }
-}
-
-fn clip_exact(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
 }
 
 const CODE_SCROLLBAR_GUTTER_WIDTH: usize = 5;
@@ -1151,7 +1190,7 @@ fn code_horizontal_scroll_for(block_index: usize, scrolls: &[(usize, usize)]) ->
 }
 
 fn pad(text: &str, width: usize) -> String {
-    let len = text.chars().count();
+    let len = display_width(text);
     if len >= width {
         text.to_string()
     } else {
@@ -1168,9 +1207,9 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
     let mut current = String::new();
     for word in text.split_whitespace() {
         let needed = if current.is_empty() {
-            char_len(word)
+            display_width(word)
         } else {
-            char_len(&current) + 1 + char_len(word)
+            display_width(&current) + 1 + display_width(word)
         };
         if needed > width && !current.is_empty() {
             lines.push(current);
@@ -1254,9 +1293,9 @@ fn wrap_text_block(text: &str, width: u16, hyphenate: bool) -> Vec<WrappedTextLi
         let mut remaining_offset = token.start;
         loop {
             let prefix_space = if current.is_empty() { 0 } else { 1 };
-            let available = width.saturating_sub(char_len(&current) + prefix_space);
-            let remaining_len = char_len(&remaining);
-            if remaining_len <= available {
+            let available = width.saturating_sub(display_width(&current) + prefix_space);
+            let remaining_width = display_width(&remaining);
+            if remaining_width <= available {
                 if current.is_empty() {
                     current_offset = remaining_offset;
                     current.push_str(&remaining);
@@ -1304,8 +1343,9 @@ fn wrap_text_block(text: &str, width: u16, hyphenate: bool) -> Vec<WrappedTextLi
             } else {
                 width.max(1)
             }
-            .min(remaining_len);
-            let (prefix, suffix) = split_chars(&remaining, take);
+            .min(remaining_width);
+            let (prefix, consumed_chars) = take_display_prefix(&remaining, take);
+            let suffix = split_chars(&remaining, consumed_chars).1;
             current_offset = remaining_offset;
             if suffix.is_empty() {
                 current.push_str(&prefix);
@@ -1317,7 +1357,7 @@ fn wrap_text_block(text: &str, width: u16, hyphenate: bool) -> Vec<WrappedTextLi
                 hyphenated: hyphenate,
             });
             remaining = suffix;
-            remaining_offset += take;
+            remaining_offset += consumed_chars;
         }
     }
 
@@ -1349,7 +1389,7 @@ fn text_columns(
         return None;
     }
     let total_width = usize::from(width);
-    let sep_width = char_len(" │ ");
+    let sep_width = display_width(" │ ");
     let available = total_width.checked_sub(sep_width * columns.saturating_sub(1))?;
     let column_width = available / columns;
     if column_width < 16 {
@@ -1402,7 +1442,35 @@ fn heading_rule(level: u8, text: &str) -> String {
         4 => '🭶',
         _ => '‾',
     };
-    rule.to_string().repeat(char_len(text).max(1))
+    rule.to_string().repeat(display_width(text).max(1))
+}
+
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+fn take_display_prefix(text: &str, max_width: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let mut buf = [0; 4];
+        let ch_width = UnicodeWidthStr::width(ch.encode_utf8(&mut buf));
+        if width + ch_width > max_width {
+            break;
+        }
+        out.push(ch);
+        chars += 1;
+        width += ch_width;
+    }
+    if out.is_empty()
+        && max_width > 0
+        && let Some(ch) = text.chars().next()
+    {
+        out.push(ch);
+        chars = 1;
+    }
+    (out, chars)
 }
 
 fn hyphenated_prefix(
@@ -1447,6 +1515,50 @@ fn detected_hyphenator(text: &str) -> Option<&'static Standard> {
     detect(sample)
         .filter(|info| info.is_reliable())
         .and_then(|info| hyphenator_for_lang(info.lang()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_copy_icon_preserves_toolbar_width() {
+        let rendered = render_document(
+            &Document {
+                blocks: vec![Block::CodeBlock {
+                    language: Some("rust".to_string()),
+                    text: "fn main() {}".to_string(),
+                }],
+                version: 0,
+            },
+            RenderOptions {
+                width: 40,
+                ..RenderOptions::default()
+            },
+        );
+
+        assert!(rendered.lines[1].contains("📋"));
+        assert_eq!(display_width(&rendered.lines[0]), 40);
+        assert_eq!(display_width(&rendered.lines[1]), 40);
+        assert_eq!(display_width(&rendered.lines[2]), 40);
+    }
+
+    #[test]
+    fn table_rows_account_for_wide_unicode_cells() {
+        let rendered = render_document(
+            &Document {
+                blocks: vec![Block::Table(Table::new(vec![
+                    vec!["icon".to_string()],
+                    vec!["📋".to_string()],
+                ]))],
+                version: 0,
+            },
+            RenderOptions::default(),
+        );
+        let top = display_width(&rendered.lines[0]);
+
+        assert!(rendered.lines.iter().all(|line| display_width(line) == top));
+    }
 }
 
 fn hyphenator_for_lang(lang: Lang) -> Option<&'static Standard> {

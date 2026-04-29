@@ -8,7 +8,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -49,7 +49,7 @@ use ratatui::{
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
-const HEADLINE_RASTER_VERSION: u32 = 10;
+const HEADLINE_RASTER_VERSION: u32 = 11;
 const HEADLINE_DEBUG_SLAB: bool = false;
 const DOCUMENT_LEFT_PAD: u16 = 1;
 const SPECIAL_EDIT_DELAY: Duration = Duration::from_millis(200);
@@ -299,6 +299,7 @@ struct TabControlHit {
 #[derive(Clone, Debug)]
 enum FilePopup {
     Menu,
+    NewFileMenu,
     NewFile { input: String },
     RenameFile { input: String, path: PathBuf },
     DeleteFile { path: PathBuf },
@@ -310,6 +311,7 @@ enum FilePopupAction {
     Rename,
     Delete,
     Cancel,
+    OpenNewFileInput,
     OpenRename,
     OpenDelete,
 }
@@ -510,6 +512,7 @@ struct TuiState {
     last_kitty_signature: Option<String>,
     headline_png_cache: HashMap<String, Vec<u8>>,
     pending_headline_jobs: HashSet<String>,
+    #[allow(dead_code)]
     headline_raster_tx: Sender<HeadlineRasterResult>,
     headline_raster_rx: Receiver<HeadlineRasterResult>,
 }
@@ -745,7 +748,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => state.file_popup = None,
             KeyCode::Enter => confirm_file_popup(state),
-            KeyCode::Char('n') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
+            KeyCode::Char('n') if matches!(state.file_popup, Some(FilePopup::NewFileMenu)) => {
                 open_new_file_popup(state)
             }
             KeyCode::Char('r') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
@@ -957,6 +960,13 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => state.save(),
         KeyCode::Char('c')
             if key.modifiers.contains(KeyModifiers::CONTROL) && copy_selected_text(state) => {}
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if state.app.editor.current_link_target().is_some() {
+                open_link_popup(state);
+            } else {
+                state.message = "no link under cursor".to_string();
+            }
+        }
         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.preferred_column = None;
             state.app.render_options.columns = 1;
@@ -1401,17 +1411,23 @@ fn current_navigation_render(state: &mut TuiState) -> Arc<Rendered> {
             if render_key.active_fallback_block.is_some() {
                 let mut rendered = base_rendered.as_ref().clone();
                 materialize_active_block_fallback(state, &mut rendered);
+                add_document_metadata_row(state, &mut rendered);
                 Arc::new(rendered)
             } else {
-                base_rendered.clone()
+                let mut rendered = base_rendered.as_ref().clone();
+                add_document_metadata_row(state, &mut rendered);
+                Arc::new(rendered)
             }
         })
     } else if render_key.active_fallback_block.is_some() {
         let mut rendered = base_rendered.as_ref().clone();
         materialize_active_block_fallback(state, &mut rendered);
+        add_document_metadata_row(state, &mut rendered);
         Arc::new(rendered)
     } else {
-        base_rendered.clone()
+        let mut rendered = base_rendered.as_ref().clone();
+        add_document_metadata_row(state, &mut rendered);
+        Arc::new(rendered)
     };
 
     state.last_render_key = Some(render_key);
@@ -1440,6 +1456,15 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
     while target_y >= 0 && target_y < max_y {
         let row = target_y as u16;
         if let Some(insert_index) = nav_index.spacer_rows.get(&row).copied() {
+            if matches!(
+                state.app.editor.document.blocks.get(current_block),
+                Some(DocBlock::ThematicBreak)
+            ) && (insert_index == current_block
+                || insert_index == current_block.saturating_add(1))
+            {
+                target_y += delta.signum();
+                continue;
+            }
             if delta < 0
                 && state.spacer_cursor.is_none()
                 && insert_index == current_block
@@ -1508,7 +1533,10 @@ fn ensure_cursor_visible(state: &mut TuiState) {
         return;
     };
     let nav_index = display_nav_index(state, &rendered);
-    let Some((_, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
+    let Some(y) = visual_cursor_position(state, nav_index.as_ref())
+        .map(|(_, y)| y)
+        .or_else(|| block_row_for_cursor(state, &rendered))
+    else {
         return;
     };
     let viewport = state.last_doc_area.height.saturating_sub(2);
@@ -1531,7 +1559,10 @@ fn place_cursor_in_jump_view(state: &mut TuiState) {
         return;
     };
     let nav_index = display_nav_index(state, &rendered);
-    let Some((_, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
+    let Some(y) = visual_cursor_position(state, nav_index.as_ref())
+        .map(|(_, y)| y)
+        .or_else(|| block_row_for_cursor(state, &rendered))
+    else {
         return;
     };
     let viewport = state.last_doc_area.height.saturating_sub(2);
@@ -1541,6 +1572,17 @@ fn place_cursor_in_jump_view(state: &mut TuiState) {
     let max_scroll = rendered.lines.len().saturating_sub(usize::from(viewport)) as u16;
     let preferred_top = viewport / 4;
     state.scroll = y.saturating_sub(preferred_top).min(max_scroll);
+}
+
+fn block_row_for_cursor(state: &TuiState, rendered: &Rendered) -> Option<u16> {
+    let block = cursor_block(state.app.editor.cursor);
+    rendered
+        .display
+        .items
+        .iter()
+        .filter(|item| display_item_block(item) == Some(block))
+        .map(|item| item.rect.y)
+        .min()
 }
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
@@ -1769,7 +1811,7 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 .cloned()
             {
                 match hit.action {
-                    TabControlAction::NewFile => open_new_file_popup(state),
+                    TabControlAction::NewFile => open_new_file_menu(state),
                     TabControlAction::OpenMenu => state.file_popup = Some(FilePopup::Menu),
                 }
             } else if let Some(hit) = state
@@ -2371,6 +2413,59 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         document_screen_cursor(doc_area, state.scroll, cursor_screen)
     {
         frame.set_cursor_position((screen_x, screen_y));
+    } else if cursor_is_in_inactive_kitty_heading(state) {
+        frame.set_cursor_position((
+            status_area
+                .x
+                .saturating_add(status_area.width.saturating_sub(1)),
+            status_area.y,
+        ));
+    }
+}
+
+fn add_document_metadata_row(state: &TuiState, rendered: &mut Rendered) {
+    let width = usize::from(state.app.render_options.width.max(1));
+    let line_count = rendered.lines.len().max(1);
+    let edited = state
+        .path
+        .as_deref()
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .map(relative_time)
+        .unwrap_or_else(|| "edited now".to_string());
+    let metadata = format!("{line_count} lines · {edited}");
+    let meta_width = metadata.chars().count();
+    let line = if meta_width >= width {
+        metadata
+            .chars()
+            .skip(meta_width.saturating_sub(width))
+            .collect()
+    } else {
+        format!("{}{}", " ".repeat(width - meta_width), metadata)
+    };
+    rendered.lines.insert(0, line);
+    for item in &mut rendered.display.items {
+        item.rect.y = item.rect.y.saturating_add(1);
+    }
+}
+
+fn relative_time(time: SystemTime) -> String {
+    let Ok(elapsed) = SystemTime::now().duration_since(time) else {
+        return "edited now".to_string();
+    };
+    let seconds = elapsed.as_secs();
+    if seconds < 60 {
+        "edited now".to_string()
+    } else if seconds < 60 * 60 {
+        format!("edited {}m ago", seconds / 60)
+    } else if seconds < 60 * 60 * 24 {
+        format!("edited {}h ago", seconds / (60 * 60))
+    } else if seconds < 60 * 60 * 24 * 30 {
+        format!("edited {}d ago", seconds / (60 * 60 * 24))
+    } else if seconds < 60 * 60 * 24 * 365 {
+        format!("edited {}mo ago", seconds / (60 * 60 * 24 * 30))
+    } else {
+        format!("edited {}y ago", seconds / (60 * 60 * 24 * 365))
     }
 }
 
@@ -2510,7 +2605,8 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
         x = start_x.saturating_add(width);
     }
 
-    let controls_width = "  +  ⋮ ".chars().count() as u16;
+    let controls_text = "[+] [⋮]";
+    let controls_width = controls_text.chars().count() as u16;
     let mut controls_x = right.saturating_sub(controls_width.saturating_add(1));
     let start = controls_x.saturating_sub(area.x);
     put(
@@ -2518,14 +2614,14 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
         &mut controls_x,
         label_y,
         right,
-        "  +  ⋮ ",
+        controls_text,
         Style::default()
             .fg(rgb(theme.text_secondary))
             .bg(rgb(theme.panel_bg)),
     );
     state.tab_control_hits.push(TabControlHit {
-        start: start.saturating_add(2),
-        end: start.saturating_add(3),
+        start: start.saturating_add(1),
+        end: start.saturating_add(2),
         action: TabControlAction::NewFile,
     });
     state.tab_control_hits.push(TabControlHit {
@@ -2776,6 +2872,14 @@ fn build_styled_document_lines(
                         .fg(rgb(theme.accent_highlight))
                         .bg(rgb(theme.panel_bg))
                         .add_modifier(Modifier::BOLD),
+                )))
+            } else if index == 0 && !row_items.contains_key(&0) && line.contains(" lines · edited ")
+            {
+                Some(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default()
+                        .fg(rgb(theme.text_muted))
+                        .bg(rgb(theme.panel_bg)),
                 )))
             } else if headline_debug_rows.contains(&index) {
                 let width = line
@@ -3137,6 +3241,10 @@ fn status_shortcuts(state: &TuiState) -> String {
         return "Ctrl+←↑↓→ insert  Ctrl+D remove  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
             .to_string();
     }
+    if state.app.editor.current_link_target().is_some() {
+        return "Ctrl-L edit link  Shift+arrows select  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
+            .to_string();
+    }
     "Shift+arrows select  Ctrl-click block  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string()
 }
 
@@ -3227,7 +3335,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             body,
         )]),
         Line::from(vec![Span::styled(
-            " Ctrl-Shift-X strike · Ctrl-C copy selection · paste inserts plain text",
+            " Ctrl-Shift-X strike · Ctrl-L edit link · Ctrl-C copy selection · paste inserts plain text",
             body,
         )]),
         Line::from(vec![Span::styled(
@@ -3906,17 +4014,22 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
         FilePopup::Menu => (
             " file ",
             vec![
-                " [n] new file".to_string(),
                 " [r] rename file".to_string(),
                 " [d] delete file".to_string(),
             ],
             vec![
-                ("new", FilePopupAction::OpenRename), // placeholder overwritten below
                 ("rename", FilePopupAction::OpenRename),
                 ("delete", FilePopupAction::OpenDelete),
             ],
             28,
-            7,
+            6,
+        ),
+        FilePopup::NewFileMenu => (
+            " new ",
+            vec![" [n] markdown file".to_string()],
+            vec![("markdown", FilePopupAction::OpenNewFileInput)],
+            28,
+            5,
         ),
         FilePopup::NewFile { input } => (
             " new file ",
@@ -3999,7 +4112,9 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
             if row == 1
                 && !matches!(
                     state.file_popup,
-                    Some(FilePopup::DeleteFile { .. }) | Some(FilePopup::Menu)
+                    Some(FilePopup::DeleteFile { .. })
+                        | Some(FilePopup::Menu)
+                        | Some(FilePopup::NewFileMenu)
                 )
             {
                 Style::default()
@@ -4015,22 +4130,24 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
     match popup_kind {
         FilePopup::Menu => {
             state.file_popup_hits.push(FilePopupHit {
-                row: 1,
-                start: 1,
-                end: inner.width.saturating_sub(1),
-                action: FilePopupAction::Create,
-            });
-            state.file_popup_hits.push(FilePopupHit {
-                row: 2,
+                row: 0,
                 start: 1,
                 end: inner.width.saturating_sub(1),
                 action: FilePopupAction::OpenRename,
             });
             state.file_popup_hits.push(FilePopupHit {
-                row: 3,
+                row: 1,
                 start: 1,
                 end: inner.width.saturating_sub(1),
                 action: FilePopupAction::OpenDelete,
+            });
+        }
+        FilePopup::NewFileMenu => {
+            state.file_popup_hits.push(FilePopupHit {
+                row: 0,
+                start: 1,
+                end: inner.width.saturating_sub(1),
+                action: FilePopupAction::OpenNewFileInput,
             });
         }
         _ => {
@@ -4237,6 +4354,7 @@ fn click_file_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
         FilePopupAction::Rename => confirm_file_popup(state),
         FilePopupAction::Delete => confirm_file_popup(state),
         FilePopupAction::Cancel => state.file_popup = None,
+        FilePopupAction::OpenNewFileInput => open_new_file_popup(state),
         FilePopupAction::OpenRename => open_rename_file_popup(state),
         FilePopupAction::OpenDelete => open_delete_file_popup(state),
     }
@@ -4764,6 +4882,11 @@ fn open_new_file_popup(state: &mut TuiState) {
     state.file_popup_hits.clear();
 }
 
+fn open_new_file_menu(state: &mut TuiState) {
+    state.file_popup = Some(FilePopup::NewFileMenu);
+    state.file_popup_hits.clear();
+}
+
 fn open_rename_file_popup(state: &mut TuiState) {
     let Some(path) = state.path.clone() else {
         state.message = "rename unavailable".to_string();
@@ -4793,6 +4916,7 @@ fn confirm_file_popup(state: &mut TuiState) {
     };
     match popup {
         FilePopup::Menu => {}
+        FilePopup::NewFileMenu => open_new_file_popup(state),
         FilePopup::NewFile { input } => {
             if let Err(error) = create_file_from_input(state, &input) {
                 state.message = format!("create failed: {error}");
@@ -4812,6 +4936,7 @@ fn confirm_file_popup(state: &mut TuiState) {
 }
 
 fn open_link_popup(state: &mut TuiState) {
+    hide_style_popup(state);
     state.link_popup = Some(LinkPopup::Edit {
         input: state
             .app
@@ -5804,28 +5929,18 @@ fn adornment_spans(
                 .add_modifier(Modifier::BOLD),
         )];
     }
-    if text == "[_]" || text == "[✗]" {
-        return vec![
-            Span::styled(
-                "[".to_string(),
-                Style::default().fg(rgb(theme.text_muted)).bg(background),
-            ),
-            Span::styled(
-                text.chars().nth(1).unwrap_or('_').to_string(),
-                Style::default()
-                    .fg(rgb(if text == "[✗]" {
-                        theme.error
-                    } else {
-                        theme.accent_highlight
-                    }))
-                    .bg(background)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "]".to_string(),
-                Style::default().fg(rgb(theme.text_muted)).bg(background),
-            ),
-        ];
+    if text == "☐" || text == "☑" {
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(rgb(if text == "☑" {
+                    theme.success
+                } else {
+                    theme.accent_highlight
+                }))
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        )];
     }
     vec![Span::styled(
         text.to_string(),
@@ -7289,6 +7404,14 @@ fn emit_kitty_headlines<W: Write>(writer: &mut W, state: &mut TuiState) -> io::R
     if !state.kitty_graphics || HEADLINE_DEBUG_SLAB {
         return Ok(());
     }
+    if popup_blocks_headline_graphics(state) {
+        if state.last_kitty_signature.is_some() {
+            writer.write_all(b"\x1b_Ga=d,d=Z,z=-1\x1b\\")?;
+            writer.flush()?;
+            state.last_kitty_signature = None;
+        }
+        return Ok(());
+    }
     let Some(rendered) = state.last_rendered.clone() else {
         return Ok(());
     };
@@ -7301,11 +7424,23 @@ fn emit_kitty_headlines<W: Write>(writer: &mut W, state: &mut TuiState) -> io::R
     if state.last_kitty_signature.is_some() || !commands.is_empty() {
         output.push_str("\u{1b}_Ga=d,d=A\u{1b}\\");
     }
-    output.push_str(&signature);
+    for command in &commands {
+        output.push_str(command);
+    }
     writer.write_all(output.as_bytes())?;
     writer.flush()?;
     state.last_kitty_signature = Some(signature);
     Ok(())
+}
+
+fn popup_blocks_headline_graphics(state: &TuiState) -> bool {
+    state.show_help
+        || state.file_popup.is_some()
+        || state.link_popup.is_some()
+        || state.heading_popup.is_some()
+        || state.table_popup.is_some()
+        || state.last_style_popup.is_some()
+        || state.last_color_popup.is_some()
 }
 
 fn visible_headline_commands(
@@ -7342,8 +7477,9 @@ fn visible_headline_commands(
         let png = if let Some(bytes) = state.headline_png_cache.get(&key) {
             bytes.clone()
         } else {
-            request_headline_raster(state, key.clone(), text.to_string(), level, cols, rows);
-            continue;
+            let bytes = headline_png(text, level, cols, rows)?;
+            state.headline_png_cache.insert(key.clone(), bytes.clone());
+            bytes
         };
         let row = document_content_top(area)
             .saturating_add(item.rect.y.saturating_sub(scroll))
@@ -7371,7 +7507,7 @@ fn kitty_png_apc(png: &[u8], cols: u16, rows: u16) -> String {
         if first {
             let more = if end < total { 1 } else { 0 };
             chunks.push_str(&format!(
-                "\u{1b}_Ga=T,f=100,c={cols},r={rows},C=1,m={more};{chunk}\u{1b}\\"
+                "\u{1b}_Ga=T,f=100,c={cols},r={rows},C=1,z=-1,m={more};{chunk}\u{1b}\\"
             ));
             first = false;
         } else {
@@ -7383,6 +7519,7 @@ fn kitty_png_apc(png: &[u8], cols: u16, rows: u16) -> String {
     chunks
 }
 
+#[allow(dead_code)]
 fn request_headline_raster(
     state: &mut TuiState,
     key: String,
@@ -7406,7 +7543,7 @@ fn headline_png(text: &str, level: u8, cols: u16, rows: u16) -> io::Result<Vec<u
     let cell_h = 48u32;
     let width = u32::from(cols.max(8)) * cell_w;
     let height = u32::from(rows).max(2) * cell_h;
-    let mut img = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([24, 18, 13, 255]));
     let text = single_line_headline_text(text);
     if HEADLINE_DEBUG_SLAB {
         draw_headline_debug_slab(&mut img, cols, rows);
@@ -7460,8 +7597,8 @@ fn draw_headline_font(
     };
     let (layout, bounds) =
         fit_headline_layout(&font, text, image.width(), image.height(), headline_height)?;
-    let blur_radius = ((cell_height as f32 * 0.085).round() as usize).max(3);
-    let shadow_drop = ((cell_height as f32 * 0.11).round() as i32).max(4);
+    let blur_radius = ((cell_height as f32 * 0.14).round() as usize).max(5);
+    let shadow_drop = ((cell_height as f32 * 0.16).round() as i32).max(6);
     let shadow_room = shadow_drop + (blur_radius as i32 * 2);
     let offset_x = (6.0 - bounds.min_x).round() as i32;
     let top_pad = ((image.height() as f32 - bounds.height() - shadow_room as f32) / 2.0)
@@ -7490,7 +7627,7 @@ fn draw_headline_font(
         image.height() as usize,
         blur_radius,
     );
-    composite_alpha_mask(image, &shadow_mask, Rgba([0, 0, 0, 150]));
+    composite_alpha_mask(image, &shadow_mask, Rgba([0, 0, 0, 220]));
     for glyph in layout.glyphs() {
         let (metrics, bitmap) = font.rasterize_config(glyph.key);
         paint_alpha_bitmap_gradient(
@@ -8628,7 +8765,7 @@ mod tests {
     }
 
     #[test]
-    fn active_thematic_break_renders_placeholder_text() {
+    fn thematic_break_stays_display_only_when_active() {
         let mut state = TuiState::new(App::from_markdown("x.md", "---"), None);
         state.app.editor.set_cursor(Cursor::Text {
             block: 0,
@@ -8639,10 +8776,15 @@ mod tests {
 
         materialize_active_block_fallback(&state, &mut rendered);
 
-        assert_eq!(rendered.lines, vec!["-".to_string()]);
+        assert_eq!(
+            rendered.lines,
+            vec![
+                "────────────────────────────────────────────────────────────────────────────────"
+                    .to_string()
+            ]
+        );
         assert!(rendered.display.items.iter().any(|item| {
-            item.kind == DisplayKind::TextRun
-                && item.text == "-"
+            item.kind == DisplayKind::CursorTarget
                 && item.cursor
                     == Some(Cursor::Text {
                         block: 0,
@@ -8652,7 +8794,7 @@ mod tests {
     }
 
     #[test]
-    fn active_thematic_break_collapses_its_trailing_gap_row() {
+    fn thematic_break_keeps_single_display_row_when_active() {
         let mut state = TuiState::new(App::from_markdown("x.md", "before\n\n---\n\nafter"), None);
         state.app.editor.set_cursor(Cursor::Text {
             block: 1,
@@ -8668,7 +8810,9 @@ mod tests {
             vec![
                 "before".to_string(),
                 String::new(),
-                "-".to_string(),
+                "────────────────────────────────────────────────────────────────────────────────"
+                    .to_string(),
+                String::new(),
                 "after".to_string()
             ]
         );
@@ -8692,9 +8836,7 @@ mod tests {
             block: 1,
             offset: 0,
         });
-        let mut rendered =
-            render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_block_fallback(&state, &mut rendered);
+        let rendered = current_navigation_render(&mut state);
         let heading_row = rendered
             .display
             .items
@@ -8708,7 +8850,7 @@ mod tests {
                 .then_some(item.rect.y)
             })
             .expect("active heading row");
-        state.last_rendered = Some(Arc::new(rendered));
+        state.last_rendered = Some(rendered);
 
         move_visual(&mut state, -1, false);
         assert_eq!(state.spacer_cursor, Some(1));
@@ -8780,10 +8922,7 @@ mod tests {
             hyphenate: true,
             ..RenderOptions::default()
         };
-        let mut rendered =
-            render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_block_fallback(&state, &mut rendered);
-        let rendered = Arc::new(rendered);
+        let rendered = current_navigation_render(&mut state);
         let nav_index =
             DisplayNavIndex::build(&rendered.display.items, &state.app.editor.document.blocks);
         let segments = nav_index
@@ -9690,6 +9829,35 @@ mod tests {
     }
 
     #[test]
+    fn active_toc_editor_shows_original_link_text() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "## Table of contents\n\n- [1. Project identity](#project-identity)\n\n# Project identity",
+            ),
+            None,
+        );
+        state.app.editor.set_cursor(Cursor::ListItem {
+            block: 1,
+            item: 0,
+            offset: 0,
+        });
+
+        let rendered = current_navigation_render(&mut state);
+
+        assert!(rendered.display.items.iter().any(|item| {
+            item.kind == DisplayKind::TextRun
+                && item.text == "1. Project identity"
+                && item.cursor
+                    == Some(Cursor::ListItem {
+                        block: 1,
+                        item: 0,
+                        offset: 0,
+                    })
+        }));
+    }
+
+    #[test]
     fn edited_toc_title_renders_from_link_text_not_heading() {
         let mut app = App::from_markdown(
             "x.md",
@@ -10200,6 +10368,54 @@ mod tests {
     }
 
     #[test]
+    fn opening_link_popup_closes_style_menu() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "[hello](https://old.example) world"),
+            None,
+        );
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 2,
+        });
+        state.app.editor.select_all();
+        state.app.editor.show_style_popover = true;
+        state.last_style_popup = Some(Rect {
+            x: 1,
+            y: 1,
+            width: 12,
+            height: 4,
+        });
+
+        open_link_popup(&mut state);
+
+        assert!(state.link_popup.is_some());
+        assert!(!state.app.editor.show_style_popover);
+        assert!(state.style_popup_not_before.is_none());
+    }
+
+    #[test]
+    fn ctrl_l_opens_link_popup_for_link_under_cursor() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "[hello](https://old.example) world"),
+            None,
+        );
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 2,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(
+            state.link_popup,
+            Some(LinkPopup::Edit { ref input }) if input == "https://old.example"
+        ));
+    }
+
+    #[test]
     fn link_jumps_bias_target_toward_upper_quarter() {
         let markdown = (1..=18)
             .map(|i| format!("# Heading {i}\n\nbody {i}"))
@@ -10217,7 +10433,10 @@ mod tests {
 
         let rendered = current_navigation_render(&mut state);
         let nav_index = display_nav_index(&mut state, &rendered);
-        let (_, y) = visual_cursor_position(&state, nav_index.as_ref()).expect("cursor row");
+        let y = visual_cursor_position(&state, nav_index.as_ref())
+            .map(|(_, y)| y)
+            .or_else(|| block_row_for_cursor(&state, &rendered))
+            .expect("cursor row");
         let viewport = state.last_doc_area.height.saturating_sub(2);
 
         assert!(y >= state.scroll);

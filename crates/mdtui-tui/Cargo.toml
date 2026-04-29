@@ -3,6 +3,10 @@ name = "mdtui-tui"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "mdtui"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.22"
 crossterm = "0.28"
@@ -15,6 +19,23 @@ mdtui-markdown = { path = "../mdtui-markdown" }
 mdtui-render = { path = "../mdtui-render" }
 mdtui-terminal = { path = "../mdtui-terminal" }
 ratatui = "0.29"
+
+[dev-dependencies]
+unicode-width = "0.2"
+
+[package.metadata.deb]
+name = "mdtui"
+maintainer = "mendrik"
+copyright = "2026, mendrik"
+license-file = ["../../LICENSE", "0"]
+extended-description = "A warm, keyboard-first terminal Markdown editor with semantic rendering, table editing, TOC navigation, and Kitty graphics headlines."
+section = "editors"
+priority = "optional"
+assets = [
+  ["target/release/mdtui", "usr/bin/mdtui", "755"],
+  ["../../README.md", "usr/share/doc/mdtui/README.md", "644"],
+  ["../../LICENSE", "usr/share/doc/mdtui/LICENSE", "644"],
+]
 
 [lints]
 workspace = true

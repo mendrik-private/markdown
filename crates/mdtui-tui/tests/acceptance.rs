@@ -5,6 +5,7 @@ use mdtui_terminal::{
     HeadlineImageCache, ImageCache, InputEngine, InputEvent, contains_forbidden_text_sizing,
 };
 use mdtui_tui::App;
+use unicode_width::UnicodeWidthStr;
 
 fn sample() -> &'static str {
     "# Title
@@ -107,7 +108,7 @@ fn rendered_list_bold_does_not_show_star_markers() {
 #[test]
 fn rendered_task_item_does_not_show_bracket_marker() {
     let rendered = App::from_markdown("x.md", "- [x] done").render_text();
-    assert!(rendered.contains("[✗]"));
+    assert!(rendered.contains("☑"));
     assert!(!rendered.contains("[x]"));
 }
 
@@ -289,7 +290,7 @@ fn enter_in_task_item_creates_unchecked_task_item() {
         offset: 4,
     });
     app.enter();
-    assert!(app.render_text().contains("[_]"));
+    assert!(app.render_text().contains("☐"));
 }
 
 #[test]
@@ -336,7 +337,7 @@ fn backspace_at_start_of_first_item_unwraps_without_marker_text() {
 fn clicking_checkbox_toggles_task_state() {
     let mut app = App::from_markdown("x.md", "- [ ] todo");
     app.click(0, 0);
-    assert!(app.render_text().contains("[✗]"));
+    assert!(app.render_text().contains("☑"));
 }
 
 #[test]
@@ -345,7 +346,7 @@ fn space_on_checkbox_toggles_task_state() {
     app.editor
         .set_cursor(Cursor::Checkbox { block: 0, item: 0 });
     app.editor.space();
-    assert!(app.render_text().contains("[✗]"));
+    assert!(app.render_text().contains("☑"));
 }
 
 #[test]
@@ -674,7 +675,7 @@ fn raw_html_never_invokes_tui_layout_renderer() {
 fn code_block_renders_line_numbers_and_copy_button() {
     let rendered =
         App::from_markdown("x.md", "```python\ndef greet():\n    return 1\n```").render_text();
-    assert!(rendered.contains("│ copy │"));
+    assert!(rendered.contains("│ 📋 │"));
     assert!(rendered.contains("│  1│ def greet():"));
     assert!(rendered.contains("│  2│     return 1"));
 }
@@ -690,7 +691,7 @@ fn code_block_toolbar_matches_border_width() {
         .lines
         .iter()
         .take(5)
-        .map(|line| line.chars().count())
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
         .collect::<Vec<_>>();
     assert!(
         widths.windows(2).all(|pair| pair[0] == pair[1]),

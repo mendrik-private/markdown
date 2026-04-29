@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "hyphenation",
  "mdtui-core",
+ "unicode-width 0.2.0",
  "whatlang",
 ]
 
@@ -419,6 +420,7 @@ dependencies = [
  "mdtui-render",
  "mdtui-terminal",
  "ratatui",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

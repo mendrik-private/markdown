@@ -99,7 +99,6 @@ pub struct EditableBlockFallback {
 
 pub fn editable_block_fallback(block: &Block) -> Option<EditableBlockFallback> {
     match block {
-        Block::ThematicBreak => Some(EditableBlockFallback { placeholder: "-" }),
         _ => None,
     }
 }
@@ -544,10 +543,7 @@ impl Editor {
                 item,
                 offset,
             } => self.enter_list_item(block, item, offset),
-            Cursor::TableCell { .. } => {
-                self.record_undo();
-                self.insert_text_at_cursor("\n");
-            }
+            Cursor::TableCell { .. } => self.tab(false),
             Cursor::CodeLanguage { block, .. } => self.cursor = Cursor::Text { block, offset: 0 },
             Cursor::Text { block, offset } => self.split_text_block(block, offset),
             Cursor::Checkbox { .. } => {}
@@ -557,6 +553,13 @@ impl Editor {
     pub fn backspace(&mut self) {
         self.normalize_checkbox_cursor();
         if self.delete_selection_if_any() {
+            return;
+        }
+        if self.cursor_on_thematic_break() {
+            self.record_undo();
+            let change = self.set_active_text(String::new());
+            self.apply_active_text_change(change, 0);
+            self.document.version += 1;
             return;
         }
         if self.active_block_fallback().is_some() {
@@ -588,6 +591,13 @@ impl Editor {
     pub fn delete(&mut self) {
         self.normalize_checkbox_cursor();
         if self.delete_selection_if_any() {
+            return;
+        }
+        if self.cursor_on_thematic_break() {
+            self.record_undo();
+            let change = self.set_active_text(String::new());
+            self.apply_active_text_change(change, 0);
+            self.document.version += 1;
             return;
         }
         if self.active_block_fallback().is_some() {
@@ -1198,6 +1208,14 @@ impl Editor {
             .and_then(editable_block_fallback)
     }
 
+    fn cursor_on_thematic_break(&self) -> bool {
+        matches!(
+            self.cursor,
+            Cursor::Text { block, .. }
+                if matches!(self.document.blocks.get(block), Some(Block::ThematicBreak))
+        )
+    }
+
     fn apply_active_text_change(&mut self, change: ActiveTextChange, offset: usize) {
         match change {
             ActiveTextChange::Updated => {
@@ -1243,6 +1261,9 @@ impl Editor {
     }
 
     fn insert_text_at_cursor(&mut self, text: &str) {
+        if self.cursor_on_thematic_break() && !text.is_empty() {
+            return;
+        }
         let (change, new_offset) = if self.active_block_fallback().is_some() {
             (self.set_active_text(text.to_string()), char_len(text))
         } else {
@@ -3110,7 +3131,7 @@ mod tests {
     }
 
     #[test]
-    fn thematic_break_uses_editable_placeholder_and_deletes_cleanly() {
+    fn thematic_break_has_no_editor_and_deletes_cleanly() {
         let mut editor = Editor::new(Document::new(vec![
             Block::Paragraph(vec![Inline::Text("before".to_string())]),
             Block::ThematicBreak,
@@ -3121,7 +3142,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(editor.active_text(), "-");
+        assert_eq!(editor.active_text(), "");
         let version = editor.document.version;
 
         editor.delete();
@@ -3275,7 +3296,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_on_thematic_break_turns_it_into_paragraph_text() {
+    fn typing_on_thematic_break_is_ignored() {
         let mut editor = Editor::new(Document::new(vec![Block::ThematicBreak]));
         editor.set_cursor(Cursor::Text {
             block: 0,
@@ -3284,15 +3305,45 @@ mod tests {
 
         editor.press_char('a');
 
-        assert_eq!(
-            editor.document.blocks,
-            vec![Block::Paragraph(vec![Inline::Text("a".to_string())])]
-        );
+        assert_eq!(editor.document.blocks, vec![Block::ThematicBreak]);
         assert_eq!(
             editor.cursor,
             Cursor::Text {
                 block: 0,
-                offset: 1
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn enter_in_table_cell_moves_without_inserting_newline() {
+        let mut editor = Editor::new(Document::new(vec![Block::Table(Table::new(vec![vec![
+            "a".to_string(),
+            "b".to_string(),
+        ]]))]));
+        editor.set_cursor(Cursor::TableCell {
+            block: 0,
+            row: 0,
+            col: 0,
+            offset: 1,
+        });
+
+        editor.enter();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Table(Table::new(vec![vec![
+                "a".to_string(),
+                "b".to_string(),
+            ]]))]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::TableCell {
+                block: 0,
+                row: 0,
+                col: 1,
+                offset: 0,
             }
         );
     }
