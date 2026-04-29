@@ -815,6 +815,10 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
 
     if has_selection(state) && state.app.editor.show_style_popover && key.modifiers.is_empty() {
         match key.code {
+            KeyCode::Esc => {
+                hide_style_popup(state);
+                return false;
+            }
             KeyCode::Up => {
                 step_style_popup_selection(state, -1);
                 state.style_popup_hover = None;
@@ -1341,6 +1345,27 @@ fn ensure_cursor_visible(state: &mut TuiState) {
     } else if y >= state.scroll.saturating_add(viewport) {
         state.scroll = y.saturating_sub(viewport.saturating_sub(1));
     }
+}
+
+fn place_cursor_in_jump_view(state: &mut TuiState) {
+    let Some(rendered) = state
+        .last_rendered
+        .clone()
+        .or_else(|| Some(current_navigation_render(state)))
+    else {
+        return;
+    };
+    let nav_index = display_nav_index(state, &rendered);
+    let Some((_, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
+        return;
+    };
+    let viewport = state.last_doc_area.height.saturating_sub(2);
+    if viewport == 0 {
+        return;
+    }
+    let max_scroll = rendered.lines.len().saturating_sub(usize::from(viewport)) as u16;
+    let preferred_top = viewport / 4;
+    state.scroll = y.saturating_sub(preferred_top).min(max_scroll);
 }
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
@@ -3226,6 +3251,7 @@ fn follow_link_to_block(state: &mut TuiState, block: usize, message: &str) {
     if editable_target_for_cursor(state, cursor).is_some() {
         schedule_editable_target_activation(state, cursor);
     }
+    place_cursor_in_jump_view(state);
     ensure_cursor_visible(state);
     state.message = message.to_string();
 }
@@ -7180,9 +7206,14 @@ fn materialize_active_block_fallback(state: &TuiState, rendered: &mut Rendered) 
     let Some(active_target) = active_editable_target(state) else {
         return;
     };
+    let collapsed_gap_row = active_thematic_break_gap_row(state, rendered, active_target);
+    if let Some(gap_row) = collapsed_gap_row {
+        rendered.lines.remove(usize::from(gap_row));
+    }
     let mut items = Vec::with_capacity(rendered.display.items.len() + 2);
     let mut replaced_rows = HashSet::new();
     for item in &rendered.display.items {
+        let item = shifted_display_item(item, collapsed_gap_row);
         if matches!(active_target, EditableTarget::ListItem { .. })
             && replaced_rows.contains(&item.rect.y)
         {
@@ -7325,6 +7356,52 @@ fn materialize_active_block_fallback(state: &TuiState, rendered: &mut Rendered) 
         }
     }
     rendered.display.items = items;
+}
+
+fn active_thematic_break_gap_row(
+    state: &TuiState,
+    rendered: &Rendered,
+    active_target: EditableTarget,
+) -> Option<u16> {
+    let EditableTarget::Block(block) = active_target else {
+        return None;
+    };
+    if !matches!(
+        state.app.editor.document.blocks.get(block),
+        Some(DocBlock::ThematicBreak)
+    ) {
+        return None;
+    }
+    let cursor_row = rendered
+        .display
+        .items
+        .iter()
+        .find_map(|item| match item.cursor {
+            Some(Cursor::Text {
+                block: item_block,
+                offset: 0,
+            }) if item_block == block && item.kind == DisplayKind::CursorTarget => {
+                Some(item.rect.y)
+            }
+            _ => None,
+        })?;
+    let gap_row = cursor_row.saturating_add(1);
+    rendered
+        .lines
+        .get(usize::from(gap_row))
+        .filter(|line| line.is_empty())
+        .map(|_| gap_row)
+}
+
+fn shifted_display_item(
+    item: &mdtui_render::DisplayItem,
+    collapsed_gap_row: Option<u16>,
+) -> mdtui_render::DisplayItem {
+    let mut shifted = item.clone();
+    if collapsed_gap_row.is_some_and(|gap_row| shifted.rect.y > gap_row) {
+        shifted.rect.y = shifted.rect.y.saturating_sub(1);
+    }
+    shifted
 }
 
 fn active_editable_target(state: &TuiState) -> Option<EditableTarget> {
@@ -7861,9 +7938,7 @@ mod tests {
         state.last_rendered = Some(Arc::new(rendered));
 
         move_visual(&mut state, 1, false);
-        assert_eq!(state.spacer_cursor, Some(2));
-
-        move_visual(&mut state, 1, false);
+        assert_eq!(state.spacer_cursor, None);
 
         assert_eq!(
             state.app.editor.cursor,
@@ -7896,6 +7971,29 @@ mod tests {
                         offset: 0,
                     })
         }));
+    }
+
+    #[test]
+    fn active_thematic_break_collapses_its_trailing_gap_row() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "before\n\n---\n\nafter"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+
+        materialize_active_block_fallback(&state, &mut rendered);
+
+        assert_eq!(
+            rendered.lines,
+            vec![
+                "before".to_string(),
+                String::new(),
+                "-".to_string(),
+                "after".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -9317,6 +9415,43 @@ mod tests {
         assert!(maybe_activate_delayed_style_popup(&mut state));
         assert!(state.style_popup_not_before.is_none());
         assert!(style_popup_delay_elapsed(&state));
+    }
+
+    #[test]
+    fn escape_closes_style_popup() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.select_all();
+        state.app.editor.show_style_popover = true;
+
+        handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!state.app.editor.show_style_popover);
+        assert!(state.style_popup_not_before.is_none());
+    }
+
+    #[test]
+    fn link_jumps_bias_target_toward_upper_quarter() {
+        let markdown = (1..=18)
+            .map(|i| format!("# Heading {i}\n\nbody {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut state = TuiState::new(App::from_markdown("x.md", &markdown), None);
+        state.last_doc_area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 18,
+        };
+
+        follow_link_to_block(&mut state, 10, "jump");
+
+        let rendered = current_navigation_render(&mut state);
+        let nav_index = display_nav_index(&mut state, &rendered);
+        let (_, y) = visual_cursor_position(&state, nav_index.as_ref()).expect("cursor row");
+        let viewport = state.last_doc_area.height.saturating_sub(2);
+
+        assert!(y >= state.scroll);
+        assert!(y.saturating_sub(state.scroll) <= viewport / 4);
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 > The editor is always a *rendered* editor. Markdown is only an import/export format. Users must never be forced to edit Markdown source syntax such as `###`, `-`, `[x]`, pipe table delimiters, emphasis markers, or link syntax.
 
-This document is the single source of truth. It supersedes earlier plans and combines the product thesis, visual design, technical architecture, implementation order, and acceptance harness into one specification. The harness at the end defines completion.
+Thissss document is the single source of truth. It supersedes earlier plans and combines the product thesis, visual design, technical architecture, implementation order, and acceptance harness into one specification. The harness at the end defines completion.
 
 ---
 
@@ -70,37 +70,48 @@ The previous build failed because it violated the product thesis. This specifica
 These rules are the contract. A feature that violates any of them is broken regardless of how it tests in isolation.
 
 1. **No modal insert mode.**
-   The app opens directly in editing mode. Typing printable characters inserts text immediately. Pressing `i` inserts the literal character `i` unless a popover or palette has captured focus. There is no Normal/Insert/Visual mode and no mode indicator in the status bar.
 
-2. **No visible Markdown syntax during normal editing.**
-   `#`, `###`, `-`, `*`, `**`, `_`, `` ` ``, `[ ]`, `[x]`, table delimiter rows, and pipe-table syntax must not appear as structural markers. They may appear only when literally part of document text. Markdown syntax is import/export only.
+The app opens directly in editing mode. Typing printable characters inserts text immediately. Pressing `i` inserts the literal character `i` unless a popover or palette has captured focus. There is no Normal/Insert/Visual mode and no mode indicator in the status bar.
 
-3. **The rendered document is the editor.**
-   There is no separate preview. Cursor, selection, mouse hit-testing, typing, deletion, paste, and formatting all operate on the rendered document model.
+1. **No visible Markdown syntax during normal editing.**
 
-4. **Tables are first-class widgets.**
-   Tables render with Unicode box drawing, never pipe ASCII. Cells are editable. Empty rows, empty columns, and empty cells remain visible and editable. `Ctrl+Arrow` table commands add rows and columns.
+`#`, `###`, `-`, `*`, `**`, `_`, `` ` ``, `[ ]`, `[x]`, table delimiter rows, and pipe-table syntax must not appear as structural markers. They may appear only when literally part of document text. Markdown syntax is import/export only.
 
-5. **Lists are first-class widgets.**
-   List markers are visual atoms, not text. `Enter` inside a list item creates a new list item. `Backspace` at the start of a list item merges or unwraps structurally without exposing `-` or numbering.
+1. **The rendered document is the editor.**
 
-6. **Selection works.**
-   `Shift+Arrow` selection is required. Mouse drag selection is required. `Ctrl+A` select-all is required. Selection works across inline marks, wrapped lines, blocks, list items, table cells, images, and raw-HTML atoms.
+There is no separate preview. Cursor, selection, mouse hit-testing, typing, deletion, paste, and formatting all operate on the rendered document model.
 
-7. **The styling popover works.**
-   Selecting text shows a small floating styling bar supporting bold, italic, strikethrough, inline code, link, heading level, list conversion, blockquote, code block, AI action (when configured), and clear style. Both keyboard and mouse can drive it. Do render a shadow but making the chars column to the right and one below the popup a bit darker.
+1. **Tables are first-class widgets.**
 
-8. **Headline renderer.**
-   H1 and H2 headlines render as two-row visual headlines using the Kitty Graphics Protocol, not Kitty Text Sizing / OSC-66. The heading text is rasterized to an embedded image and placed in the document display list. When the cursor enters any cell covered by the headline, the heading switches to regular editable rendered text with no `#` marker. When the cursor leaves the heading, the cached headline image is restored immediately without flicker.
+Tables render with Unicode box drawing, never pipe ASCII. Cells are editable. Empty rows, empty columns, and empty cells remain visible and editable. `Ctrl+Arrow` table commands add rows and columns.
 
-9. **GFM is primary.**
-   The editor targets the official GitHub Flavored Markdown specification at <https://github.github.com/gfm/>. Raw HTML is preserved on import/export but is not rendered as a browser-like or TUI layout engine.
+1. **Lists are first-class widgets.**
 
-10. **The harness is authoritative.**
-    A feature without tests is not done. If any test would allow modal editing, pipe-source tables, list-spacing regressions, marker leakage, or non-working selection, the harness is wrong and must be tightened before coding continues.
+List markers are visual atoms, not text. `Enter` inside a list item creates a new list item. `Backspace` at the start of a list item merges or unwraps structurally without exposing `-` or numbering.
 
-11. **The app must look intentional.**
-    The `look-and-feel` reference is a polished Ghostty-amber terminal aesthetic. Default-terminal ugliness is a regression. No noisy ASCII fallback unless the terminal genuinely requires it.
+1. **Selection works.**
+
+`Shift+Arrow` selection is required. Mouse drag selection is required. `Ctrl+A` select-all is required. Selection works across inline marks, wrapped lines, blocks, list items, table cells, images, and raw-HTML atoms.
+
+1. **The styling popover works.**
+
+Selecting text shows a small floating styling bar supporting bold, italic, strikethrough, inline code, link, heading level, list conversion, blockquote, code block, AI action (when configured), and clear style. Both keyboard and mouse can drive it. Do render a shadow but making the chars column to the right and one below the popup a bit darker.
+
+1. **Headline renderer.**
+
+H1 and H2 headlines render as two-row visual headlines using the Kitty Graphics Protocol, not Kitty Text Sizing / OSC-66. The heading text is rasterized to an embedded image and placed in the document display list. When the cursor enters any cell covered by the headline, the heading switches to regular editable rendered text with no `#` marker. When the cursor leaves the heading, the cached headline image is restored immediately without flicker.
+
+1. **GFM is primary.**
+
+The editor targets the official GitHub Flavored Markdown specification at <https://github.github.com/gfm/>. Raw HTML is preserved on import/export but is not rendered as a browser-like or TUI layout engine.
+
+1. **The harness is authoritative.**
+
+A feature without tests is not done. If any test would allow modal editing, pipe-source tables, list-spacing regressions, marker leakage, or non-working selection, the harness is wrong and must be tightened before coding continues.
+
+1. **The app must look intentional.**
+
+The `look-and-feel` reference is a polished Ghostty-amber terminal aesthetic. Default-terminal ugliness is a regression. No noisy ASCII fallback unless the terminal genuinely requires it.
 
 ---
 
@@ -268,9 +279,9 @@ The app is a fullscreen TUI. Suggested 16:9 layout:
 ╭──────────────┬──────────────────────────────────────────────────────┬──────────╮
 │ EXPLORER     │ ┌── README.md ●  roadmap.md   prosa-spec.md   ────┐  │ OUTLINE  │  ← tab strip
 │ ⌄ project    │ │                                                 │  │ ⌄ Intro  │
-│   📄 README  │ │   Prosa: A Productive Markdown Dialect          │  │  ⌄Tasks  │
-│   📄 roadmap │ │   ═══════════════════════════════════════════   │  │ ⌄ Tables │
-│   📁 docs    │ │                                                 │  │ ⌄ Code   │
+│   - README   │ │   Prosa: A Productive Markdown Dialect          │  │  ⌄Tasks  │
+│   - roadmap  │ │   ═══════════════════════════════════════════   │  │ ⌄ Tables │
+│   - docs     │ │                                                 │  │ ⌄ Code   │
 │ ⌄ config     │ │   Prose wraps softly at the document width.     │  │          │
 │   * Cargo    │ │                                                 │  │          │
 │              │ │   • Task list                                   │  │          │
@@ -307,10 +318,10 @@ The document panel is **not** a Markdown source view. It renders:
 ### Inline style popup (floating)
 
 ```text
-╭─ Inline Style ───────────────────────────────╮
-│  B   I   S   `   🔗   x²   x₂  [more]        │
-│  ●   ●   ●   ●   ●    ●    ●                 │  ← swatches: amber,
-╰──────────────────────────────────────────────╯       orange, olive,
+╭─ Inline Style ──────────────────────────────╮
+│  B   I   S   `   L   x²   x₂  [more]        │
+│  ●   ●   ●   ●   ●   ●    ●                 │  ← swatches: amber,
+╰─────────────────────────────────────────────╯       orange, olive,
                                                        steel blue, gray,
                                                        red, rose
 ```
@@ -348,38 +359,38 @@ The document focus always accepts text input. Popovers and palettes temporarily 
 
 ### Keyboard expectations
 
-| Key                          | Required behavior                                                                      |
-| ---------------------------- | -------------------------------------------------------------------------------------- |
-| Printable char               | Insert at selection/cursor                                                             |
-| `i`                          | Insert literal `i` (no special mode meaning)                                           |
-| `Enter`                      | Split block; create list item; create table row/cell paragraph depending on context    |
-| `Backspace`                  | Delete selection or previous grapheme/structural boundary                              |
-| `Delete`                     | Delete selection or next grapheme/structural boundary                                  |
-| Arrow keys                   | Move cursor by grapheme / line / block as appropriate                                  |
-| `Ctrl+Arrow`                 | Word movement; in tables, add row/column in arrow direction                            |
-| `Shift+Arrow`                | Extend selection                                                                       |
-| `Ctrl+B`                     | Toggle bold                                                                            |
-| `Ctrl+I`                     | Toggle italic (alternate binding when terminal reserves this for Tab)                  |
-| `Ctrl+Shift+X`               | Strikethrough                                                                          |
-| `Ctrl+E`                     | Inline code                                                                            |
-| `Ctrl+K`                     | Link popover                                                                           |
-| `Ctrl+F`                     | Find rendered text                                                                     |
-| `Ctrl+H`                     | Replace rendered text                                                                  |
-| `Ctrl+S`                     | Save                                                                                   |
-| `Ctrl+Z`                     | Undo                                                                                   |
-| `Ctrl+Shift+Z` / `Ctrl+Y`    | Redo                                                                                   |
-| `Ctrl+P`                     | Command palette                                                                        |
-| `Alt+[` / `Alt+]`            | Decrease/increase document width                                                       |
-| `Ctrl+Alt+Left/Right`        | Decrease/increase document width                                                       |
-| `Space` on checkbox atom     | Toggle checkbox                                                                        |
-| Click on link                | Place cursor inside link text                                                          |
-| `Ctrl+Click` / `Cmd+Click`   | Open link externally                                                                   |
-| `Tab` in table               | Next cell (creates new row at the last cell)                                           |
-| `Shift+Tab` in table         | Previous cell                                                                          |
-| `Tab` in list                | Indent list item                                                                       |
-| `Ctrl+Enter` in table        | Insert row after current                                                               |
-| `Ctrl+Shift+Enter` in table  | Insert row before current                                                              |
-| `Alt+Arrow` in table         | Move cell focus without editing text                                                   |
+| Key | Required behavior |
+| --- | --- |
+| Printable char | Insert at selection/cursor |
+| i | Insert literal i (no special mode meaning) |
+| Enter | Split block; create list item; create table row/cell paragraph depending on context |
+| Backspace | Delete selection or previous grapheme/structural boundary |
+| Delete | Delete selection or next grapheme/structural boundary |
+| Arrow keys | Move cursor by grapheme / line / block as appropriate |
+| Ctrl+Arrow | Word movement; in tables, add row/column in arrow direction |
+| Shift+Arrow | Extend selection |
+| Ctrl+B | Toggle bold |
+| Ctrl+I | Toggle italic (alternate binding when terminal reserves this for Tab) |
+| Ctrl+Shift+X | Strikethrough |
+| Ctrl+E | Inline code |
+| Ctrl+K | Link popover |
+| Ctrl+F | Find rendered text |
+| Ctrl+H | Replace rendered text |
+| Ctrl+S | Save |
+| Ctrl+Z | Undo |
+| Ctrl+Shift+Z / Ctrl+Y | Redo |
+| Ctrl+P | Command palette |
+| Alt+[ / Alt+] | Decrease/increase document width |
+| Ctrl+Alt+Left/Right | Decrease/increase document width |
+| Space on checkbox atom | Toggle checkbox |
+| Click on link | Place cursor inside link text |
+| Ctrl+Click / Cmd+Click | Open link externally |
+| Tab in table | Next cell (creates new row at the last cell) |
+| Shift+Tab in table | Previous cell |
+| Tab in list | Indent list item |
+| Ctrl+Enter in table | Insert row after current |
+| Ctrl+Shift+Enter in table | Insert row before current |
+| Alt+Arrow in table | Move cell focus without editing text |
 
 ---
 
@@ -696,18 +707,18 @@ Printable text inserts at the cursor immediately. Typing replaces a non-empty se
 
 ### Backspace
 
-| Context                          | Behavior                                                                                  |
-| -------------------------------- | ----------------------------------------------------------------------------------------- |
-| Non-empty selection              | Delete rendered selection structurally                                                    |
-| Middle of text                   | Delete previous grapheme                                                                  |
-| Start of paragraph               | Merge with previous block if compatible                                                   |
-| Start of heading                 | Convert to paragraph or merge per command intent                                          |
-| Start of first list item         | Unwrap list item to paragraph                                                             |
-| Start of later list item         | Merge with previous item                                                                  |
-| Empty list item                  | Exit or remove list item                                                                  |
-| Start of table cell              | Move to previous cell or merge cell content per command — never delete the table border  |
-| Start of code line               | Delete previous grapheme/line break inside code block                                     |
-| Before/after raw HTML atom       | Delete or select the atom by explicit command; do not enter a hidden HTML renderer        |
+| Context | Behavior |
+| --- | --- |
+| Non-empty selection | Delete rendered selection structurally |
+| Middle of text | Delete previous grapheme |
+| Start of paragraph | Merge with previous block if compatible |
+| Start of heading | Convert to paragraph or merge per command intent |
+| Start of first list item | Unwrap list item to paragraph |
+| Start of later list item | Merge with previous item |
+| Empty list item | Exit or remove list item |
+| Start of table cell | Move to previous cell or merge cell content per command — never delete the table border |
+| Start of code line | Delete previous grapheme/line break inside code block |
+| Before/after raw HTML atom | Delete or select the atom by explicit command; do not enter a hidden HTML renderer |
 
 ### Delete
 
@@ -715,18 +726,18 @@ Mirrors Backspace forward.
 
 ### Enter
 
-| Context                       | Behavior                                                                                |
-| ----------------------------- | --------------------------------------------------------------------------------------- |
-| Paragraph                     | Split paragraph                                                                         |
-| Heading                       | Split; text after cursor becomes paragraph (unless configured otherwise)                |
-| Empty heading                 | Convert to paragraph                                                                    |
-| List item with content        | Create next item of same kind                                                           |
-| Empty list item               | Exit list or outdent                                                                    |
-| Task list item                | Create next task item, unchecked                                                        |
-| Block quote                   | Create new quoted paragraph; empty quoted line exits quote                              |
-| Table cell                    | Insert newline inside cell when multi-line cells enabled, otherwise move/create per key |
-| Code block                    | Insert newline inside code block                                                        |
-| Raw HTML atom                 | Open raw edit command only when explicitly requested; Enter otherwise moves past atom     |
+| Context | Behavior |
+| --- | --- |
+| Paragraph | Split paragraph |
+| Heading | Split; text after cursor becomes paragraph (unless configured otherwise) |
+| Empty heading | Convert to paragraph |
+| List item with content | Create next item of same kind |
+| Empty list item | Exit list or outdent |
+| Task list item | Create next task item, unchecked |
+| Block quote | Create new quoted paragraph; empty quoted line exits quote |
+| Table cell | Insert newline inside cell when multi-line cells enabled, otherwise move/create per key |
+| Code block | Insert newline inside code block |
+| Raw HTML atom | Open raw edit command only when explicitly requested; Enter otherwise moves past atom |
 
 ### Paste
 
@@ -921,12 +932,12 @@ No marker text (`-`, `1.`, `[ ]`) may ever leak into the editable text after the
 
 ## 17. Headings and Kitty Graphics
 
-| Level | Visual treatment                                                                                         |
-| ----- | -------------------------------------------------------------------------------------------------------- |
-| H1    | Two terminal rows tall via Kitty Graphics; amber raster fill/shadow; extra top spacing                   |
-| H2    | Two terminal rows tall via Kitty Graphics; slightly smaller raster; amber underline or divider treatment |
-| H3    | Bold/accent styled text                                                                                  |
-| H4–H6 | Muted accent with small prefix/adornment                                                                 |
+| Level | Visual treatment |
+| --- | --- |
+| H1 | Two terminal rows tall via Kitty Graphics; amber raster fill/shadow; extra top spacing |
+| H2 | Two terminal rows tall via Kitty Graphics; slightly smaller raster; amber underline or divider treatment |
+| H3 | Bold/accent styled text |
+| H4–H6 | Muted accent with small prefix/adornment |
 
 H1 and H2 are not implemented with Kitty Text Sizing Protocol, OSC-66, font-size escapes, terminal zooming, or any source-level ASCII art. They are rendered as image placements created by the editor and sent through the Kitty Graphics Protocol.
 

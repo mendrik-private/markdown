@@ -514,10 +514,8 @@ impl Editor {
             Cursor::TableCell { offset: 0, .. } => self.move_table_prev_cell(),
             _ if self.clamped_cursor_offset() > 0 => {
                 self.record_undo();
-                let old = self.active_text();
                 let offset = self.clamped_cursor_offset();
-                let new = delete_range_chars(&old, offset.saturating_sub(1), offset);
-                let change = self.set_active_text(new);
+                let change = self.delete_active_text_range(offset.saturating_sub(1), offset);
                 self.apply_active_text_change(change, offset.saturating_sub(1));
                 self.document.version += 1;
             }
@@ -538,11 +536,9 @@ impl Editor {
             return;
         }
         let offset = self.clamped_cursor_offset();
-        let old = self.active_text();
-        if offset < char_len(&old) {
+        if offset < self.active_text_len() {
             self.record_undo();
-            let new = delete_range_chars(&old, offset, offset + 1);
-            let change = self.set_active_text(new);
+            let change = self.delete_active_text_range(offset, offset + 1);
             self.apply_active_text_change(change, offset);
             self.document.version += 1;
         }
@@ -586,6 +582,7 @@ impl Editor {
         if start == end {
             return;
         }
+        let (start, end) = self.expanded_style_clear_range(start, end);
         self.record_undo();
         match selection.anchor {
             Cursor::Text { block, .. } => {
@@ -616,6 +613,9 @@ impl Editor {
             }
             Cursor::Checkbox { .. } => {}
         }
+        let selection = expanded_selection(selection, start, end);
+        self.selection = Some(selection);
+        self.cursor = selection.head;
         self.document.version += 1;
     }
 
@@ -1215,9 +1215,7 @@ impl Editor {
             return;
         };
         self.cursor = selection.anchor;
-        let old = self.active_text();
-        let new = delete_range_chars(&old, start, end);
-        let change = self.set_active_text(new);
+        let change = self.delete_active_text_range(start, end);
         self.apply_active_text_change(change, start);
         self.show_style_popover = false;
         self.document.version += 1;
@@ -1260,6 +1258,60 @@ impl Editor {
             Cursor::Checkbox { .. } => {}
         }
         self.document.version += 1;
+    }
+
+    fn expanded_style_clear_range(&self, start: usize, end: usize) -> (usize, usize) {
+        let chunks = match self.cursor {
+            Cursor::Text { block, .. } => {
+                self.document.blocks.get(block).and_then(block_style_chunks)
+            }
+            Cursor::ListItem { block, item, .. } => self
+                .document
+                .blocks
+                .get(block)
+                .and_then(|block| list_item_style_chunks(block, item)),
+            Cursor::TableCell {
+                block, row, col, ..
+            } => self
+                .document
+                .blocks
+                .get(block)
+                .and_then(|block| table_cell_style_chunks(block, row, col)),
+            Cursor::Checkbox { .. } => None,
+        };
+        chunks.as_deref().map_or((start, end), |chunks| {
+            expand_style_clear_range(chunks, start, end)
+        })
+    }
+
+    fn delete_active_text_range(&mut self, start: usize, end: usize) -> ActiveTextChange {
+        match self.cursor {
+            Cursor::Text { block, .. } => {
+                delete_range_in_block(&mut self.document.blocks, block, start, end)
+            }
+            Cursor::ListItem { block, item, .. } => {
+                if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
+                    && let Some(list_item) = list.items.get_mut(item)
+                {
+                    delete_range_in_list_item(list_item, start, end);
+                }
+                ActiveTextChange::Updated
+            }
+            Cursor::TableCell {
+                block, row, col, ..
+            } => {
+                if let Some(Block::Table(table)) = self.document.blocks.get_mut(block)
+                    && let Some(cell) = table
+                        .rows
+                        .get_mut(row)
+                        .and_then(|row| row.cells.get_mut(col))
+                {
+                    delete_range_in_table_cell(cell, start, end);
+                }
+                ActiveTextChange::Updated
+            }
+            Cursor::Checkbox { .. } => ActiveTextChange::Updated,
+        }
     }
 
     fn insert_table_row(&mut self, block: usize, index: usize) {
@@ -1613,6 +1665,40 @@ fn offset(cursor: Cursor) -> usize {
     }
 }
 
+fn cursor_with_offset(cursor: Cursor, offset: usize) -> Cursor {
+    match cursor {
+        Cursor::Text { block, .. } => Cursor::Text { block, offset },
+        Cursor::ListItem { block, item, .. } => Cursor::ListItem {
+            block,
+            item,
+            offset,
+        },
+        Cursor::TableCell {
+            block, row, col, ..
+        } => Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        },
+        Cursor::Checkbox { block, item } => Cursor::Checkbox { block, item },
+    }
+}
+
+fn expanded_selection(selection: Selection, start: usize, end: usize) -> Selection {
+    if offset(selection.anchor) <= offset(selection.head) {
+        Selection {
+            anchor: cursor_with_offset(selection.anchor, start),
+            head: cursor_with_offset(selection.head, end),
+        }
+    } else {
+        Selection {
+            anchor: cursor_with_offset(selection.anchor, end),
+            head: cursor_with_offset(selection.head, start),
+        }
+    }
+}
+
 fn wrap_block_range(block: &mut Block, start: usize, end: usize, mark: InlineMark) {
     if start >= end {
         return;
@@ -1628,6 +1714,35 @@ fn wrap_block_range(block: &mut Block, start: usize, end: usize, mark: InlineMar
     let remove = selection_fully_marked(&chunks, start, end, mark);
     let next = apply_mark_to_chunks(&chunks, start, end, mark, remove);
     *inlines = chunks_to_inlines(&next);
+}
+
+fn block_style_chunks(block: &Block) -> Option<Vec<InlineChunk>> {
+    match block {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => Some(inline_chunks(inlines)),
+        _ => None,
+    }
+}
+
+fn list_item_style_chunks(block: &Block, item: usize) -> Option<Vec<InlineChunk>> {
+    let Block::List(list) = block else {
+        return None;
+    };
+    let list_item = list.items.get(item)?;
+    let [Block::Paragraph(inlines)] = list_item.blocks.as_slice() else {
+        return None;
+    };
+    Some(inline_chunks(inlines))
+}
+
+fn table_cell_style_chunks(block: &Block, row: usize, col: usize) -> Option<Vec<InlineChunk>> {
+    let Block::Table(table) = block else {
+        return None;
+    };
+    let cell = table.rows.get(row)?.cells.get(col)?;
+    let [Block::Paragraph(inlines)] = cell.blocks.as_slice() else {
+        return None;
+    };
+    Some(inline_chunks(inlines))
 }
 
 fn clear_block_styles(block: &mut Block, start: usize, end: usize) {
@@ -1651,6 +1766,84 @@ fn clear_block_styles(block: &mut Block, start: usize, end: usize) {
         }
         _ => {}
     }
+}
+
+fn delete_range_in_block(
+    blocks: &mut Vec<Block>,
+    block: usize,
+    start: usize,
+    end: usize,
+) -> ActiveTextChange {
+    let Some(kind) = blocks.get(block) else {
+        return ActiveTextChange::Updated;
+    };
+    match kind {
+        Block::Paragraph(_) | Block::Heading { .. } => {
+            if let Some(inlines) = paragraph_like_inlines_mut(blocks.get_mut(block)) {
+                let chunks = inline_chunks(inlines);
+                *inlines = chunks_to_inlines(&delete_range_in_chunks(&chunks, start, end));
+            }
+            ActiveTextChange::Updated
+        }
+        Block::CodeBlock { .. } => {
+            let next = blocks.get(block).and_then(|block| match block {
+                Block::CodeBlock { text, .. } => Some(delete_range_chars(text, start, end)),
+                _ => None,
+            });
+            if let Some(Block::CodeBlock { text: code, .. }) = blocks.get_mut(block) {
+                *code = next.unwrap_or_default();
+            }
+            ActiveTextChange::Updated
+        }
+        Block::ImageBlock { .. } => {
+            let next = blocks.get(block).and_then(|block| match block {
+                Block::ImageBlock { alt, .. } => Some(delete_range_chars(alt, start, end)),
+                _ => None,
+            });
+            if let Some(Block::ImageBlock {
+                alt: current_alt, ..
+            }) = blocks.get_mut(block)
+            {
+                *current_alt = next.unwrap_or_default();
+            }
+            ActiveTextChange::Updated
+        }
+        Block::ThematicBreak => set_block_text(blocks, block, String::new()),
+        _ => ActiveTextChange::Updated,
+    }
+}
+
+fn delete_range_in_list_item(list_item: &mut ListItem, start: usize, end: usize) {
+    let [Block::Paragraph(inlines)] = list_item.blocks.as_mut_slice() else {
+        let next = delete_range_chars(&list_item.rendered_text(), start, end);
+        set_list_item_text(list_item, next);
+        return;
+    };
+    let chunks = inline_chunks(inlines);
+    let shared_link = shared_link_meta(&chunks);
+    let next = delete_range_in_chunks(&chunks, start, end);
+    if let Some(link) = shared_link {
+        let children = chunks_to_inlines_without_link(&next);
+        *inlines = vec![Inline::Link {
+            target: link.target,
+            title: link.title,
+            children: if children.is_empty() {
+                vec![Inline::Text(String::new())]
+            } else {
+                children
+            },
+        }];
+    } else {
+        *inlines = chunks_to_inlines(&next);
+    }
+}
+
+fn delete_range_in_table_cell(cell: &mut TableCell, start: usize, end: usize) {
+    let [Block::Paragraph(inlines)] = cell.blocks.as_mut_slice() else {
+        return;
+    };
+    let chunks = inline_chunks(inlines);
+    *inlines = chunks_to_inlines(&delete_range_in_chunks(&chunks, start, end));
 }
 
 fn wrap_block_link(block: &mut Block, start: usize, end: usize, target: &str) {
@@ -1897,6 +2090,59 @@ fn clear_styles_in_chunks(chunks: &[InlineChunk], start: usize, end: usize) -> V
     out
 }
 
+fn delete_range_in_chunks(chunks: &[InlineChunk], start: usize, end: usize) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end <= overlap_start {
+            push_inline_chunk(
+                &mut out,
+                chunk.text.clone(),
+                chunk.marks,
+                chunk.link.as_ref(),
+            );
+            offset = chunk_end;
+            continue;
+        }
+
+        let leading = overlap_start.saturating_sub(offset);
+        let removed = overlap_end - overlap_start;
+        let (prefix, rest) = split_chars(&chunk.text, leading);
+        let (_, suffix) = split_chars(&rest, removed);
+
+        if !prefix.is_empty() {
+            push_inline_chunk(&mut out, prefix, chunk.marks, chunk.link.as_ref());
+        }
+        if !suffix.is_empty() {
+            push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
+        }
+        offset = chunk_end;
+    }
+    out
+}
+
+fn expand_style_clear_range(chunks: &[InlineChunk], start: usize, end: usize) -> (usize, usize) {
+    let mut expanded_start = start;
+    let mut expanded_end = end;
+    let mut offset = 0usize;
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end > overlap_start && chunk_has_styles(chunk) {
+            expanded_start = expanded_start.min(offset);
+            expanded_end = expanded_end.max(chunk_end);
+        }
+        offset = chunk_end;
+    }
+    (expanded_start, expanded_end)
+}
+
 fn apply_link_to_chunks(
     chunks: &[InlineChunk],
     start: usize,
@@ -1975,6 +2221,52 @@ fn chunk_mark_enabled(marks: ActiveMarks, mark: InlineMark) -> bool {
         InlineMark::Code => marks.code,
         InlineMark::Superscript => marks.superscript,
         InlineMark::Subscript => marks.subscript,
+    }
+}
+
+fn chunk_has_styles(chunk: &InlineChunk) -> bool {
+    chunk.link.is_some()
+        || chunk.marks.emphasis
+        || chunk.marks.strong
+        || chunk.marks.strike
+        || chunk.marks.code
+        || chunk.marks.superscript
+        || chunk.marks.subscript
+}
+
+fn shared_link_meta(chunks: &[InlineChunk]) -> Option<LinkMeta> {
+    let mut shared = None;
+    for chunk in chunks {
+        let Some(link) = &chunk.link else {
+            return None;
+        };
+        if let Some(existing) = &shared {
+            if existing != link {
+                return None;
+            }
+        } else {
+            shared = Some(link.clone());
+        }
+    }
+    shared
+}
+
+fn chunks_to_inlines_without_link(chunks: &[InlineChunk]) -> Vec<Inline> {
+    let stripped: Vec<_> = chunks
+        .iter()
+        .map(|chunk| InlineChunk {
+            text: chunk.text.clone(),
+            marks: chunk.marks,
+            link: None,
+        })
+        .collect();
+    chunks_to_inlines(&stripped)
+}
+
+fn paragraph_like_inlines_mut(block: Option<&mut Block>) -> Option<&mut Vec<Inline>> {
+    match block? {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => Some(inlines),
+        _ => None,
     }
 }
 
@@ -2192,6 +2484,32 @@ mod tests {
     }
 
     #[test]
+    fn clear_styles_expands_to_styled_boundaries() {
+        let mut editor = paragraph_editor(vec![
+            Inline::Strong(vec![Inline::Text("abc".to_string())]),
+            Inline::Text("d".to_string()),
+        ]);
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 1,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 2,
+            },
+        );
+
+        editor.clear_styles();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("abcd".to_string())])]
+        );
+        assert_eq!(editor.selection.and_then(same_owner_offsets), Some((0, 3)));
+    }
+
+    #[test]
     fn toggle_block_quote_wraps_and_unwraps_current_block() {
         let mut editor = paragraph_editor(vec![Inline::Text("quoted".to_string())]);
         editor.select_all();
@@ -2323,6 +2641,49 @@ mod tests {
 
         assert!(editor.document.version > version);
         assert_eq!(editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
+    fn backspace_into_styled_text_preserves_remaining_styles() {
+        let mut editor = paragraph_editor(vec![
+            Inline::Text("a".to_string()),
+            Inline::Strong(vec![Inline::Text("bc".to_string())]),
+        ]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 1,
+        });
+
+        editor.backspace();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Strong(vec![Inline::Text(
+                "bc".to_string()
+            )])])]
+        );
+    }
+
+    #[test]
+    fn delete_into_styled_text_preserves_remaining_styles() {
+        let mut editor = paragraph_editor(vec![
+            Inline::Text("a".to_string()),
+            Inline::Strong(vec![Inline::Text("bc".to_string())]),
+        ]);
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 1,
+        });
+
+        editor.delete();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Text("a".to_string()),
+                Inline::Strong(vec![Inline::Text("c".to_string())]),
+            ])]
+        );
     }
 
     #[test]
@@ -2502,6 +2863,46 @@ mod tests {
                         target: "#section".to_string(),
                         title: None,
                         children: vec![Inline::Text("ection".to_string())],
+                    }])],
+                }],
+            })]
+        );
+    }
+
+    #[test]
+    fn deleting_entire_internal_link_list_item_text_preserves_link_target() {
+        let mut editor = Editor::new(Document::new(vec![Block::List(List {
+            ordered: true,
+            tight: false,
+            items: vec![ListItem {
+                checked: None,
+                blocks: vec![Block::Paragraph(vec![Inline::Link {
+                    target: "#section".to_string(),
+                    title: None,
+                    children: vec![Inline::Text("Section".to_string())],
+                }])],
+            }],
+        })]));
+        editor.set_cursor(Cursor::ListItem {
+            block: 0,
+            item: 0,
+            offset: 0,
+        });
+        editor.select_all();
+
+        editor.delete();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::List(List {
+                ordered: true,
+                tight: false,
+                items: vec![ListItem {
+                    checked: None,
+                    blocks: vec![Block::Paragraph(vec![Inline::Link {
+                        target: "#section".to_string(),
+                        title: None,
+                        children: vec![Inline::Text(String::new())],
                     }])],
                 }],
             })]
