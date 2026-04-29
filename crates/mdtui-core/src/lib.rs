@@ -92,6 +92,45 @@ impl Block {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditableBlockFallback {
+    pub placeholder: &'static str,
+}
+
+pub fn editable_block_fallback(block: &Block) -> Option<EditableBlockFallback> {
+    match block {
+        Block::ThematicBreak => Some(EditableBlockFallback { placeholder: "-" }),
+        _ => None,
+    }
+}
+
+pub fn default_cursor_for_block(block: usize, doc_block: &Block) -> Option<Cursor> {
+    match doc_block {
+        Block::Paragraph(_)
+        | Block::Heading { .. }
+        | Block::BlockQuote(_)
+        | Block::CodeBlock { .. }
+        | Block::ThematicBreak
+        | Block::ImageBlock { .. }
+        | Block::HtmlBlock(_)
+        | Block::Frontmatter(_) => Some(Cursor::Text { block, offset: 0 }),
+        Block::List(list) => list.items.first().map(|_| Cursor::ListItem {
+            block,
+            item: 0,
+            offset: 0,
+        }),
+        Block::Table(table) => {
+            let (rows, cols) = table.dimensions();
+            (rows > 0 && cols > 0).then_some(Cursor::TableCell {
+                block,
+                row: 0,
+                col: 0,
+                offset: 0,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Inline {
     Text(String),
@@ -409,6 +448,7 @@ impl Editor {
         if self.focus != UiFocus::Document {
             return;
         }
+        self.normalize_checkbox_cursor();
         let text = ch.to_string();
         if self.delete_selection_if_any() {
             self.insert_text_at_cursor(&text);
@@ -449,7 +489,14 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.normalize_checkbox_cursor();
         if self.delete_selection_if_any() {
+            return;
+        }
+        if self.active_block_fallback().is_some() {
+            self.record_undo();
+            let change = self.set_active_text(String::new());
+            self.apply_active_text_change(change, 0);
             return;
         }
 
@@ -465,15 +512,22 @@ impl Editor {
                 let old = self.active_text();
                 let offset = self.cursor_offset();
                 let new = delete_range_chars(&old, offset.saturating_sub(1), offset);
-                self.set_active_text(new);
-                self.cursor = self.with_offset(offset.saturating_sub(1));
+                let change = self.set_active_text(new);
+                self.apply_active_text_change(change, offset.saturating_sub(1));
             }
             _ => {}
         }
     }
 
     pub fn delete(&mut self) {
+        self.normalize_checkbox_cursor();
         if self.delete_selection_if_any() {
+            return;
+        }
+        if self.active_block_fallback().is_some() {
+            self.record_undo();
+            let change = self.set_active_text(String::new());
+            self.apply_active_text_change(change, 0);
             return;
         }
         let offset = self.cursor_offset();
@@ -481,7 +535,8 @@ impl Editor {
         if offset < char_len(&old) {
             self.record_undo();
             let new = delete_range_chars(&old, offset, offset + 1);
-            self.set_active_text(new);
+            let change = self.set_active_text(new);
+            self.apply_active_text_change(change, offset);
         }
     }
 
@@ -662,6 +717,87 @@ impl Editor {
         }
     }
 
+    pub fn insert_block_at(&mut self, index: usize, block: Block, cursor: Cursor) {
+        self.record_undo();
+        let insert_at = index.min(self.document.blocks.len());
+        self.document.blocks.insert(insert_at, block);
+        self.cursor = cursor;
+        self.selection = None;
+        self.show_style_popover = false;
+        self.document.version += 1;
+    }
+
+    pub fn remove_current_table_row(&mut self) -> bool {
+        let Cursor::TableCell {
+            block, row, col, ..
+        } = self.cursor
+        else {
+            return false;
+        };
+        let Some(Block::Table(table)) = self.document.blocks.get(block) else {
+            return false;
+        };
+        if table.rows.len() <= 1 {
+            return false;
+        }
+        self.record_undo();
+        let Some(Block::Table(table)) = self.document.blocks.get_mut(block) else {
+            return false;
+        };
+        table.rows.remove(row);
+        let next_row = row.min(table.rows.len().saturating_sub(1));
+        let next_col = col.min(table.rows[next_row].cells.len().saturating_sub(1));
+        self.cursor = Cursor::TableCell {
+            block,
+            row: next_row,
+            col: next_col,
+            offset: 0,
+        };
+        self.selection = None;
+        self.show_style_popover = false;
+        self.document.version += 1;
+        true
+    }
+
+    pub fn remove_current_table_column(&mut self) -> bool {
+        let Cursor::TableCell {
+            block, row, col, ..
+        } = self.cursor
+        else {
+            return false;
+        };
+        let Some(Block::Table(table)) = self.document.blocks.get(block) else {
+            return false;
+        };
+        let cols = table.dimensions().1;
+        if cols <= 1 {
+            return false;
+        }
+        self.record_undo();
+        let Some(Block::Table(table)) = self.document.blocks.get_mut(block) else {
+            return false;
+        };
+        for current_row in &mut table.rows {
+            if col < current_row.cells.len() {
+                current_row.cells.remove(col);
+            }
+        }
+        if col < table.alignments.len() {
+            table.alignments.remove(col);
+        }
+        let next_col = col.min(cols.saturating_sub(2));
+        self.cursor = Cursor::TableCell {
+            block,
+            row: row.min(table.rows.len().saturating_sub(1)),
+            col: next_col,
+            offset: 0,
+        };
+        self.selection = None;
+        self.show_style_popover = false;
+        self.document.version += 1;
+        true
+    }
+
     pub fn undo(&mut self) {
         if let Some(snapshot) = self.undo.pop() {
             let current = self.snapshot();
@@ -687,7 +823,7 @@ impl Editor {
 
     pub fn active_text(&self) -> String {
         match self.cursor {
-            Cursor::Text { block, .. } => text_of_block(self.document.blocks.get(block)),
+            Cursor::Text { block, .. } => editable_text_of_block(self.document.blocks.get(block)),
             Cursor::ListItem { block, item, .. } => self
                 .document
                 .blocks
@@ -866,6 +1002,29 @@ impl Editor {
         self.cursor = next;
     }
 
+    fn active_block_fallback(&self) -> Option<EditableBlockFallback> {
+        let Cursor::Text { block, .. } = self.cursor else {
+            return None;
+        };
+        self.document
+            .blocks
+            .get(block)
+            .and_then(editable_block_fallback)
+    }
+
+    fn apply_active_text_change(&mut self, change: ActiveTextChange, offset: usize) {
+        match change {
+            ActiveTextChange::Updated => {
+                self.cursor = self.with_offset(offset.min(self.active_text_len()));
+            }
+            ActiveTextChange::Deleted(cursor) => {
+                self.cursor = cursor;
+                self.selection = None;
+                self.show_style_popover = false;
+            }
+        }
+    }
+
     fn next_text_cursor(&self) -> Cursor {
         let Cursor::Text { block, .. } = self.cursor else {
             return self.cursor;
@@ -888,25 +1047,33 @@ impl Editor {
     }
 
     fn insert_text_at_cursor(&mut self, text: &str) {
-        let old = self.active_text();
-        let offset = self.cursor_offset();
-        let new = insert_chars(&old, offset, text);
-        self.set_active_text(new);
-        self.cursor = self.with_offset(offset + char_len(text));
+        let (change, new_offset) = if self.active_block_fallback().is_some() {
+            (self.set_active_text(text.to_string()), char_len(text))
+        } else {
+            let old = self.active_text();
+            let offset = self.cursor_offset();
+            let new = insert_chars(&old, offset, text);
+            (
+                self.set_active_text(new),
+                offset.saturating_add(char_len(text)),
+            )
+        };
+        self.apply_active_text_change(change, new_offset);
         self.selection = None;
         self.show_style_popover = false;
         self.document.version += 1;
     }
 
-    fn set_active_text(&mut self, text: String) {
+    fn set_active_text(&mut self, text: String) -> ActiveTextChange {
         match self.cursor {
-            Cursor::Text { block, .. } => set_block_text(self.document.blocks.get_mut(block), text),
+            Cursor::Text { block, .. } => set_block_text(&mut self.document.blocks, block, text),
             Cursor::ListItem { block, item, .. } => {
                 if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
                     && let Some(list_item) = list.items.get_mut(item)
                 {
-                    list_item.blocks = vec![Block::Paragraph(vec![Inline::Text(text)])];
+                    set_list_item_text(list_item, text);
                 }
+                ActiveTextChange::Updated
             }
             Cursor::TableCell {
                 block, row, col, ..
@@ -919,13 +1086,24 @@ impl Editor {
                 {
                     cell.blocks = vec![Block::Paragraph(vec![Inline::Text(text)])];
                 }
+                ActiveTextChange::Updated
             }
-            Cursor::Checkbox { .. } => {}
+            Cursor::Checkbox { .. } => ActiveTextChange::Updated,
         }
     }
 
     fn active_text_len(&self) -> usize {
         char_len(&self.active_text())
+    }
+
+    fn normalize_checkbox_cursor(&mut self) {
+        if let Cursor::Checkbox { block, item } = self.cursor {
+            self.cursor = Cursor::ListItem {
+                block,
+                item,
+                offset: 0,
+            };
+        }
     }
 
     fn cursor_offset(&self) -> usize {
@@ -981,8 +1159,8 @@ impl Editor {
         self.cursor = selection.anchor;
         let old = self.active_text();
         let new = delete_range_chars(&old, start, end);
-        self.set_active_text(new);
-        self.cursor = self.with_offset(start);
+        let change = self.set_active_text(new);
+        self.apply_active_text_change(change, start);
         self.show_style_popover = false;
         self.document.version += 1;
     }
@@ -1252,17 +1430,100 @@ fn byte_index(text: &str, at: usize) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
-fn text_of_block(block: Option<&Block>) -> String {
-    block.map_or_else(String::new, Block::rendered_text)
+enum ActiveTextChange {
+    Updated,
+    Deleted(Cursor),
 }
 
-fn set_block_text(block: Option<&mut Block>, text: String) {
-    match block {
-        Some(Block::Paragraph(inlines)) => *inlines = vec![Inline::Text(text)],
-        Some(Block::Heading { inlines, .. }) => *inlines = vec![Inline::Text(text)],
-        Some(Block::CodeBlock { text: code, .. }) => *code = text,
-        Some(_) | None => {}
+fn editable_text_of_block(block: Option<&Block>) -> String {
+    block.map_or_else(String::new, |block| {
+        editable_block_fallback(block).map_or_else(
+            || block.rendered_text(),
+            |fallback| fallback.placeholder.to_string(),
+        )
+    })
+}
+
+fn set_block_text(blocks: &mut Vec<Block>, block: usize, text: String) -> ActiveTextChange {
+    let Some(current) = blocks.get(block) else {
+        return ActiveTextChange::Updated;
+    };
+    match current {
+        Block::Paragraph(_) => {
+            if let Some(Block::Paragraph(inlines)) = blocks.get_mut(block) {
+                *inlines = vec![Inline::Text(text)];
+            }
+            ActiveTextChange::Updated
+        }
+        Block::Heading { .. } => {
+            if let Some(Block::Heading { inlines, .. }) = blocks.get_mut(block) {
+                *inlines = vec![Inline::Text(text)];
+            }
+            ActiveTextChange::Updated
+        }
+        Block::CodeBlock { .. } => {
+            if let Some(Block::CodeBlock { text: code, .. }) = blocks.get_mut(block) {
+                *code = text;
+            }
+            ActiveTextChange::Updated
+        }
+        Block::ImageBlock { .. } => {
+            if let Some(Block::ImageBlock { alt, .. }) = blocks.get_mut(block) {
+                *alt = text;
+            }
+            ActiveTextChange::Updated
+        }
+        Block::ThematicBreak => {
+            if text.is_empty() {
+                remove_block(blocks, block)
+            } else if editable_block_fallback(current)
+                .is_some_and(|fallback| text == fallback.placeholder)
+            {
+                ActiveTextChange::Updated
+            } else {
+                blocks[block] = Block::Paragraph(vec![Inline::Text(text)]);
+                ActiveTextChange::Updated
+            }
+        }
+        _ => ActiveTextChange::Updated,
     }
+}
+
+fn set_list_item_text(list_item: &mut ListItem, text: String) {
+    if let [Block::Paragraph(inlines)] = list_item.blocks.as_mut_slice()
+        && let [Inline::Link { children, .. }] = inlines.as_mut_slice()
+    {
+        *children = vec![Inline::Text(text)];
+        return;
+    }
+    list_item.blocks = vec![Block::Paragraph(vec![Inline::Text(text)])];
+}
+
+fn remove_block(blocks: &mut Vec<Block>, block: usize) -> ActiveTextChange {
+    if block < blocks.len() {
+        blocks.remove(block);
+    }
+    if blocks.is_empty() {
+        blocks.push(Block::Paragraph(vec![Inline::Text(String::new())]));
+        return ActiveTextChange::Deleted(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+    }
+    let forward = block.min(blocks.len().saturating_sub(1));
+    if let Some(cursor) = default_cursor_for_block(forward, &blocks[forward]) {
+        return ActiveTextChange::Deleted(cursor);
+    }
+    for index in (0..forward).rev() {
+        if let Some(cursor) = default_cursor_for_block(index, &blocks[index]) {
+            return ActiveTextChange::Deleted(cursor);
+        }
+    }
+    blocks.insert(0, Block::Paragraph(vec![Inline::Text(String::new())]));
+    ActiveTextChange::Deleted(Cursor::Text {
+        block: 0,
+        offset: 0,
+    })
 }
 
 fn same_owner_offsets(selection: Selection) -> Option<(usize, usize)> {
@@ -1838,6 +2099,223 @@ mod tests {
             vec![Block::Paragraph(vec![Inline::Text(
                 "fn main() {}".to_string()
             )])]
+        );
+    }
+
+    #[test]
+    fn thematic_break_uses_editable_placeholder_and_deletes_cleanly() {
+        let mut editor = Editor::new(Document::new(vec![
+            Block::Paragraph(vec![Inline::Text("before".to_string())]),
+            Block::ThematicBreak,
+            Block::Paragraph(vec![Inline::Text("after".to_string())]),
+        ]));
+        editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+
+        assert_eq!(editor.active_text(), "-");
+
+        editor.delete();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![
+                Block::Paragraph(vec![Inline::Text("before".to_string())]),
+                Block::Paragraph(vec![Inline::Text("after".to_string())]),
+            ]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::Text {
+                block: 1,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn typing_on_thematic_break_turns_it_into_paragraph_text() {
+        let mut editor = Editor::new(Document::new(vec![Block::ThematicBreak]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        editor.press_char('a');
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("a".to_string())])]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: 1
+            }
+        );
+    }
+
+    #[test]
+    fn backspace_on_checkbox_cursor_unindents_list_item() {
+        let mut editor = Editor::new(Document::new(vec![Block::List(List {
+            ordered: false,
+            tight: false,
+            items: vec![ListItem {
+                checked: Some(true),
+                blocks: vec![Block::Paragraph(vec![Inline::Text("task".to_string())])],
+            }],
+        })]));
+        editor.set_cursor(Cursor::Checkbox { block: 0, item: 0 });
+
+        editor.backspace();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![Inline::Text("task".to_string())])]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn typing_on_checkbox_cursor_edits_list_item_text() {
+        let mut editor = Editor::new(Document::new(vec![Block::List(List {
+            ordered: false,
+            tight: false,
+            items: vec![ListItem {
+                checked: Some(true),
+                blocks: vec![Block::Paragraph(vec![Inline::Text("task".to_string())])],
+            }],
+        })]));
+        editor.set_cursor(Cursor::Checkbox { block: 0, item: 0 });
+
+        editor.press_char('A');
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::List(List {
+                ordered: false,
+                tight: false,
+                items: vec![ListItem {
+                    checked: Some(true),
+                    blocks: vec![Block::Paragraph(vec![Inline::Text("Atask".to_string())])],
+                }],
+            })]
+        );
+        assert_eq!(
+            editor.cursor,
+            Cursor::ListItem {
+                block: 0,
+                item: 0,
+                offset: 1
+            }
+        );
+    }
+
+    #[test]
+    fn typing_on_internal_link_list_item_preserves_link_target() {
+        let mut editor = Editor::new(Document::new(vec![Block::List(List {
+            ordered: true,
+            tight: false,
+            items: vec![ListItem {
+                checked: None,
+                blocks: vec![Block::Paragraph(vec![Inline::Link {
+                    target: "#section".to_string(),
+                    title: None,
+                    children: vec![Inline::Text("Section".to_string())],
+                }])],
+            }],
+        })]));
+        editor.set_cursor(Cursor::ListItem {
+            block: 0,
+            item: 0,
+            offset: 0,
+        });
+
+        editor.press_char('A');
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::List(List {
+                ordered: true,
+                tight: false,
+                items: vec![ListItem {
+                    checked: None,
+                    blocks: vec![Block::Paragraph(vec![Inline::Link {
+                        target: "#section".to_string(),
+                        title: None,
+                        children: vec![Inline::Text("ASection".to_string())],
+                    }])],
+                }],
+            })]
+        );
+    }
+
+    #[test]
+    fn delete_on_internal_link_list_item_preserves_link_target() {
+        let mut editor = Editor::new(Document::new(vec![Block::List(List {
+            ordered: true,
+            tight: false,
+            items: vec![ListItem {
+                checked: None,
+                blocks: vec![Block::Paragraph(vec![Inline::Link {
+                    target: "#section".to_string(),
+                    title: None,
+                    children: vec![Inline::Text("Section".to_string())],
+                }])],
+            }],
+        })]));
+        editor.set_cursor(Cursor::ListItem {
+            block: 0,
+            item: 0,
+            offset: 0,
+        });
+
+        editor.delete();
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::List(List {
+                ordered: true,
+                tight: false,
+                items: vec![ListItem {
+                    checked: None,
+                    blocks: vec![Block::Paragraph(vec![Inline::Link {
+                        target: "#section".to_string(),
+                        title: None,
+                        children: vec![Inline::Text("ection".to_string())],
+                    }])],
+                }],
+            })]
+        );
+    }
+
+    #[test]
+    fn typing_on_image_block_updates_alt_text() {
+        let mut editor = Editor::new(Document::new(vec![Block::ImageBlock {
+            src: "cover.png".to_string(),
+            alt: "Cover".to_string(),
+        }]));
+        editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        editor.press_char('!');
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::ImageBlock {
+                src: "cover.png".to_string(),
+                alt: "Cover!".to_string(),
+            }]
         );
     }
 }

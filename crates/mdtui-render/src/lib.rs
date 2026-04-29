@@ -153,7 +153,9 @@ pub fn render_document(document: &Document, options: RenderOptions) -> Rendered 
     let mut ctx = RenderContext::new(options.clone(), heading_targets(document));
     for (block_index, block) in document.blocks.iter().enumerate() {
         ctx.render_block(block_index, block);
-        if block_index + 1 < document.blocks.len() {
+        if block_index + 1 < document.blocks.len()
+            && block_gap_after(block, &document.blocks[block_index + 1])
+        {
             ctx.lines.push(String::new());
         }
     }
@@ -161,6 +163,14 @@ pub fn render_document(document: &Document, options: RenderOptions) -> Rendered 
         lines: ctx.lines,
         display: ctx.display,
         kitty_commands: ctx.kitty_commands,
+    }
+}
+
+fn block_gap_after(current: &Block, next: &Block) -> bool {
+    match current {
+        Block::Heading { level: 1 | 2, .. } => !matches!(next, Block::Heading { level: 1 | 2, .. }),
+        Block::Heading { .. } => false,
+        _ => true,
     }
 }
 
@@ -360,8 +370,24 @@ impl RenderContext {
             }
             Block::Table(table) => self.render_table(block_index, table),
             Block::ThematicBreak => {
-                self.lines
-                    .push("─".repeat(usize::from(self.options.width.min(80))));
+                let line = "─".repeat(usize::from(self.options.width.min(80)));
+                let y = self.lines.len() as u16;
+                self.display.items.push(DisplayItem {
+                    kind: DisplayKind::CursorTarget,
+                    rect: Rect {
+                        x: 0,
+                        y,
+                        width: line.chars().count() as u16,
+                        height: 1,
+                    },
+                    cursor: Some(Cursor::Text {
+                        block: block_index,
+                        offset: 0,
+                    }),
+                    action: None,
+                    text: line.clone(),
+                });
+                self.lines.push(line);
             }
             Block::ImageBlock { src, alt } => {
                 self.render_image(block_index, src, alt);
@@ -659,14 +685,15 @@ impl RenderContext {
             let title = compact(&entry.title, max_title);
             let dots = "."
                 .repeat(width.saturating_sub(title.chars().count() + number.chars().count() + 2));
-            let line = format!("{title} {dots} {number}");
+            let dots_text = format!(" {dots} ");
+            let line = format!("{title}{dots_text}{number}");
             let y = self.lines.len() as u16;
             self.display.items.push(DisplayItem {
                 kind: DisplayKind::TextRun,
                 rect: Rect {
                     x: 0,
                     y,
-                    width: line.chars().count() as u16,
+                    width: title.chars().count() as u16,
                     height: 1,
                 },
                 cursor: Some(Cursor::ListItem {
@@ -674,8 +701,35 @@ impl RenderContext {
                     item: entry.item,
                     offset: 0,
                 }),
+                action: None,
+                text: title.clone(),
+            });
+            self.display.items.push(DisplayItem {
+                kind: DisplayKind::TextRun,
+                rect: Rect {
+                    x: title.chars().count() as u16,
+                    y,
+                    width: dots_text.chars().count() as u16,
+                    height: 1,
+                },
+                cursor: None,
+                action: None,
+                text: dots_text.clone(),
+            });
+            self.display.items.push(DisplayItem {
+                kind: DisplayKind::TextRun,
+                rect: Rect {
+                    x: title
+                        .chars()
+                        .count()
+                        .saturating_add(dots_text.chars().count()) as u16,
+                    y,
+                    width: number.chars().count() as u16,
+                    height: 1,
+                },
+                cursor: None,
                 action: Some(DisplayAction::FollowLink { block: entry.block }),
-                text: line.clone(),
+                text: number.clone(),
             });
             self.lines.push(line);
         }

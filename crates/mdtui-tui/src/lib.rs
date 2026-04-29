@@ -135,13 +135,13 @@ impl App {
 
     pub fn help_popup() -> String {
         [
-            "╭─ Help ─────────────────────────────╮",
-            "│ Navigation: arrows, shift+arrows   │",
-            "│ Editing: type, enter, backspace    │",
-            "│ Tables: tab, shift+tab, ctrl+arrow │",
-            "│ Lists: enter, backspace, space     │",
-            "│ Misc: ctrl-s save, ctrl-q quit, ?  │",
-            "╰────────────────────────────────────╯",
+            "╭─ Help ───────────────────────────────╮",
+            "│ Navigation: arrows, shift+arrows     │",
+            "│ Editing: type, enter, backspace      │",
+            "│ Tables: tab, shift+tab, ctrl+arrow   │",
+            "│ Lists: enter, backspace, space       │",
+            "│ Misc: ctrl-h help, ctrl-s, ctrl-q    │",
+            "╰──────────────────────────────────────╯",
         ]
         .join("\n")
     }

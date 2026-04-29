@@ -919,6 +919,13 @@ fn top_level_blocks_have_blank_line_spacing() {
 }
 
 #[test]
+fn h1_h2_keep_gap_before_following_non_top_heading_blocks() {
+    let rendered =
+        render_document(&import_gfm("## Two\n\n### Three"), RenderOptions::default()).text();
+    assert!(rendered.contains("───\n\nThree"));
+}
+
+#[test]
 fn hyphenation_affects_visual_wrap_only_not_exported_text() {
     document_width_slider_changes_softwrap_without_changing_markdown();
 }

@@ -3,9 +3,12 @@ use std::{
     env, fs,
     io::{self, Stdout, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -24,9 +27,12 @@ use fontdue::{
     layout::{CoordinateSystem, Layout as FontLayout, LayoutSettings, TextStyle},
 };
 use image::{ColorType, ImageEncoder, Rgba, RgbaImage, codecs::png::PngEncoder};
-use mdtui_core::{Block as DocBlock, Cursor, Direction, Inline};
+use mdtui_core::{
+    Block as DocBlock, Cursor, Direction, Inline, Table, default_cursor_for_block,
+    editable_block_fallback,
+};
 use mdtui_render::{
-    DisplayAction, DisplayKind, RenderOptions, Rendered, Theme, action_at, hit_test,
+    DisplayAction, DisplayKind, RenderOptions, Rendered, Theme, action_at, hit_test_or_nearest,
     render_document,
 };
 use mdtui_tui::App;
@@ -46,6 +52,7 @@ type HeadlineRasterResult = (String, io::Result<Vec<u8>>);
 const HEADLINE_RASTER_VERSION: u32 = 9;
 const HEADLINE_DEBUG_SLAB: bool = true;
 const DOCUMENT_LEFT_PAD: u16 = 1;
+const SPECIAL_EDIT_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -99,7 +106,6 @@ struct StatusHit {
 enum StylePopupAction {
     Bold,
     Italic,
-    Strike,
     Code,
     Superscript,
     Subscript,
@@ -112,7 +118,6 @@ impl StylePopupAction {
         match self {
             Self::Bold => "Ctrl+B",
             Self::Italic => "Ctrl+I",
-            Self::Strike => "Ctrl+Shift+X",
             Self::Code => "Ctrl+E",
             Self::Superscript => "Ctrl+.",
             Self::Subscript => "Ctrl+,",
@@ -125,11 +130,10 @@ impl StylePopupAction {
         match self {
             Self::Bold => "Bold",
             Self::Italic => "Italic",
-            Self::Strike => "Strike",
             Self::Code => "Code",
             Self::Superscript => "Superscript",
             Self::Subscript => "Subscript",
-            Self::Clear => "Clear style",
+            Self::Clear => "Remove styling",
             Self::Quote => "Block quote",
         }
     }
@@ -144,10 +148,77 @@ struct StylePopupHit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct BaseRenderCacheKey {
+    version: u64,
+    options: RenderOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RenderCacheKey {
     version: u64,
     options: RenderOptions,
-    active_headline_block: Option<usize>,
+    active_fallback_block: Option<EditableTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutlineCacheKey {
+    version: u64,
+    width: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExplorerCacheKey {
+    root: PathBuf,
+    active_file: String,
+    mode: ExplorerMode,
+    collapsed_dirs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EditableTarget {
+    Block(usize),
+    ListItem { block: usize, item: usize },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingEditableTarget {
+    target: EditableTarget,
+    activate_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CursorLane {
+    Text {
+        block: usize,
+    },
+    ListItem {
+        block: usize,
+        item: usize,
+    },
+    TableCell {
+        block: usize,
+        row: usize,
+        col: usize,
+    },
+    Checkbox {
+        block: usize,
+        item: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CursorSegment {
+    start: usize,
+    end: usize,
+    x: u16,
+    y: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DisplayNavIndex {
+    rows: HashMap<u16, Vec<usize>>,
+    lanes: HashMap<CursorLane, Vec<CursorSegment>>,
+    spacer_rows: HashMap<u16, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +269,27 @@ struct FilePopupHit {
     action: FilePopupAction,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TablePopupAction {
+    RemoveRow,
+    RemoveColumn,
+}
+
+#[derive(Clone, Debug)]
+struct TablePopupHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    action: TablePopupAction,
+}
+
+#[derive(Clone, Debug)]
+struct TablePopup {
+    block: usize,
+    row: usize,
+    col: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CodeThumbDrag {
     block: usize,
@@ -231,7 +323,6 @@ struct RenderLineContext<'a> {
     state: &'a TuiState,
     rendered: &'a Rendered,
     theme: &'a Theme,
-    current_y: Option<u16>,
 }
 
 fn main() -> AppResult<()> {
@@ -291,17 +382,32 @@ struct TuiState {
     path: Option<PathBuf>,
     scroll: u16,
     preferred_column: Option<u16>,
+    cursor_row_hint: Option<u16>,
+    spacer_cursor: Option<usize>,
     wrap_width: u16,
     show_help: bool,
     dirty: bool,
     message: String,
+    pending_edit_target: Option<PendingEditableTarget>,
     last_tabs_area: Rect,
     last_doc_area: Rect,
     last_explorer_area: Rect,
     last_outline_area: Rect,
     last_status_area: Rect,
-    last_rendered: Option<Rendered>,
+    last_base_rendered: Option<Arc<Rendered>>,
+    last_base_render_key: Option<BaseRenderCacheKey>,
+    last_rendered: Option<Arc<Rendered>>,
     last_render_key: Option<RenderCacheKey>,
+    last_styled_lines: Option<Arc<Vec<Line<'static>>>>,
+    last_styled_key: Option<RenderCacheKey>,
+    last_outline_lines: Option<Arc<Vec<Line<'static>>>>,
+    last_outline_hits: Option<Arc<Vec<OutlineHit>>>,
+    last_outline_key: Option<OutlineCacheKey>,
+    last_explorer_lines: Option<Arc<Vec<Line<'static>>>>,
+    last_explorer_hits: Option<Arc<Vec<ExplorerHit>>>,
+    last_explorer_key: Option<ExplorerCacheKey>,
+    last_nav_index: Option<Arc<DisplayNavIndex>>,
+    last_nav_key: Option<RenderCacheKey>,
     drag_anchor: Option<(u16, u16)>,
     last_style_popup: Option<Rect>,
     style_popup_hits: Vec<StylePopupHit>,
@@ -321,6 +427,11 @@ struct TuiState {
     file_popup: Option<FilePopup>,
     file_popup_hits: Vec<FilePopupHit>,
     last_file_popup: Option<Rect>,
+    table_popup: Option<TablePopup>,
+    table_popup_hits: Vec<TablePopupHit>,
+    last_table_popup: Option<Rect>,
+    table_popup_selected: TablePopupAction,
+    table_popup_hover: Option<TablePopupAction>,
     code_thumb_drag: Option<CodeThumbDrag>,
     panel_scroll_drag: Option<PanelScrollDrag>,
     wrap_slider_track: Option<WrapSliderTrack>,
@@ -341,17 +452,32 @@ impl TuiState {
             path,
             scroll: 0,
             preferred_column: None,
+            cursor_row_hint: None,
+            spacer_cursor: None,
             wrap_width: 65,
             show_help: false,
             dirty: false,
-            message: "direct editing · F1/? help · Ctrl-S save · Ctrl-Q quit".to_string(),
+            message: "direct editing · Ctrl-H help · Ctrl-S save · Ctrl-Q quit".to_string(),
+            pending_edit_target: None,
             last_tabs_area: Rect::default(),
             last_doc_area: Rect::default(),
             last_explorer_area: Rect::default(),
             last_outline_area: Rect::default(),
             last_status_area: Rect::default(),
+            last_base_rendered: None,
+            last_base_render_key: None,
             last_rendered: None,
             last_render_key: None,
+            last_styled_lines: None,
+            last_styled_key: None,
+            last_outline_lines: None,
+            last_outline_hits: None,
+            last_outline_key: None,
+            last_explorer_lines: None,
+            last_explorer_hits: None,
+            last_explorer_key: None,
+            last_nav_index: None,
+            last_nav_key: None,
             drag_anchor: None,
             last_style_popup: None,
             style_popup_hits: Vec::new(),
@@ -371,6 +497,11 @@ impl TuiState {
             file_popup: None,
             file_popup_hits: Vec::new(),
             last_file_popup: None,
+            table_popup: None,
+            table_popup_hits: Vec::new(),
+            last_table_popup: None,
+            table_popup_selected: TablePopupAction::RemoveRow,
+            table_popup_hover: None,
             code_thumb_drag: None,
             panel_scroll_drag: None,
             wrap_slider_track: None,
@@ -409,6 +540,9 @@ fn run(terminal: &mut TuiTerminal, state: &mut TuiState) -> AppResult<()> {
         if drain_headline_raster_results(state) {
             needs_redraw = true;
         }
+        if maybe_activate_pending_edit_target(state) {
+            needs_redraw = true;
+        }
         if needs_redraw {
             terminal.draw(|frame| draw(frame, state))?;
             emit_kitty_headlines(terminal.backend_mut(), state)?;
@@ -427,6 +561,22 @@ fn run(terminal: &mut TuiTerminal, state: &mut TuiState) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+fn maybe_activate_pending_edit_target(state: &mut TuiState) -> bool {
+    let Some(pending) = state.pending_edit_target else {
+        return false;
+    };
+    let current = current_editable_target(state);
+    if current != Some(pending.target) {
+        state.pending_edit_target = None;
+        return false;
+    }
+    if Instant::now() < pending.activate_at {
+        return false;
+    }
+    state.pending_edit_target = None;
+    true
 }
 
 fn drain_headline_raster_results(state: &mut TuiState) -> bool {
@@ -460,7 +610,10 @@ fn should_handle_key(key: KeyEvent) -> bool {
 fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     if state.show_help {
         match key.code {
-            KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => state.show_help = false,
+            KeyCode::Esc => state.show_help = false,
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.show_help = false
+            }
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             _ => {}
         }
@@ -480,7 +633,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Char('d') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
                 open_delete_file_popup(state)
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace | KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
                 if let Some(FilePopup::NewFile { input } | FilePopup::RenameFile { input, .. }) =
                     state.file_popup.as_mut()
                 {
@@ -488,7 +641,12 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char(ch)
-                if is_plain_text_key(key) || ch == '/' || ch == '.' || ch == '-' || ch == '_' =>
+                if !ch.is_control()
+                    && (is_plain_text_key(key)
+                        || ch == '/'
+                        || ch == '.'
+                        || ch == '-'
+                        || ch == '_') =>
             {
                 if let Some(FilePopup::NewFile { input } | FilePopup::RenameFile { input, .. }) =
                     state.file_popup.as_mut()
@@ -502,14 +660,36 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         return false;
     }
 
+    if state.table_popup.is_some() {
+        match key.code {
+            KeyCode::Esc => state.table_popup = None,
+            KeyCode::Up => {
+                step_table_popup_selection(state, -1);
+                state.table_popup_hover = None;
+            }
+            KeyCode::Down => {
+                step_table_popup_selection(state, 1);
+                state.table_popup_hover = None;
+            }
+            KeyCode::Char('r') => apply_table_popup_action(state, TablePopupAction::RemoveRow),
+            KeyCode::Char('c') => apply_table_popup_action(state, TablePopupAction::RemoveColumn),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                apply_table_popup_action(state, active_table_popup_action(state))
+            }
+            _ => {}
+        }
+        state.table_popup_hits.clear();
+        return false;
+    }
+
     if has_selection(state) && state.app.editor.show_style_popover && key.modifiers.is_empty() {
         match key.code {
-            KeyCode::Left => {
+            KeyCode::Up => {
                 step_style_popup_selection(state, -1);
                 state.style_popup_hover = None;
                 return false;
             }
-            KeyCode::Right => {
+            KeyCode::Down => {
                 step_style_popup_selection(state, 1);
                 state.style_popup_hover = None;
                 return false;
@@ -522,6 +702,74 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             }
             _ => {}
         }
+    }
+
+    if let Some(insert_index) = state.spacer_cursor {
+        match key.code {
+            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 1);
+                return false;
+            }
+            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 2);
+                return false;
+            }
+            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 3);
+                return false;
+            }
+            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 4);
+                return false;
+            }
+            KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 5);
+                return false;
+            }
+            KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_heading_block(state, insert_index, 6);
+                return false;
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_table_block(state, insert_index);
+                return false;
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_code_block(state, insert_index);
+                return false;
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                insert_quote_block(state, insert_index);
+                return false;
+            }
+            KeyCode::Char(ch) if is_text_input_char(key, ch) => {
+                insert_paragraph_text(state, insert_index, &ch.to_string());
+                return false;
+            }
+            KeyCode::Char(' ') => {
+                insert_paragraph_text(state, insert_index, " ");
+                return false;
+            }
+            _ => {}
+        }
+    }
+
+    if state.spacer_cursor.is_some() && !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        clear_spacer_cursor(state);
+    }
+
+    if !matches!(key.code, KeyCode::Up | KeyCode::Down) || !key.modifiers.is_empty() {
+        state.cursor_row_hint = None;
+    }
+
+    if state.pending_edit_target.is_some()
+        && current_editable_target(state).is_some()
+        && !matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        )
+    {
+        activate_pending_edit_target_now(state);
     }
 
     match key.code {
@@ -546,7 +794,13 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             persist_view_state(state);
         }
         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            run_status_action(state, &StatusAction::ToggleHyphenation);
+            state.show_help = true
+        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(state.app.editor.cursor, Cursor::TableCell { .. }) =>
+        {
+            open_table_popup(state);
         }
         KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.app.editor.undo();
@@ -591,13 +845,17 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             state.preferred_column = None;
             state.dirty = true;
         }
-        KeyCode::F(1) | KeyCode::Char('?') => state.show_help = true,
         KeyCode::Char(' ') => {
             state.app.editor.space();
             state.preferred_column = None;
             state.dirty = true;
         }
-        KeyCode::Char(ch) if is_plain_text_key(key) => {
+        KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
+            state.app.backspace();
+            state.preferred_column = None;
+            state.dirty = true;
+        }
+        KeyCode::Char(ch) if is_text_input_char(key, ch) => {
             state.app.type_char(ch);
             state.preferred_column = None;
             state.dirty = true;
@@ -685,40 +943,163 @@ fn is_plain_text_key(key: KeyEvent) -> bool {
     key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT
 }
 
-fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
-    let Some(rendered) = &state.last_rendered else {
-        if delta < 0 {
-            state.app.editor.move_up(extend);
-        } else {
-            state.app.editor.move_down(extend);
-        }
-        return;
+fn is_text_input_char(key: KeyEvent, ch: char) -> bool {
+    is_plain_text_key(key) && !ch.is_control()
+}
+
+fn display_nav_index(state: &mut TuiState, rendered: &Rendered) -> Arc<DisplayNavIndex> {
+    if state.last_render_key.is_none()
+        || state.last_nav_key.as_ref() != state.last_render_key.as_ref()
+    {
+        let index = Arc::new(DisplayNavIndex::build(
+            &rendered.display.items,
+            &state.app.editor.document.blocks,
+        ));
+        state.last_nav_key = state.last_render_key.clone();
+        state.last_nav_index = Some(index.clone());
+        return index;
+    }
+    state.last_nav_index.clone().unwrap_or_else(|| {
+        let index = Arc::new(DisplayNavIndex::build(
+            &rendered.display.items,
+            &state.app.editor.document.blocks,
+        ));
+        state.last_nav_key = state.last_render_key.clone();
+        state.last_nav_index = Some(index.clone());
+        index
+    })
+}
+
+fn sync_navigation_render_options(state: &mut TuiState) {
+    if state.last_doc_area.width > 0 {
+        let doc_area = state.last_doc_area;
+        let doc_inner_width = doc_area
+            .width
+            .saturating_sub(4)
+            .max(24)
+            .min(state.wrap_width.max(24));
+        let headline_width = doc_area.width.saturating_sub(2).max(8);
+        state.app.render_options = RenderOptions {
+            width: doc_inner_width,
+            heading_width: headline_width,
+            kitty_graphics: state.kitty_graphics,
+            show_status: false,
+            ..state.app.render_options.clone()
+        };
+    }
+}
+
+fn current_base_render(state: &mut TuiState) -> Arc<Rendered> {
+    sync_navigation_render_options(state);
+    let base_render_key = BaseRenderCacheKey {
+        version: state.app.editor.document.version,
+        options: state.app.render_options.clone(),
     };
-    let Some((x, y)) = cursor_position(&state.app.editor.cursor, &rendered.display.items) else {
+    if state.last_base_render_key.as_ref() == Some(&base_render_key) {
+        state.last_base_rendered.clone().unwrap_or_else(|| {
+            let rendered = Arc::new(render_document(
+                &state.app.editor.document,
+                state.app.render_options.clone(),
+            ));
+            state.last_base_rendered = Some(rendered.clone());
+            rendered
+        })
+    } else {
+        let rendered = Arc::new(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        state.last_base_render_key = Some(base_render_key);
+        state.last_base_rendered = Some(rendered.clone());
+        rendered
+    }
+}
+
+fn current_navigation_render(state: &mut TuiState) -> Arc<Rendered> {
+    let base_rendered = current_base_render(state);
+
+    let render_key = RenderCacheKey {
+        version: state.app.editor.document.version,
+        options: state.app.render_options.clone(),
+        active_fallback_block: active_editable_target(state),
+    };
+    let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
+        state.last_rendered.clone().unwrap_or_else(|| {
+            if render_key.active_fallback_block.is_some() {
+                let mut rendered = base_rendered.as_ref().clone();
+                materialize_active_block_fallback(state, &mut rendered);
+                Arc::new(rendered)
+            } else {
+                base_rendered.clone()
+            }
+        })
+    } else if render_key.active_fallback_block.is_some() {
+        let mut rendered = base_rendered.as_ref().clone();
+        materialize_active_block_fallback(state, &mut rendered);
+        Arc::new(rendered)
+    } else {
+        base_rendered.clone()
+    };
+
+    state.last_render_key = Some(render_key);
+    state.last_rendered = Some(rendered.clone());
+    rendered
+}
+
+fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
+    let rendered = current_base_render(state);
+    let nav_index = display_nav_index(state, &rendered);
+    let Some((x, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
+        recover_nonvisual_cursor(state, delta, extend);
         return;
     };
     let preferred_x = state.preferred_column.unwrap_or(x);
-    let step = headline_visual_step(state, state.app.editor.cursor);
-    let mut target_y = y as i32 + delta * step;
+    let mut target_y = y as i32 + delta;
     let max_y = rendered.lines.len() as i32;
     if target_y < 0 || target_y >= max_y {
         return;
     }
     let mut target = None;
+    let mut target_row = None;
+    let mut target_spacer = None;
+    let current_block = cursor_block(state.app.editor.cursor);
     while target_y >= 0 && target_y < max_y {
         let row = target_y as u16;
-        target = nearest_cursor_on_row(preferred_x, row, &rendered.display.items)
-            .or_else(|| hit_test(preferred_x, row, &rendered.display))
-            .or_else(|| hit_test(0, row, &rendered.display));
+        if let Some(insert_index) = nav_index.spacer_rows.get(&row).copied() {
+            if delta < 0
+                && state.spacer_cursor.is_none()
+                && insert_index == current_block
+                && row > 0
+                && nav_index.spacer_rows.get(&row.saturating_sub(1)) == Some(&insert_index)
+            {
+                target_y += delta.signum();
+                continue;
+            }
+            target_spacer = Some(insert_index);
+            target_row = Some(row);
+            break;
+        }
+        target = nearest_cursor_on_row(preferred_x, row, &rendered.display, nav_index.as_ref())
+            .or_else(|| hit_test_row(preferred_x, row, &rendered.display, nav_index.as_ref()))
+            .or_else(|| hit_test_row(0, row, &rendered.display, nav_index.as_ref()));
         if target.is_some() {
+            target_row = Some(row);
             break;
         }
         target_y += delta.signum();
     }
-    let Some(cursor) = target.map(|cursor| normalize_headline_cursor(state, cursor)) else {
+    if let Some(insert_index) = target_spacer {
+        if let Some(row) = target_row {
+            set_spacer_cursor(state, insert_index, row);
+        }
+        return;
+    }
+    let Some(cursor) = target.map(|cursor| normalize_active_block_cursor(state, cursor)) else {
         return;
     };
     state.preferred_column = Some(preferred_x);
+    state.cursor_row_hint = target_row;
+    clear_spacer_cursor(state);
     if extend {
         let anchor = state
             .app
@@ -726,26 +1107,23 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
             .selection
             .map_or(state.app.editor.cursor, |selection| selection.anchor);
         state.app.editor.select_range(anchor, cursor);
+        clear_pending_edit_target(state);
     } else {
         state.app.editor.set_cursor(cursor);
-    }
-}
-
-fn headline_visual_step(state: &TuiState, cursor: Cursor) -> i32 {
-    let block = cursor_block(cursor);
-    match state.app.editor.document.blocks.get(block) {
-        Some(DocBlock::Heading { level, .. }) if state.kitty_graphics && matches!(level, 1 | 2) => {
-            2
-        }
-        _ => 1,
+        schedule_editable_target_activation(state, cursor);
     }
 }
 
 fn ensure_cursor_visible(state: &mut TuiState) {
-    let Some(rendered) = &state.last_rendered else {
+    let Some(rendered) = state
+        .last_rendered
+        .clone()
+        .or_else(|| Some(current_navigation_render(state)))
+    else {
         return;
     };
-    let Some((_, y)) = cursor_position(&state.app.editor.cursor, &rendered.display.items) else {
+    let nav_index = display_nav_index(state, &rendered);
+    let Some((_, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
         return;
     };
     let viewport = state.last_doc_area.height.saturating_sub(2);
@@ -774,6 +1152,28 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             state.file_popup = None;
             state.file_popup_hits.clear();
+        }
+    }
+    if let Some(popup) = state.last_table_popup {
+        if mouse.column >= popup.x
+            && mouse.column < popup.x.saturating_add(popup.width)
+            && mouse.row >= popup.y
+            && mouse.row < popup.y.saturating_add(popup.height)
+        {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    click_table_popup(state, popup, mouse.column, mouse.row)
+                }
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                    hover_table_popup(state, popup, mouse.column, mouse.row)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            state.table_popup = None;
+            state.table_popup_hits.clear();
         }
     }
     if state.last_style_popup.is_some()
@@ -1008,14 +1408,13 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
             .saturating_add(state.outline_scroll);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(hit) = state.outline_hits.iter().find(|hit| hit.row == row) {
-                    state.preferred_column = None;
-                    state.app.editor.set_cursor(Cursor::Text {
-                        block: hit.block,
-                        offset: 0,
-                    });
-                    state.message = "outline jump".to_string();
-                    ensure_cursor_visible(state);
+                if let Some(block) = state
+                    .outline_hits
+                    .iter()
+                    .find(|hit| hit.row == row)
+                    .map(|hit| hit.block)
+                {
+                    follow_link_to_block(state, block, "outline jump");
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -1077,6 +1476,7 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(rendered) = &state.last_rendered
+                && !mouse.modifiers.contains(KeyModifiers::CONTROL)
                 && let Some(action) = action_at(x, y, &rendered.display)
             {
                 match action {
@@ -1106,9 +1506,32 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 }
                 return;
             }
+            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                state.preferred_column = None;
+                if let Some(target) = document_target_at(state, x, y) {
+                    select_document_target(state, target);
+                    ensure_cursor_visible(state);
+                }
+                return;
+            }
             state.drag_anchor = Some((x, y));
             state.preferred_column = None;
-            state.app.click(x, y);
+            match document_target_at(state, x, y) {
+                Some(DocumentTarget::Cursor(cursor)) => {
+                    clear_spacer_cursor(state);
+                    if let Cursor::Checkbox { block, item } = cursor {
+                        clear_pending_edit_target(state);
+                        state.app.editor.toggle_checkbox(block, item);
+                    } else {
+                        clear_pending_edit_target(state);
+                        state.app.editor.set_cursor(cursor);
+                    }
+                }
+                Some(DocumentTarget::Spacer(insert_index)) => {
+                    set_spacer_cursor(state, insert_index, y);
+                }
+                None => {}
+            }
             ensure_cursor_visible(state);
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -1119,7 +1542,17 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
             }
             if let Some(anchor) = state.drag_anchor {
                 state.preferred_column = None;
-                state.app.drag_select(anchor, (x, y));
+                let from = document_target_at(state, anchor.0, anchor.1);
+                let to = document_target_at(state, x, y);
+                if let (
+                    Some(DocumentTarget::Cursor(anchor_cursor)),
+                    Some(DocumentTarget::Cursor(head_cursor)),
+                ) = (from, to)
+                {
+                    clear_spacer_cursor(state);
+                    clear_pending_edit_target(state);
+                    state.app.editor.select_range(anchor_cursor, head_cursor);
+                }
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
@@ -1199,52 +1632,141 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         show_status: false,
         ..state.app.render_options.clone()
     };
-    let render_key = RenderCacheKey {
+    let base_render_key = BaseRenderCacheKey {
         version: state.app.editor.document.version,
         options: state.app.render_options.clone(),
-        active_headline_block: active_headline_block(state),
     };
-    let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
-        state.last_rendered.clone().unwrap_or_else(|| {
-            let mut rendered =
-                render_document(&state.app.editor.document, state.app.render_options.clone());
-            materialize_active_headline_fallback(state, &mut rendered);
+    let base_rendered = if state.last_base_render_key.as_ref() == Some(&base_render_key) {
+        state.last_base_rendered.clone().unwrap_or_else(|| {
+            let rendered = Arc::new(render_document(
+                &state.app.editor.document,
+                state.app.render_options.clone(),
+            ));
+            state.last_base_rendered = Some(rendered.clone());
             rendered
         })
     } else {
-        let mut rendered =
-            render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(state, &mut rendered);
-        state.last_render_key = Some(render_key);
-        state.last_rendered = Some(rendered.clone());
+        let rendered = Arc::new(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        state.last_base_render_key = Some(base_render_key);
+        state.last_base_rendered = Some(rendered.clone());
         rendered
     };
+    let render_key = RenderCacheKey {
+        version: state.app.editor.document.version,
+        options: state.app.render_options.clone(),
+        active_fallback_block: active_editable_target(state),
+    };
+    let rendered = if state.last_render_key.as_ref() == Some(&render_key) {
+        state.last_rendered.clone().unwrap_or_else(|| {
+            if render_key.active_fallback_block.is_some() {
+                let mut rendered = base_rendered.as_ref().clone();
+                materialize_active_block_fallback(state, &mut rendered);
+                Arc::new(rendered)
+            } else {
+                base_rendered.clone()
+            }
+        })
+    } else if render_key.active_fallback_block.is_some() {
+        let mut rendered = base_rendered.as_ref().clone();
+        materialize_active_block_fallback(state, &mut rendered);
+        Arc::new(rendered)
+    } else {
+        base_rendered.clone()
+    };
+    state.last_render_key = Some(render_key.clone());
+    state.last_rendered = Some(rendered.clone());
     let viewport = usize::from(doc_area.height.saturating_sub(2));
     let max_scroll = rendered.lines.len().saturating_sub(viewport);
     state.scroll = state.scroll.min(max_scroll as u16);
     state.last_rendered = Some(rendered.clone());
+    let nav_index = display_nav_index(state, &rendered);
+    let cursor_screen = visual_cursor_position(state, nav_index.as_ref());
+    let styled_lines = if state.last_styled_key.as_ref() == Some(&render_key) {
+        state
+            .last_styled_lines
+            .clone()
+            .unwrap_or_else(|| Arc::new(build_styled_document_lines(state, &rendered, &theme)))
+    } else {
+        let styled = Arc::new(build_styled_document_lines(state, &rendered, &theme));
+        state.last_styled_key = Some(render_key.clone());
+        state.last_styled_lines = Some(styled.clone());
+        styled
+    };
+    state.last_styled_lines = Some(styled_lines.clone());
 
-    let (explorer_lines, explorer_hits) = explorer_lines(
-        state.path.as_deref(),
-        &state.app.file_name,
-        state.explorer_mode,
-        &state.collapsed_dirs,
-        &theme,
-    );
-    state.explorer_hits = explorer_hits;
+    let explorer_key = ExplorerCacheKey {
+        root: workspace_root_for(state.path.as_deref()),
+        active_file: state.app.file_name.clone(),
+        mode: state.explorer_mode,
+        collapsed_dirs: sorted_paths(&state.collapsed_dirs),
+    };
+    let (explorer_lines, explorer_hits) = if state.last_explorer_key.as_ref() == Some(&explorer_key)
+    {
+        (
+            state
+                .last_explorer_lines
+                .clone()
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+            state
+                .last_explorer_hits
+                .clone()
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+        )
+    } else {
+        let (lines, hits) = explorer_lines(
+            state.path.as_deref(),
+            &state.app.file_name,
+            state.explorer_mode,
+            &state.collapsed_dirs,
+            &theme,
+        );
+        let lines = Arc::new(lines);
+        let hits = Arc::new(hits);
+        state.last_explorer_key = Some(explorer_key);
+        state.last_explorer_lines = Some(lines.clone());
+        state.last_explorer_hits = Some(hits.clone());
+        (lines, hits)
+    };
+    state.explorer_hits = explorer_hits.as_ref().clone();
     state.explorer_scroll = clamp_scroll(
         state.explorer_scroll,
         explorer_lines.len(),
         usize::from(sidebar_split[0].height.saturating_sub(2)),
     );
 
-    let (outline_lines, outline_hits) = outline_lines(
-        &state.app.editor.document.blocks,
-        cursor_block(state.app.editor.cursor),
-        &theme,
-        sidebar_split[1].width.saturating_sub(2),
-    );
-    state.outline_hits = outline_hits;
+    let active_block = cursor_block(state.app.editor.cursor);
+    let outline_key = OutlineCacheKey {
+        version: state.app.editor.document.version,
+        width: sidebar_split[1].width.saturating_sub(2),
+    };
+    let (outline_lines, outline_hits) = if state.last_outline_key.as_ref() == Some(&outline_key) {
+        (
+            state
+                .last_outline_lines
+                .clone()
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+            state
+                .last_outline_hits
+                .clone()
+                .unwrap_or_else(|| Arc::new(Vec::new())),
+        )
+    } else {
+        let (lines, hits) = outline_lines(
+            &state.app.editor.document.blocks,
+            &theme,
+            sidebar_split[1].width.saturating_sub(2),
+        );
+        let lines = Arc::new(lines);
+        let hits = Arc::new(hits);
+        state.last_outline_key = Some(outline_key);
+        state.last_outline_lines = Some(lines.clone());
+        state.last_outline_hits = Some(hits.clone());
+        (lines, hits)
+    };
+    state.outline_hits = outline_hits.as_ref().clone();
     state.outline_scroll = clamp_scroll(
         state.outline_scroll,
         outline_lines.len(),
@@ -1255,22 +1777,32 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         frame,
         sidebar_split[0],
         state,
-        &explorer_lines,
+        explorer_lines.as_ref(),
         state.explorer_scroll,
         &theme,
     );
     draw_outline(
         frame,
         sidebar_split[1],
-        &outline_lines,
+        outline_lines.as_ref(),
+        outline_hits.as_ref(),
         state.outline_scroll,
+        active_block,
         &theme,
     );
-    draw_document(frame, doc_area, state, &rendered, &theme);
+    draw_document_with_lines(
+        frame,
+        doc_area,
+        state,
+        &rendered,
+        styled_lines.as_ref(),
+        cursor_screen.map(|(_, y)| y),
+        &theme,
+    );
     draw_tabs(frame, tabs_area, state, &theme);
     draw_status(frame, status_area, state, &rendered, &theme);
 
-    if has_selection(state) && state.app.editor.show_style_popover {
+    if has_selection(state) && state.app.editor.show_style_popover && state.drag_anchor.is_none() {
         let selection_rects = selection_rects(state, &rendered);
         state.last_style_popup = Some(draw_style_popover(
             frame,
@@ -1294,18 +1826,17 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         state.last_file_popup = None;
         state.file_popup_hits.clear();
     }
+    if state.table_popup.is_some() {
+        state.last_table_popup = Some(draw_table_popup(frame, area, state, &theme));
+    } else {
+        state.last_table_popup = None;
+        state.table_popup_hits.clear();
+    }
 
-    if let Some((x, y)) = cursor_position(&state.app.editor.cursor, &rendered.display.items) {
-        let screen_x = doc_area.x.saturating_add(1).saturating_add(x);
-        let screen_y = doc_area
-            .y
-            .saturating_add(1)
-            .saturating_add(y.saturating_sub(state.scroll));
-        if screen_y > doc_area.y
-            && screen_y < doc_area.y.saturating_add(doc_area.height.saturating_sub(1))
-        {
-            frame.set_cursor_position((screen_x, screen_y));
-        }
+    if let Some((screen_x, screen_y)) =
+        document_screen_cursor(doc_area, state.scroll, cursor_screen)
+    {
+        frame.set_cursor_position((screen_x, screen_y));
     }
 }
 
@@ -1572,26 +2103,42 @@ fn draw_outline(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: &[Line<'static>],
+    hits: &[OutlineHit],
     scroll: u16,
+    active_block: usize,
     theme: &Theme,
 ) {
+    let viewport_height = usize::from(area.height.saturating_sub(2));
+    let visible = lines
+        .iter()
+        .enumerate()
+        .skip(usize::from(scroll))
+        .take(viewport_height)
+        .map(|(row, line)| {
+            let active = hits
+                .iter()
+                .any(|hit| hit.row == row as u16 && hit.block == active_block);
+            if active {
+                highlight_outline_line(line, theme)
+            } else {
+                line.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines.to_vec())
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" OUTLINE ")
-                    .title_style(
-                        Style::default()
-                            .fg(rgb(theme.accent_highlight))
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .border_type(BorderType::Rounded)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(rgb(theme.border)))
-                    .style(Style::default().bg(rgb(theme.panel_bg))),
-            ),
+        Paragraph::new(visible).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(" OUTLINE ")
+                .title_style(
+                    Style::default()
+                        .fg(rgb(theme.accent_highlight))
+                        .add_modifier(Modifier::BOLD),
+                )
+                .border_type(BorderType::Rounded)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(rgb(theme.border)))
+                .style(Style::default().bg(rgb(theme.panel_bg))),
+        ),
         area,
     );
     draw_scrollbar(
@@ -1608,6 +2155,23 @@ fn draw_outline(
     );
 }
 
+fn highlight_outline_line(line: &Line<'static>, theme: &Theme) -> Line<'static> {
+    Line::from(
+        line.spans
+            .iter()
+            .cloned()
+            .map(|span| {
+                let style = span
+                    .style
+                    .bg(rgb(theme.active_row))
+                    .add_modifier(Modifier::BOLD);
+                Span::styled(span.content, style)
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[cfg(test)]
 fn draw_document(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1615,6 +2179,18 @@ fn draw_document(
     rendered: &Rendered,
     theme: &Theme,
 ) {
+    let lines = build_styled_document_lines(state, rendered, theme);
+    let nav_index =
+        DisplayNavIndex::build(&rendered.display.items, &state.app.editor.document.blocks);
+    let current_y = visual_cursor_position(state, &nav_index).map(|(_, y)| y);
+    draw_document_with_lines(frame, area, state, rendered, &lines, current_y, theme);
+}
+
+fn build_styled_document_lines(
+    state: &TuiState,
+    rendered: &Rendered,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let active_headline_edit_rows = rendered
         .display
         .items
@@ -1647,16 +2223,12 @@ fn draw_document(
     } else {
         HashSet::new()
     };
-    let current_y =
-        cursor_position(&state.app.editor.cursor, &rendered.display.items).map(|(_, y)| y);
-    let selection_rects = selection_rects(state, rendered);
     let render_context = RenderLineContext {
         state,
         rendered,
         theme,
-        current_y,
     };
-    let lines = rendered
+    rendered
         .lines
         .iter()
         .enumerate()
@@ -1693,10 +2265,21 @@ fn draw_document(
                 ))
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+}
 
+fn draw_document_with_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    rendered: &Rendered,
+    lines: &[Line<'static>],
+    current_y: Option<u16>,
+    theme: &Theme,
+) {
+    let selection_rects = selection_rects(state, rendered);
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(lines.to_vec())
             .block(
                 Block::default()
                     .border_type(BorderType::Rounded)
@@ -1709,6 +2292,7 @@ fn draw_document(
             .wrap(Wrap { trim: false }),
         area,
     );
+    apply_active_row_highlight(frame.buffer_mut(), area, state.scroll, current_y, theme);
 
     apply_selection_highlight(
         frame.buffer_mut(),
@@ -1736,7 +2320,7 @@ fn draw_status(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &mut TuiState,
-    rendered: &Rendered,
+    _rendered: &Rendered,
     theme: &Theme,
 ) {
     state.status_hits.clear();
@@ -1744,13 +2328,6 @@ fn draw_status(
     let buf = frame.buffer_mut();
     buf.set_style(area, Style::default().bg(rgb(theme.panel_bg)));
     let right = area.x.saturating_add(area.width);
-    let (row, col) = state.app.editor.logical_position();
-    let selection = state
-        .app
-        .editor
-        .selection
-        .filter(|selection| !selection.is_collapsed())
-        .map_or(String::new(), |_| " · selection".to_string());
     let mut x = area.x;
 
     put(
@@ -1935,58 +2512,74 @@ fn draw_status(
         &mut x,
         area.y,
         right,
-        &format!(" {}{} ", compact_text(&state.message, 28), selection),
-        Style::default()
-            .fg(rgb(theme.text_secondary))
-            .bg(rgb(theme.panel_bg)),
-    );
-    put(
-        buf,
-        &mut x,
-        area.y,
-        right,
-        &format!(" {} row {row} col {col} ", file_leaf(&state.app.file_name)),
-        Style::default()
-            .fg(rgb(theme.text_primary))
-            .bg(rgb(theme.panel_bg))
-            .add_modifier(Modifier::BOLD),
-    );
-    put(
-        buf,
-        &mut x,
-        area.y,
-        right,
-        &format!(
-            "  {} / {}  ctrl-1/2/3 cols  ctrl-h hyphen  drag wrap slider  F1/? help",
-            row,
-            rendered.lines.len().max(1)
-        ),
+        &format!("  {}", status_shortcuts(state)),
         Style::default()
             .fg(rgb(theme.text_secondary))
             .bg(rgb(theme.panel_bg)),
     );
 }
 
+fn status_shortcuts(state: &TuiState) -> String {
+    if state.spacer_cursor.is_some() {
+        return "type paragraph  Ctrl+T table  Ctrl+E code  Ctrl+B quote  Ctrl+1-6 heading"
+            .to_string();
+    }
+    if matches!(state.app.editor.cursor, Cursor::TableCell { .. }) {
+        return "Tab next  Shift+Tab prev  Ctrl+←↑↓→ insert  Ctrl+D remove  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
+            .to_string();
+    }
+    "Shift+arrows select  Ctrl-click block  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string()
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-    let width = area.width.min(68);
-    let height = area.height.min(14);
+    let width = area.width.min(78);
+    let height = area.height.min(16);
     let popup = centered(area, width, height);
+    let panel_bg = rgb(theme.panel_raised);
+    let section = Style::default()
+        .fg(rgb(theme.accent_highlight))
+        .bg(panel_bg)
+        .add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(rgb(theme.text_primary)).bg(panel_bg);
+    let hint = Style::default().fg(rgb(theme.text_secondary)).bg(panel_bg);
     let text = vec![
-        Line::from("Navigation"),
-        Line::from("  arrows move · Shift+arrows select · PageUp/PageDown scroll"),
-        Line::from("  Ctrl-1/2/3 columns · drag the wrap slider"),
-        Line::from("Editing"),
-        Line::from("  type to edit · Enter split/create · Backspace/Delete remove"),
-        Line::from("  Ctrl-B/I/E style · Ctrl-Shift-X strike · Ctrl-./, super/sub"),
-        Line::from("  Ctrl-B bold · Ctrl-I italic · Ctrl-E code · Ctrl-Shift-X strike"),
-        Line::from("Tables & Lists"),
-        Line::from("  Tab / Shift+Tab move cells · Ctrl+Arrow add row/column"),
-        Line::from("Mouse"),
-        Line::from(
-            "  click place cursor · drag select · drag wrap slider · click explorer/outline/status controls",
-        ),
-        Line::from("Session"),
-        Line::from("  Ctrl-S save · Ctrl-Q quit · F1 or Esc close help"),
+        Line::from(vec![Span::styled(" Navigation ", section)]),
+        Line::from(vec![Span::styled(
+            " arrows move · Shift+arrows select · PageUp/PageDown scroll · drag the wrap slider",
+            body,
+        )]),
+        Line::from(vec![Span::styled(
+            " Ctrl-1/2/3 columns · Ctrl-click selects a whole block or table cell",
+            body,
+        )]),
+        Line::from(vec![Span::styled(" Editing ", section)]),
+        Line::from(vec![Span::styled(
+            " type to edit · Enter split/create · Backspace/Delete remove · Ctrl-B/I/E style",
+            body,
+        )]),
+        Line::from(vec![Span::styled(
+            " Ctrl-Shift-X strike · Ctrl-./, super/sub · spacer rows: type or Ctrl+1-6 / T / E / B",
+            body,
+        )]),
+        Line::from(vec![Span::styled(" Tables & lists ", section)]),
+        Line::from(vec![Span::styled(
+            " Tab / Shift+Tab move cells · Ctrl+Arrow insert row/column · Ctrl+D removes row/column",
+            body,
+        )]),
+        Line::from(vec![Span::styled(" Mouse ", section)]),
+        Line::from(vec![Span::styled(
+            " click to place cursor · drag to select · click TOC numbers to jump · click chips to style",
+            body,
+        )]),
+        Line::from(vec![Span::styled(" Session ", section)]),
+        Line::from(vec![Span::styled(
+            " Ctrl-S save · Ctrl-Q quit · Esc or Ctrl-H closes help",
+            body,
+        )]),
+        Line::from(vec![Span::styled(
+            " only TOC numbers jump, so titles stay editable in place",
+            hint,
+        )]),
     ];
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -2002,13 +2595,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
                     .border_type(BorderType::Rounded)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(rgb(theme.border_strong)))
-                    .style(Style::default().bg(rgb(theme.panel_raised))),
+                    .style(Style::default().bg(panel_bg)),
             )
-            .style(
-                Style::default()
-                    .fg(rgb(theme.text_primary))
-                    .bg(rgb(theme.panel_raised)),
-            ),
+            .style(body),
         popup,
     );
 }
@@ -2022,176 +2611,108 @@ fn draw_style_popover(
     state: &mut TuiState,
     theme: &Theme,
 ) -> Rect {
-    let chips = style_popup_cells();
-    let width = popup_line_width(&chips);
-    let height = 3;
+    let items = style_popup_items();
+    let width = style_popup_width(&items);
+    let height = items.len() as u16 + 2;
     let popup = anchored_style_popup(area, doc_area, scroll, selection_rects, width, height);
-    state.style_popup_hits.clear();
     frame.render_widget(Clear, popup);
-    let border_style = Style::default()
-        .fg(rgb(theme.text_muted))
-        .bg(rgb(theme.panel_bg));
-    let fill_style = Style::default().bg(rgb(theme.panel_bg));
-    frame.buffer_mut().set_style(popup, fill_style);
-    let active = active_style_popup_action(state);
-    let footer = format!(" {} - {} ", active.shortcut(), active.label());
-    let footer_inner = build_footer_line(usize::from(width.saturating_sub(2)), &footer);
-    let top = build_popup_top_line(&chips);
-    let bottom = format!("└{footer_inner}┘");
-    for (row, line) in [(0u16, top), (2u16, bottom)] {
-        let y = popup.y + row;
-        let mut x = popup.x;
-        put(
-            frame.buffer_mut(),
-            &mut x,
-            y,
-            popup.x + popup.width,
-            &line,
-            border_style,
-        );
-    }
-    render_popup_middle(frame.buffer_mut(), popup, state, theme, &chips);
-    populate_style_popup_hits(state, &chips);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(rgb(theme.border_strong)))
+            .style(Style::default().bg(rgb(theme.panel_bg))),
+        popup,
+    );
+    render_popup_items(frame.buffer_mut(), popup, state, theme, &items);
+    populate_style_popup_hits(state, &items, popup);
     popup
 }
 
 #[derive(Clone, Copy)]
-struct StylePopupCell {
+struct StylePopupItem {
     label: &'static str,
-    width: u16,
-    action: Option<StylePopupAction>,
+    action: StylePopupAction,
 }
 
-fn style_popup_cells() -> [StylePopupCell; 8] {
+fn style_popup_items() -> [StylePopupItem; 7] {
     [
-        StylePopupCell {
-            label: "B",
-            width: 3,
-            action: Some(StylePopupAction::Bold),
+        StylePopupItem {
+            label: "Bold",
+            action: StylePopupAction::Bold,
         },
-        StylePopupCell {
-            label: "I",
-            width: 3,
-            action: Some(StylePopupAction::Italic),
+        StylePopupItem {
+            label: "Italic",
+            action: StylePopupAction::Italic,
         },
-        StylePopupCell {
-            label: "S",
-            width: 3,
-            action: Some(StylePopupAction::Strike),
+        StylePopupItem {
+            label: "Code",
+            action: StylePopupAction::Code,
         },
-        StylePopupCell {
-            label: "</>",
-            width: 5,
-            action: Some(StylePopupAction::Code),
+        StylePopupItem {
+            label: "Superscript",
+            action: StylePopupAction::Superscript,
         },
-        StylePopupCell {
-            label: "x^",
-            width: 4,
-            action: Some(StylePopupAction::Superscript),
+        StylePopupItem {
+            label: "Subscript",
+            action: StylePopupAction::Subscript,
         },
-        StylePopupCell {
-            label: "x_",
-            width: 4,
-            action: Some(StylePopupAction::Subscript),
+        StylePopupItem {
+            label: "Block quote",
+            action: StylePopupAction::Quote,
         },
-        StylePopupCell {
-            label: "clr",
-            width: 5,
-            action: Some(StylePopupAction::Clear),
-        },
-        StylePopupCell {
-            label: ">",
-            width: 3,
-            action: Some(StylePopupAction::Quote),
+        StylePopupItem {
+            label: "Remove styling",
+            action: StylePopupAction::Clear,
         },
     ]
 }
 
-fn popup_line_width(cells: &[StylePopupCell]) -> u16 {
-    2 + cells.iter().map(|cell| cell.width).sum::<u16>() + cells.len().saturating_sub(1) as u16
+fn style_popup_width(items: &[StylePopupItem]) -> u16 {
+    items
+        .iter()
+        .map(|item| item.label.chars().count())
+        .max()
+        .unwrap_or(0) as u16
+        + 4
 }
 
-fn build_popup_top_line(cells: &[StylePopupCell]) -> String {
-    let mut out = String::from("┌");
-    for (index, cell) in cells.iter().enumerate() {
-        out.push_str(&"─".repeat(cell.width as usize));
-        out.push(if index + 1 == cells.len() {
-            '┐'
-        } else {
-            '┬'
+fn populate_style_popup_hits(state: &mut TuiState, items: &[StylePopupItem], popup: Rect) {
+    state.style_popup_hits.clear();
+    for (index, item) in items.iter().enumerate() {
+        state.style_popup_hits.push(StylePopupHit {
+            row: index as u16 + 1,
+            start: 1,
+            end: popup.width.saturating_sub(1),
+            action: item.action,
         });
     }
-    out
 }
 
-fn build_footer_line(inner_width: usize, footer: &str) -> String {
-    let footer_width = footer.chars().count().min(inner_width);
-    let leading = inner_width.saturating_sub(footer_width) / 2;
-    let trailing = inner_width.saturating_sub(footer_width + leading);
-    format!(
-        "{}{}{}",
-        "─".repeat(leading),
-        footer.chars().take(footer_width).collect::<String>(),
-        "─".repeat(trailing)
-    )
-}
-
-fn populate_style_popup_hits(state: &mut TuiState, cells: &[StylePopupCell]) {
-    let mut x = 0u16;
-    for cell in cells {
-        if let Some(action) = cell.action {
-            state.style_popup_hits.push(StylePopupHit {
-                row: 1,
-                start: x,
-                end: x.saturating_add(cell.width),
-                action,
-            });
-        }
-        x = x.saturating_add(cell.width + 1);
-    }
-}
-
-fn render_popup_middle(
+fn render_popup_items(
     buf: &mut Buffer,
     popup: Rect,
     state: &TuiState,
     theme: &Theme,
-    cells: &[StylePopupCell],
+    items: &[StylePopupItem],
 ) {
-    let y = popup.y + 1;
-    let right = popup.x + popup.width;
-    let border_style = Style::default()
-        .fg(rgb(theme.text_muted))
-        .bg(rgb(theme.panel_bg));
     let idle_style = Style::default()
-        .fg(rgb(theme.accent_primary))
+        .fg(rgb(theme.text_primary))
         .bg(rgb(theme.panel_bg));
     let active_style = Style::default()
         .fg(rgb(theme.panel_bg))
         .bg(rgb(theme.accent_highlight))
         .add_modifier(Modifier::BOLD);
-    let mut x = popup.x;
-    put(buf, &mut x, y, right, "│", border_style);
-    for cell in cells {
-        let action = cell.action;
-        let selected = action == Some(active_style_popup_action(state));
+    for (index, item) in items.iter().enumerate() {
+        let y = popup.y + 1 + index as u16;
+        let mut x = popup.x + 1;
+        let selected = item.action == active_style_popup_action(state);
         let style = if selected { active_style } else { idle_style };
-        let label = if cell.label.chars().count() >= cell.width as usize {
-            cell.label.to_string()
-        } else {
-            let left = (usize::from(cell.width) - cell.label.chars().count()) / 2;
-            let right_pad = usize::from(cell.width)
-                .saturating_sub(cell.label.chars().count())
-                .saturating_sub(left);
-            format!(
-                "{}{}{}",
-                " ".repeat(left),
-                cell.label,
-                " ".repeat(right_pad)
-            )
-        };
-        put(buf, &mut x, y, right, &label, style);
-        put(buf, &mut x, y, right, "│", border_style);
+        let label = format!(
+            " {}",
+            pad_width(item.label, usize::from(popup.width.saturating_sub(3)))
+        );
+        put(buf, &mut x, y, popup.x + popup.width - 1, &label, style);
     }
 }
 
@@ -2228,18 +2749,19 @@ fn anchored_style_popup(
     let (Some(selection_left), Some(selection_top)) = (min_x, min_y) else {
         return default;
     };
-    let selection_center = selection_left.saturating_add(max_x).saturating_div(2);
-    let max_x_origin = area.x.saturating_add(area.width.saturating_sub(width));
-    let mut x = selection_center.saturating_sub(width / 2);
-    x = x.clamp(area.x, max_x_origin);
-    let above_y = selection_top.saturating_sub(height);
-    let y = if selection_top >= area.y.saturating_add(height) {
-        above_y
+    let right_x = max_x
+        .saturating_add(2)
+        .min(area.x.saturating_add(area.width.saturating_sub(width)));
+    let left_x = selection_left
+        .saturating_sub(width.saturating_add(1))
+        .max(area.x);
+    let x = if max_x.saturating_add(2).saturating_add(width) <= area.x.saturating_add(area.width) {
+        right_x
     } else {
-        max_y
-            .saturating_add(1)
-            .min(area.y.saturating_add(area.height.saturating_sub(height)))
+        left_x
     };
+    let max_y_origin = area.y.saturating_add(area.height.saturating_sub(height));
+    let y = selection_top.min(max_y_origin).max(area.y);
     Rect {
         x,
         y,
@@ -2260,11 +2782,11 @@ fn draw_scrollbar(frame: &mut Frame<'_>, area: Rect, offset: usize, content: usi
     let mut lines = Vec::new();
     for index in 0..viewport {
         let ch = if index >= start && index < start + thumb {
-            "█"
+            "▋"
         } else {
-            "│"
+            ""
         };
-        let style = if ch == "█" {
+        let style = if ch == "▋" {
             Style::default()
                 .fg(rgb(theme.accent_highlight))
                 .bg(rgb(theme.panel_bg))
@@ -2308,17 +2830,53 @@ fn run_action(state: &mut TuiState, action: DisplayAction) {
                 Err(error) => state.message = format!("copy failed: {error}"),
             }
         }
-        DisplayAction::FollowLink { block } => {
-            state.preferred_column = None;
-            state
-                .app
-                .editor
-                .set_cursor(Cursor::Text { block, offset: 0 });
-            state.message = "link jump".to_string();
-            ensure_cursor_visible(state);
-        }
+        DisplayAction::FollowLink { block } => follow_link_to_block(state, block, "link jump"),
         DisplayAction::ScrollCodeBlock { .. } => {}
     }
+}
+
+fn follow_link_to_block(state: &mut TuiState, block: usize, message: &str) {
+    state.preferred_column = None;
+    state.cursor_row_hint = None;
+    clear_spacer_cursor(state);
+    clear_pending_edit_target(state);
+    if editable_target_for_cursor(state, Cursor::Text { block, offset: 0 }).is_some() {
+        scroll_block_into_view(state, block);
+    } else {
+        state
+            .app
+            .editor
+            .set_cursor(Cursor::Text { block, offset: 0 });
+        ensure_cursor_visible(state);
+    }
+    state.message = message.to_string();
+}
+
+fn scroll_block_into_view(state: &mut TuiState, block: usize) {
+    let rendered = state
+        .last_base_rendered
+        .as_ref()
+        .cloned()
+        .or_else(|| state.last_rendered.clone());
+    let Some(rendered) = rendered else {
+        return;
+    };
+    let Some(target_row) = rendered
+        .display
+        .items
+        .iter()
+        .filter_map(|item| (display_item_block(item) == Some(block)).then_some(item.rect.y))
+        .min()
+    else {
+        return;
+    };
+    let viewport = state.last_doc_area.height.saturating_sub(2);
+    if viewport == 0 {
+        state.scroll = target_row;
+        return;
+    }
+    let margin = viewport.saturating_sub(1).min(2);
+    state.scroll = target_row.saturating_sub(margin);
 }
 
 fn update_code_thumb_drag(state: &mut TuiState, drag: CodeThumbDrag, x: u16) {
@@ -2391,6 +2949,89 @@ fn hover_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
         state.style_popup_hover = hover;
         state.dirty = true;
     }
+}
+
+fn draw_table_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    theme: &Theme,
+) -> Rect {
+    state.table_popup_hits.clear();
+    let Some(TablePopup { block, row, col }) = state.table_popup.clone() else {
+        return Rect::default();
+    };
+    let body = [
+        format!(" remove row {}", row + 1),
+        format!(" remove column {}", col + 1),
+        format!(" table {}", block + 1),
+    ];
+    let popup = centered(area, 24.min(area.width), 6.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block_widget = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" remove ")
+        .title_style(
+            Style::default()
+                .fg(rgb(theme.accent_primary))
+                .bg(rgb(theme.panel_raised))
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(rgb(theme.border_strong)))
+        .style(Style::default().bg(rgb(theme.panel_raised)));
+    frame.render_widget(block_widget, popup);
+    let items = [
+        ("[r] remove row", TablePopupAction::RemoveRow),
+        ("[c] remove column", TablePopupAction::RemoveColumn),
+    ];
+    for (index, (label, action)) in items.iter().enumerate() {
+        let y = popup.y + 1 + index as u16;
+        let mut x = popup.x + 1;
+        let selected = *action == active_table_popup_action(state);
+        let style = if selected {
+            Style::default()
+                .fg(rgb(theme.panel_bg))
+                .bg(rgb(theme.accent_highlight))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(rgb(theme.text_primary))
+                .bg(rgb(theme.panel_raised))
+        };
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            popup.x + popup.width - 1,
+            &format!(
+                " {}",
+                pad_width(label, usize::from(popup.width.saturating_sub(3)))
+            ),
+            style,
+        );
+        state.table_popup_hits.push(TablePopupHit {
+            row: 1 + index as u16,
+            start: 1,
+            end: popup.width.saturating_sub(1),
+            action: action.clone(),
+        });
+    }
+    let mut x = popup.x + 1;
+    put(
+        frame.buffer_mut(),
+        &mut x,
+        popup.y + popup.height.saturating_sub(2),
+        popup.x + popup.width - 1,
+        &format!(
+            " {}",
+            pad_width(&body[2], usize::from(popup.width.saturating_sub(3)))
+        ),
+        Style::default()
+            .fg(rgb(theme.text_secondary))
+            .bg(rgb(theme.panel_raised)),
+    );
+    popup
 }
 
 fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Theme) -> Rect {
@@ -2598,12 +3239,11 @@ fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
     let actions = [
         StylePopupAction::Bold,
         StylePopupAction::Italic,
-        StylePopupAction::Strike,
         StylePopupAction::Code,
         StylePopupAction::Superscript,
         StylePopupAction::Subscript,
-        StylePopupAction::Clear,
         StylePopupAction::Quote,
+        StylePopupAction::Clear,
     ];
     let current = actions
         .iter()
@@ -2623,7 +3263,6 @@ fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
     match action {
         StylePopupAction::Bold => state.app.apply_bold(),
         StylePopupAction::Italic => state.app.apply_italic(),
-        StylePopupAction::Strike => state.app.apply_strike(),
         StylePopupAction::Code => {
             if state.app.editor.selection_covers_active_text()
                 || matches!(state.app.editor.cursor, Cursor::Text { block, .. } if matches!(
@@ -2641,6 +3280,181 @@ fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
         StylePopupAction::Clear => state.app.clear_styles(),
         StylePopupAction::Quote => state.app.apply_block_quote(),
     }
+}
+
+fn active_table_popup_action(state: &TuiState) -> TablePopupAction {
+    state
+        .table_popup_hover
+        .clone()
+        .unwrap_or_else(|| state.table_popup_selected.clone())
+}
+
+fn step_table_popup_selection(state: &mut TuiState, delta: i32) {
+    let actions = [TablePopupAction::RemoveRow, TablePopupAction::RemoveColumn];
+    let current = actions
+        .iter()
+        .position(|action| *action == state.table_popup_selected)
+        .unwrap_or(0) as i32;
+    let next = (current + delta).rem_euclid(actions.len() as i32) as usize;
+    state.table_popup_selected = actions[next].clone();
+    state.dirty = true;
+}
+
+fn apply_table_popup_action(state: &mut TuiState, action: TablePopupAction) {
+    let changed = match action {
+        TablePopupAction::RemoveRow => state.app.editor.remove_current_table_row(),
+        TablePopupAction::RemoveColumn => state.app.editor.remove_current_table_column(),
+    };
+    state.table_popup = None;
+    state.table_popup_hover = None;
+    state.table_popup_hits.clear();
+    state.dirty = true;
+    state.message = if changed {
+        match action {
+            TablePopupAction::RemoveRow => "row removed".to_string(),
+            TablePopupAction::RemoveColumn => "column removed".to_string(),
+        }
+    } else {
+        match action {
+            TablePopupAction::RemoveRow => "cannot remove last row".to_string(),
+            TablePopupAction::RemoveColumn => "cannot remove last column".to_string(),
+        }
+    };
+}
+
+fn open_table_popup(state: &mut TuiState) {
+    let Cursor::TableCell {
+        block, row, col, ..
+    } = state.app.editor.cursor
+    else {
+        return;
+    };
+    state.table_popup = Some(TablePopup { block, row, col });
+    state.table_popup_selected = TablePopupAction::RemoveRow;
+    state.table_popup_hover = None;
+    state.dirty = true;
+}
+
+fn click_table_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let Some(action) = state
+        .table_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action.clone())
+    else {
+        return;
+    };
+    state.table_popup_selected = action.clone();
+    state.table_popup_hover = Some(action.clone());
+    apply_table_popup_action(state, action);
+}
+
+fn hover_table_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let hover = state
+        .table_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action.clone());
+    if state.table_popup_hover != hover {
+        state.table_popup_hover = hover;
+        state.dirty = true;
+    }
+}
+
+fn insert_block_with_cursor(
+    state: &mut TuiState,
+    insert_index: usize,
+    block: DocBlock,
+    cursor: Cursor,
+    message: &str,
+) {
+    clear_spacer_cursor(state);
+    state.preferred_column = None;
+    state.cursor_row_hint = None;
+    state
+        .app
+        .editor
+        .insert_block_at(insert_index, block, cursor);
+    state.dirty = true;
+    state.message = message.to_string();
+    ensure_cursor_visible(state);
+}
+
+fn insert_heading_block(state: &mut TuiState, insert_index: usize, level: u8) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::Heading {
+            level,
+            inlines: vec![Inline::Text(String::new())],
+        },
+        Cursor::Text {
+            block: insert_index,
+            offset: 0,
+        },
+        &format!("heading {level}"),
+    );
+}
+
+fn insert_table_block(state: &mut TuiState, insert_index: usize) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::Table(Table::new(vec![vec![String::new()]])),
+        Cursor::TableCell {
+            block: insert_index,
+            row: 0,
+            col: 0,
+            offset: 0,
+        },
+        "table",
+    );
+}
+
+fn insert_code_block(state: &mut TuiState, insert_index: usize) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::CodeBlock {
+            language: None,
+            text: String::new(),
+        },
+        Cursor::Text {
+            block: insert_index,
+            offset: 0,
+        },
+        "code block",
+    );
+}
+
+fn insert_quote_block(state: &mut TuiState, insert_index: usize) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::BlockQuote(vec![DocBlock::Paragraph(vec![Inline::Text(String::new())])]),
+        Cursor::Text {
+            block: insert_index,
+            offset: 0,
+        },
+        "block quote",
+    );
+}
+
+fn insert_paragraph_text(state: &mut TuiState, insert_index: usize, text: &str) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::Paragraph(vec![Inline::Text(text.to_string())]),
+        Cursor::Text {
+            block: insert_index,
+            offset: text.chars().count(),
+        },
+        "paragraph",
+    );
 }
 
 fn run_explorer_action(state: &mut TuiState, action: &ExplorerAction) {
@@ -2710,8 +3524,25 @@ fn open_file(state: &mut TuiState, path: &Path) {
                 .remove(&file_leaf(&path.display().to_string()));
             state.scroll = 0;
             state.preferred_column = None;
+            state.cursor_row_hint = None;
+            state.spacer_cursor = None;
+            state.last_base_rendered = None;
+            state.last_base_render_key = None;
             state.last_rendered = None;
             state.last_render_key = None;
+            state.last_styled_lines = None;
+            state.last_styled_key = None;
+            state.last_outline_lines = None;
+            state.last_outline_hits = None;
+            state.last_outline_key = None;
+            state.last_explorer_lines = None;
+            state.last_explorer_hits = None;
+            state.last_explorer_key = None;
+            state.last_nav_index = None;
+            state.last_nav_key = None;
+            state.table_popup = None;
+            state.table_popup_hits.clear();
+            state.last_table_popup = None;
             state.last_kitty_signature = None;
             state.dirty = false;
             state.message = format!("opened {}", file_leaf(&path.display().to_string()));
@@ -3170,12 +4001,11 @@ fn walk_dir_nested(
 
 fn outline_lines(
     blocks: &[DocBlock],
-    active_block: usize,
     theme: &Theme,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<OutlineHit>) {
     if let Some(entries) = outline_toc_entries(blocks) {
-        return outline_toc_lines(&entries, active_block, theme, width);
+        return outline_toc_lines(&entries, theme, width);
     }
     let headings = blocks
         .iter()
@@ -3196,36 +4026,12 @@ fn outline_lines(
     let mut lines = Vec::new();
     let mut hits = Vec::new();
     for (index, level, text) in headings {
-        let active = active_block == index;
-        let bg = if active {
-            theme.active_row
-        } else {
-            theme.panel_bg
-        };
         let depth = level.saturating_sub(1);
         let mute_mix = u16::from(depth).saturating_mul(20);
-        let title_color = rgb(&mix_hex(
-            if active {
-                theme.accent_highlight
-            } else {
-                theme.accent_primary
-            },
-            theme.panel_bg,
-            mute_mix,
-        ));
+        let title_color = rgb(&mix_hex(theme.accent_primary, theme.panel_bg, mute_mix));
         let prefix_color = rgb(&mix_hex(theme.link, theme.panel_bg, mute_mix));
-        let title_style = Style::default()
-            .fg(title_color)
-            .bg(rgb(bg))
-            .add_modifier(if active {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            });
-        let prefix_style = Style::default()
-            .fg(prefix_color)
-            .bg(rgb(bg))
-            .add_modifier(Modifier::BOLD);
+        let title_style = Style::default().fg(title_color).bg(rgb(theme.panel_bg));
+        let prefix_style = Style::default().fg(prefix_color).bg(rgb(theme.panel_bg));
         let indent = "  ".repeat(level.saturating_sub(1) as usize);
         let (prefix_marker, title_text) = if let Some((prefix, title)) = split_heading_number(&text)
         {
@@ -3246,7 +4052,9 @@ fn outline_lines(
                 lines.push(Line::from(vec![
                     Span::styled(
                         indent.clone(),
-                        Style::default().fg(rgb(theme.text_muted)).bg(rgb(bg)),
+                        Style::default()
+                            .fg(rgb(theme.text_muted))
+                            .bg(rgb(theme.panel_bg)),
                     ),
                     Span::styled(prefix_marker.clone(), prefix_style),
                     Span::styled(part.clone(), title_style),
@@ -3255,7 +4063,9 @@ fn outline_lines(
                 lines.push(Line::from(vec![
                     Span::styled(
                         " ".repeat(prefix_width),
-                        Style::default().fg(rgb(theme.text_muted)).bg(rgb(bg)),
+                        Style::default()
+                            .fg(rgb(theme.text_muted))
+                            .bg(rgb(theme.panel_bg)),
                     ),
                     Span::styled(part.clone(), title_style),
                 ]));
@@ -3329,7 +4139,6 @@ fn outline_toc_entries(blocks: &[DocBlock]) -> Option<Vec<(usize, String)>> {
 
 fn outline_toc_lines(
     entries: &[(usize, String)],
-    active_block: usize,
     theme: &Theme,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<OutlineHit>) {
@@ -3337,12 +4146,6 @@ fn outline_toc_lines(
     let mut hits = Vec::new();
     let prefix_width = entries.len().max(1).to_string().chars().count() + 2;
     for (index, (block, title)) in entries.iter().enumerate() {
-        let active = *block == active_block;
-        let bg = if active {
-            theme.active_row
-        } else {
-            theme.panel_bg
-        };
         let prefix = format!("{:>width$}. ", index + 1, width = prefix_width - 2);
         let available = usize::from(width).saturating_sub(prefix_width).max(8);
         let wrapped = wrap_outline_text(title, available);
@@ -3354,42 +4157,23 @@ fn outline_toc_lines(
                         prefix.clone(),
                         Style::default()
                             .fg(rgb(theme.text_secondary))
-                            .bg(rgb(bg))
+                            .bg(rgb(theme.panel_bg))
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         part.clone(),
-                        Style::default()
-                            .fg(rgb(if active {
-                                theme.accent_highlight
-                            } else {
-                                theme.link
-                            }))
-                            .bg(rgb(bg))
-                            .add_modifier(if active {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
+                        Style::default().fg(rgb(theme.link)).bg(rgb(theme.panel_bg)),
                     ),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled(" ".repeat(prefix_width), Style::default().bg(rgb(bg))),
+                    Span::styled(
+                        " ".repeat(prefix_width),
+                        Style::default().bg(rgb(theme.panel_bg)),
+                    ),
                     Span::styled(
                         part.clone(),
-                        Style::default()
-                            .fg(rgb(if active {
-                                theme.accent_highlight
-                            } else {
-                                theme.link
-                            }))
-                            .bg(rgb(bg))
-                            .add_modifier(if active {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
+                        Style::default().fg(rgb(theme.link)).bg(rgb(theme.panel_bg)),
                     ),
                 ]));
             }
@@ -3526,11 +4310,7 @@ fn style_rendered_line(
         ));
     }
 
-    let background = if context.current_y.is_some_and(|y| y as usize == index) {
-        rgb(theme.panel_raised)
-    } else {
-        rgb(theme.panel_bg)
-    };
+    let background = rgb(theme.panel_bg);
     let mut style = Style::default().fg(rgb(theme.text_primary)).bg(background);
     if next_line.is_some_and(is_heading_rule) {
         style = style
@@ -3601,6 +4381,7 @@ fn styled_text_spans_for_row(
         .filter(|item| {
             item.rect.y as usize == index
                 && item.kind != DisplayKind::HeadlinePlacement
+                && item.kind != DisplayKind::CursorTarget
                 && !(item.kind == DisplayKind::Adornment && item.text.trim().is_empty())
         })
         .collect::<Vec<_>>();
@@ -3620,6 +4401,13 @@ fn styled_text_spans_for_row(
         && row_items.first().is_some_and(|item| {
             item.kind == DisplayKind::Adornment && is_numbered_marker(&item.text)
         });
+    let row_style = RowSpanContext {
+        background,
+        heading,
+        toc_row,
+        numbered_row,
+        blockquote_row,
+    };
     let mut spans = Vec::new();
     let mut cursor_x = 0usize;
     for item in row_items {
@@ -3629,49 +4417,64 @@ fn styled_text_spans_for_row(
                 line_chars[cursor_x..item_x.min(line_chars.len())]
                     .iter()
                     .collect::<String>(),
-                base_document_style(theme, background, heading, numbered_row, blockquote_row),
+                base_document_style(
+                    theme,
+                    row_style.background,
+                    row_style.heading,
+                    row_style.numbered_row,
+                    row_style.blockquote_row,
+                ),
             ));
         }
-        spans.extend(spans_for_display_item(
-            item,
-            state,
-            theme,
-            background,
-            heading,
-            numbered_row,
-            blockquote_row,
-        ));
+        spans.extend(spans_for_display_item(item, state, theme, row_style));
         cursor_x = item_x.saturating_add(usize::from(item.rect.width));
     }
     if cursor_x < line_chars.len() {
         spans.push(Span::styled(
             line_chars[cursor_x..].iter().collect::<String>(),
-            base_document_style(theme, background, heading, numbered_row, blockquote_row),
+            base_document_style(
+                theme,
+                row_style.background,
+                row_style.heading,
+                row_style.numbered_row,
+                row_style.blockquote_row,
+            ),
         ));
     }
     Some(spans)
+}
+
+#[derive(Clone, Copy)]
+struct RowSpanContext {
+    background: Color,
+    heading: bool,
+    toc_row: bool,
+    numbered_row: bool,
+    blockquote_row: bool,
 }
 
 fn spans_for_display_item(
     item: &mdtui_render::DisplayItem,
     state: &TuiState,
     theme: &Theme,
-    background: Color,
-    heading: bool,
-    numbered_row: bool,
-    blockquote_row: bool,
+    row_style: RowSpanContext,
 ) -> Vec<Span<'static>> {
-    if matches!(item.action, Some(DisplayAction::FollowLink { .. })) {
-        return toc_row_spans(&item.text, theme, background);
+    if row_style.toc_row {
+        return toc_row_spans(
+            &item.text,
+            theme,
+            row_style.background,
+            item.action.is_some(),
+        );
     }
     if item.kind == DisplayKind::Adornment {
         return adornment_spans(
             &item.text,
             theme,
-            background,
-            heading,
-            numbered_row,
-            blockquote_row,
+            row_style.background,
+            row_style.heading,
+            row_style.numbered_row,
+            row_style.blockquote_row,
         );
     }
     let visible_len = item.text.chars().count();
@@ -3681,10 +4484,10 @@ fn spans_for_display_item(
         let mut spans = fragments_to_spans(
             &fragments,
             theme,
-            background,
-            heading,
-            numbered_row,
-            blockquote_row,
+            row_style.background,
+            row_style.heading,
+            row_style.numbered_row,
+            row_style.blockquote_row,
         );
         let painted = fragments
             .iter()
@@ -3693,7 +4496,13 @@ fn spans_for_display_item(
         if painted < usize::from(item.rect.width) {
             spans.push(Span::styled(
                 " ".repeat(usize::from(item.rect.width) - painted),
-                base_document_style(theme, background, heading, numbered_row, blockquote_row),
+                base_document_style(
+                    theme,
+                    row_style.background,
+                    row_style.heading,
+                    row_style.numbered_row,
+                    row_style.blockquote_row,
+                ),
             ));
         }
         return spans;
@@ -3703,10 +4512,10 @@ fn spans_for_display_item(
         style_for_display_item(
             item,
             theme,
-            background,
-            heading,
-            numbered_row,
-            blockquote_row,
+            row_style.background,
+            row_style.heading,
+            row_style.numbered_row,
+            row_style.blockquote_row,
         ),
     )]
 }
@@ -3772,8 +4581,8 @@ fn adornment_spans(
     )]
 }
 
-fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'static>> {
-    let Some((head, number)) = text.rsplit_once(' ') else {
+fn toc_row_spans(text: &str, theme: &Theme, background: Color, linked: bool) -> Vec<Span<'static>> {
+    if linked {
         return vec![Span::styled(
             text.to_string(),
             Style::default()
@@ -3781,35 +4590,19 @@ fn toc_row_spans(text: &str, theme: &Theme, background: Color) -> Vec<Span<'stat
                 .bg(background)
                 .add_modifier(Modifier::UNDERLINED),
         )];
-    };
-    let Some((title, dots)) = head.rsplit_once(' ') else {
+    }
+    if text.trim().chars().all(|ch| ch == '.') {
         return vec![Span::styled(
             text.to_string(),
-            Style::default()
-                .fg(rgb(theme.link))
-                .bg(background)
-                .add_modifier(Modifier::UNDERLINED),
-        )];
-    };
-    vec![
-        Span::styled(
-            title.to_string(),
-            Style::default()
-                .fg(rgb(theme.link))
-                .bg(background)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        Span::styled(
-            format!(" {dots} "),
             Style::default()
                 .fg(rgb(theme.text_secondary))
                 .bg(background),
-        ),
-        Span::styled(
-            number.to_string(),
-            Style::default().fg(rgb(theme.link)).bg(background),
-        ),
-    ]
+        )];
+    }
+    vec![Span::styled(
+        text.to_string(),
+        Style::default().fg(rgb(theme.link)).bg(background),
+    )]
 }
 
 fn styled_fragments_for_item(
@@ -4333,7 +5126,10 @@ fn selection_rect_for_item(
     selection_end: Cursor,
 ) -> Option<mdtui_render::Rect> {
     let item_start = item.cursor?;
-    if item.kind == DisplayKind::Adornment || item.kind == DisplayKind::HeadlinePlacement {
+    if matches!(
+        item.kind,
+        DisplayKind::Adornment | DisplayKind::HeadlinePlacement | DisplayKind::CursorTarget
+    ) {
         return None;
     }
     let item_end = advance_cursor(item_start, usize::from(item.rect.width))?;
@@ -4467,6 +5263,39 @@ fn apply_selection_highlight(
             Style::default().bg(rgb(theme.active_row)),
         );
     }
+}
+
+fn apply_active_row_highlight(
+    buf: &mut Buffer,
+    area: Rect,
+    scroll: u16,
+    current_y: Option<u16>,
+    theme: &Theme,
+) {
+    let Some(current_y) = current_y else {
+        return;
+    };
+    if current_y < scroll {
+        return;
+    }
+    let screen_y = document_content_top(area).saturating_add(current_y - scroll);
+    if screen_y <= area.y || screen_y >= area.y.saturating_add(area.height.saturating_sub(1)) {
+        return;
+    }
+    let left = area.x.saturating_add(1);
+    let right = area.x.saturating_add(area.width.saturating_sub(1));
+    if right <= left {
+        return;
+    }
+    buf.set_style(
+        Rect {
+            x: left,
+            y: screen_y,
+            width: right.saturating_sub(left),
+            height: 1,
+        },
+        Style::default().bg(rgb(theme.panel_raised)),
+    );
 }
 
 fn is_heading_rule(line: &str) -> bool {
@@ -4770,93 +5599,311 @@ fn copy_osc52(text: &str) -> io::Result<()> {
     stdout.flush()
 }
 
-fn cursor_position(cursor: &Cursor, items: &[mdtui_render::DisplayItem]) -> Option<(u16, u16)> {
-    for item in items {
-        let Some(base) = item.cursor else {
-            continue;
-        };
-        match (*cursor, base) {
-            (
-                Cursor::Text { block, offset },
-                Cursor::Text {
-                    block: base_block,
-                    offset: base_offset,
-                },
-            ) if block == base_block
-                && offset >= base_offset
-                && offset <= base_offset + usize::from(item.rect.width) =>
-            {
-                let local = offset.saturating_sub(base_offset) as u16;
-                return Some((item.rect.x.saturating_add(local), item.rect.y));
+impl DisplayNavIndex {
+    fn build(items: &[mdtui_render::DisplayItem], blocks: &[DocBlock]) -> Self {
+        let mut index = Self::default();
+        let mut extents: HashMap<usize, (u16, u16)> = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            index.rows.entry(item.rect.y).or_default().push(item_index);
+            if let Some(block) = display_item_block(item) {
+                let mut item_min_y = item.rect.y;
+                let mut item_max_y = item
+                    .rect
+                    .y
+                    .saturating_add(item.rect.height.saturating_sub(1));
+                if matches!(blocks.get(block), Some(DocBlock::CodeBlock { .. })) {
+                    if matches!(item.action, Some(DisplayAction::CopyCodeBlock { .. })) {
+                        item_min_y = item_min_y.saturating_sub(1);
+                        item_max_y = item_max_y.saturating_add(3);
+                    }
+                    if matches!(item.cursor, Some(Cursor::Text { .. })) {
+                        item_max_y = item_max_y.saturating_add(1);
+                    }
+                }
+                extents
+                    .entry(block)
+                    .and_modify(|(min_y, max_y)| {
+                        *min_y = (*min_y).min(item_min_y);
+                        *max_y = (*max_y).max(item_max_y);
+                    })
+                    .or_insert((item_min_y, item_max_y));
             }
-            (
+            let Some(cursor) = item.cursor else {
+                continue;
+            };
+            let lane = cursor_lane(cursor);
+            let segment = match cursor {
+                Cursor::Text { offset, .. }
+                | Cursor::ListItem { offset, .. }
+                | Cursor::TableCell { offset, .. } => CursorSegment {
+                    start: offset,
+                    end: offset + usize::from(item.rect.width),
+                    x: item.rect.x,
+                    y: item.rect.y,
+                },
+                Cursor::Checkbox { .. } => CursorSegment {
+                    start: 0,
+                    end: 0,
+                    x: item.rect.x,
+                    y: item.rect.y,
+                },
+            };
+            index.lanes.entry(lane).or_default().push(segment);
+        }
+        let mut blocks = extents.into_iter().collect::<Vec<_>>();
+        blocks.sort_by_key(|(block, _)| *block);
+        for window in blocks.windows(2) {
+            let [(block, (_, max_y)), (_, (next_min_y, _))] = window else {
+                continue;
+            };
+            let start = max_y.saturating_add(1);
+            if *next_min_y <= start {
+                continue;
+            }
+            for row in start..*next_min_y {
+                index.spacer_rows.insert(row, block + 1);
+            }
+        }
+        index
+    }
+}
+
+fn display_item_block(item: &mdtui_render::DisplayItem) -> Option<usize> {
+    item.cursor.map(cursor_block).or(match item.action {
+        Some(DisplayAction::CopyCodeBlock { block })
+        | Some(DisplayAction::FollowLink { block })
+        | Some(DisplayAction::ScrollCodeBlock { block, .. }) => Some(block),
+        None => None,
+    })
+}
+
+fn cursor_lane(cursor: Cursor) -> CursorLane {
+    match cursor {
+        Cursor::Text { block, .. } => CursorLane::Text { block },
+        Cursor::ListItem { block, item, .. } => CursorLane::ListItem { block, item },
+        Cursor::TableCell {
+            block, row, col, ..
+        } => CursorLane::TableCell { block, row, col },
+        Cursor::Checkbox { block, item } => CursorLane::Checkbox { block, item },
+    }
+}
+
+fn cursor_position(
+    cursor: &Cursor,
+    index: &DisplayNavIndex,
+    hint_row: Option<u16>,
+) -> Option<(u16, u16)> {
+    let lane = cursor_lane(*cursor);
+    let segments = index.lanes.get(&lane)?;
+    match *cursor {
+        Cursor::Text { offset, .. }
+        | Cursor::ListItem { offset, .. }
+        | Cursor::TableCell { offset, .. } => {
+            let mut matches = segments
+                .iter()
+                .filter(|segment| offset >= segment.start && offset <= segment.end);
+            if let Some(row) = hint_row
+                && let Some(segment) = matches.clone().find(|segment| segment.y == row)
+            {
+                return Some((
+                    segment
+                        .x
+                        .saturating_add(offset.saturating_sub(segment.start) as u16),
+                    segment.y,
+                ));
+            }
+            matches.next().map(|segment| {
+                (
+                    segment
+                        .x
+                        .saturating_add(offset.saturating_sub(segment.start) as u16),
+                    segment.y,
+                )
+            })
+        }
+        Cursor::Checkbox { .. } => hint_row
+            .and_then(|row| segments.iter().find(|segment| segment.y == row))
+            .or_else(|| segments.first())
+            .map(|segment| (segment.x, segment.y)),
+    }
+}
+
+fn visual_cursor_position(state: &TuiState, index: &DisplayNavIndex) -> Option<(u16, u16)> {
+    if let Some(insert_index) = state.spacer_cursor {
+        index
+            .spacer_rows
+            .iter()
+            .find(|(_, candidate)| **candidate == insert_index)
+            .map(|(row, _)| (0, *row))
+            .or_else(|| state.cursor_row_hint.map(|row| (0, row)))
+    } else {
+        cursor_position(&state.app.editor.cursor, index, state.cursor_row_hint)
+    }
+}
+
+fn clear_spacer_cursor(state: &mut TuiState) {
+    state.spacer_cursor = None;
+}
+
+fn set_spacer_cursor(state: &mut TuiState, insert_index: usize, row: u16) {
+    state.spacer_cursor = Some(insert_index);
+    state.cursor_row_hint = Some(row);
+    state.preferred_column = Some(0);
+    clear_pending_edit_target(state);
+    state.app.editor.selection = None;
+    state.app.editor.show_style_popover = false;
+}
+
+enum DocumentTarget {
+    Cursor(Cursor),
+    Spacer(usize),
+}
+
+fn document_target_at(state: &TuiState, x: u16, y: u16) -> Option<DocumentTarget> {
+    let rendered = state.last_rendered.as_ref()?;
+    let nav_index = state.last_nav_index.as_ref()?;
+    hit_test_or_nearest(x, y, &rendered.display)
+        .map(DocumentTarget::Cursor)
+        .or_else(|| {
+            nav_index
+                .spacer_rows
+                .get(&y)
+                .copied()
+                .map(DocumentTarget::Spacer)
+        })
+}
+
+fn select_document_target(state: &mut TuiState, target: DocumentTarget) {
+    match target {
+        DocumentTarget::Cursor(cursor) => {
+            clear_spacer_cursor(state);
+            if let Some((anchor, head)) = whole_target_selection(&state.app.editor.document, cursor)
+            {
+                clear_pending_edit_target(state);
+                state.app.editor.select_range(anchor, head);
+            } else {
+                clear_pending_edit_target(state);
+                state.app.editor.set_cursor(cursor);
+            }
+        }
+        DocumentTarget::Spacer(insert_index) => {
+            set_spacer_cursor(state, insert_index, state.cursor_row_hint.unwrap_or(0))
+        }
+    }
+}
+
+fn whole_target_selection(
+    document: &mdtui_core::Document,
+    cursor: Cursor,
+) -> Option<(Cursor, Cursor)> {
+    match cursor {
+        Cursor::Text { block, .. } => {
+            let len = document.blocks.get(block).map(|doc_block| {
+                editable_block_fallback(doc_block).map_or_else(
+                    || doc_block.rendered_text().chars().count(),
+                    |fallback| fallback.placeholder.chars().count(),
+                )
+            })?;
+            Some((
+                Cursor::Text { block, offset: 0 },
+                Cursor::Text { block, offset: len },
+            ))
+        }
+        Cursor::ListItem { block, item, .. } => {
+            let len = match document.blocks.get(block)? {
+                DocBlock::List(list) => list.items.get(item)?.rendered_text().chars().count(),
+                _ => return None,
+            };
+            Some((
                 Cursor::ListItem {
                     block,
-                    item: list_item,
-                    offset,
+                    item,
+                    offset: 0,
                 },
                 Cursor::ListItem {
-                    block: base_block,
-                    item: base_item,
-                    offset: base_offset,
+                    block,
+                    item,
+                    offset: len,
                 },
-            ) if block == base_block
-                && list_item == base_item
-                && offset >= base_offset
-                && offset <= base_offset + usize::from(item.rect.width) =>
-            {
-                let local = offset.saturating_sub(base_offset) as u16;
-                return Some((item.rect.x.saturating_add(local), item.rect.y));
-            }
-            (
+            ))
+        }
+        Cursor::TableCell {
+            block, row, col, ..
+        } => {
+            let len = match document.blocks.get(block)? {
+                DocBlock::Table(table) => table
+                    .rows
+                    .get(row)?
+                    .cells
+                    .get(col)?
+                    .rendered_text()
+                    .chars()
+                    .count(),
+                _ => return None,
+            };
+            Some((
                 Cursor::TableCell {
                     block,
                     row,
                     col,
-                    offset,
+                    offset: 0,
                 },
                 Cursor::TableCell {
-                    block: base_block,
-                    row: base_row,
-                    col: base_col,
-                    offset: base_offset,
-                },
-            ) if block == base_block
-                && row == base_row
-                && col == base_col
-                && offset >= base_offset
-                && offset <= base_offset + usize::from(item.rect.width) =>
-            {
-                let local = offset.saturating_sub(base_offset) as u16;
-                return Some((item.rect.x.saturating_add(local), item.rect.y));
-            }
-            (
-                Cursor::Checkbox {
                     block,
-                    item: checkbox_item,
+                    row,
+                    col,
+                    offset: len,
                 },
-                Cursor::Checkbox {
-                    block: base_block,
-                    item: base_item,
+            ))
+        }
+        Cursor::Checkbox { block, item } => {
+            let len = match document.blocks.get(block)? {
+                DocBlock::List(list) => list.items.get(item)?.rendered_text().chars().count(),
+                _ => return None,
+            };
+            Some((
+                Cursor::ListItem {
+                    block,
+                    item,
+                    offset: 0,
                 },
-            ) if block == base_block && checkbox_item == base_item => {
-                return Some((item.rect.x, item.rect.y));
-            }
-            _ => {}
+                Cursor::ListItem {
+                    block,
+                    item,
+                    offset: len,
+                },
+            ))
         }
     }
-    None
 }
 
-fn nearest_cursor_on_row(x: u16, y: u16, items: &[mdtui_render::DisplayItem]) -> Option<Cursor> {
+fn hit_test_row(
+    x: u16,
+    y: u16,
+    display: &mdtui_render::DisplayList,
+    index: &DisplayNavIndex,
+) -> Option<Cursor> {
+    index.rows.get(&y)?.iter().find_map(|&item_index| {
+        let item = &display.items[item_index];
+        rect_contains(item.rect, x, y)
+            .then_some(item.cursor)
+            .flatten()
+            .map(|cursor| map_cursor_within_item(cursor, x, item.rect.x, item.rect.width))
+    })
+}
+
+fn nearest_cursor_on_row(
+    x: u16,
+    y: u16,
+    display: &mdtui_render::DisplayList,
+    index: &DisplayNavIndex,
+) -> Option<Cursor> {
     let mut best: Option<(u16, Cursor)> = None;
-    for item in items {
+    for &item_index in index.rows.get(&y)? {
+        let item = &display.items[item_index];
         let Some(cursor) = item.cursor else {
             continue;
         };
-        if item.rect.y != y {
-            continue;
-        }
         let start = item.rect.x;
         let end = item.rect.x.saturating_add(item.rect.width);
         let distance = if x < start {
@@ -4864,33 +5911,7 @@ fn nearest_cursor_on_row(x: u16, y: u16, items: &[mdtui_render::DisplayItem]) ->
         } else {
             x.saturating_sub(end)
         };
-        let mapped = match cursor {
-            Cursor::Text { block, offset } => Cursor::Text {
-                block,
-                offset: offset + usize::from(x.saturating_sub(start).min(item.rect.width)),
-            },
-            Cursor::ListItem {
-                block,
-                item: list_item,
-                offset,
-            } => Cursor::ListItem {
-                block,
-                item: list_item,
-                offset: offset + usize::from(x.saturating_sub(start).min(item.rect.width)),
-            },
-            Cursor::TableCell {
-                block,
-                row,
-                col,
-                offset,
-            } => Cursor::TableCell {
-                block,
-                row,
-                col,
-                offset: offset + usize::from(x.saturating_sub(start).min(item.rect.width)),
-            },
-            Cursor::Checkbox { block, item } => Cursor::Checkbox { block, item },
-        };
+        let mapped = map_cursor_within_item(cursor, x, start, item.rect.width);
         if best
             .as_ref()
             .is_none_or(|(best_distance, _)| distance < *best_distance)
@@ -4899,6 +5920,43 @@ fn nearest_cursor_on_row(x: u16, y: u16, items: &[mdtui_render::DisplayItem]) ->
         }
     }
     best.map(|(_, cursor)| cursor)
+}
+
+fn map_cursor_within_item(cursor: Cursor, x: u16, start: u16, width: u16) -> Cursor {
+    match cursor {
+        Cursor::Text { block, offset } => Cursor::Text {
+            block,
+            offset: offset + usize::from(x.saturating_sub(start).min(width)),
+        },
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } => Cursor::ListItem {
+            block,
+            item,
+            offset: offset + usize::from(x.saturating_sub(start).min(width)),
+        },
+        Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset,
+        } => Cursor::TableCell {
+            block,
+            row,
+            col,
+            offset: offset + usize::from(x.saturating_sub(start).min(width)),
+        },
+        Cursor::Checkbox { block, item } => Cursor::Checkbox { block, item },
+    }
+}
+
+fn rect_contains(rect: mdtui_render::Rect, x: u16, y: u16) -> bool {
+    x >= rect.x
+        && x < rect.x.saturating_add(rect.width)
+        && y >= rect.y
+        && y < rect.y.saturating_add(rect.height)
 }
 
 fn emit_kitty_headlines<W: Write>(writer: &mut W, state: &mut TuiState) -> io::Result<()> {
@@ -5395,67 +6453,239 @@ fn headline_level(state: &TuiState, item: &mdtui_render::DisplayItem) -> u8 {
     }
 }
 
-fn materialize_active_headline_fallback(state: &TuiState, rendered: &mut Rendered) {
-    let Some(active_block) = active_headline_block(state) else {
+fn materialize_active_block_fallback(state: &TuiState, rendered: &mut Rendered) {
+    let Some(active_target) = active_editable_target(state) else {
         return;
     };
     let mut items = Vec::with_capacity(rendered.display.items.len() + 2);
+    let mut replaced_rows = HashSet::new();
     for item in &rendered.display.items {
-        if item.kind != DisplayKind::HeadlinePlacement {
-            items.push(item.clone());
+        if matches!(active_target, EditableTarget::ListItem { .. })
+            && replaced_rows.contains(&item.rect.y)
+        {
             continue;
         }
         let Some(cursor) = item.cursor else {
             items.push(item.clone());
             continue;
         };
-        if cursor_block(cursor) != active_block {
-            items.push(item.clone());
-            continue;
+        match active_target {
+            EditableTarget::Block(active_block) => {
+                if cursor_block(cursor) != active_block {
+                    items.push(item.clone());
+                    continue;
+                }
+                match state.app.editor.document.blocks.get(active_block) {
+                    Some(DocBlock::Heading { .. })
+                        if item.kind == DisplayKind::HeadlinePlacement =>
+                    {
+                        let text = item.text.trim();
+                        let display = text.to_string();
+                        let text_y = usize::from(item.rect.y);
+                        let rule_y = usize::from(item.rect.y.saturating_add(1));
+                        if let Some(line) = rendered.lines.get_mut(text_y) {
+                            *line = String::new();
+                        }
+                        if let Some(line) = rendered.lines.get_mut(rule_y) {
+                            *line = display.clone();
+                        }
+                        items.push(mdtui_render::DisplayItem {
+                            kind: DisplayKind::TextRun,
+                            rect: mdtui_render::Rect {
+                                x: 0,
+                                y: item.rect.y.saturating_add(1),
+                                width: display.chars().count() as u16,
+                                height: 1,
+                            },
+                            cursor: Some(Cursor::Text {
+                                block: active_block,
+                                offset: 0,
+                            }),
+                            action: None,
+                            text: display,
+                        });
+                    }
+                    Some(DocBlock::ImageBlock { alt, .. })
+                        if item.kind == DisplayKind::ImagePlacement =>
+                    {
+                        if let Some(line) = rendered.lines.get_mut(usize::from(item.rect.y)) {
+                            *line = alt.clone();
+                        }
+                        items.push(mdtui_render::DisplayItem {
+                            kind: DisplayKind::TextRun,
+                            rect: mdtui_render::Rect {
+                                x: 0,
+                                y: item.rect.y,
+                                width: alt.chars().count() as u16,
+                                height: 1,
+                            },
+                            cursor: Some(Cursor::Text {
+                                block: active_block,
+                                offset: 0,
+                            }),
+                            action: None,
+                            text: alt.clone(),
+                        });
+                    }
+                    Some(block)
+                        if item.kind == DisplayKind::CursorTarget
+                            && editable_block_fallback(block).is_some() =>
+                    {
+                        let display = editable_block_fallback(block)
+                            .map(|fallback| fallback.placeholder.to_string())
+                            .unwrap_or_default();
+                        if let Some(line) = rendered.lines.get_mut(usize::from(item.rect.y)) {
+                            *line = display.clone();
+                        }
+                        items.push(mdtui_render::DisplayItem {
+                            kind: DisplayKind::TextRun,
+                            rect: mdtui_render::Rect {
+                                x: item.rect.x,
+                                y: item.rect.y,
+                                width: display.chars().count() as u16,
+                                height: 1,
+                            },
+                            cursor: item.cursor,
+                            action: None,
+                            text: display,
+                        });
+                    }
+                    _ => items.push(item.clone()),
+                }
+            }
+            EditableTarget::ListItem {
+                block,
+                item: list_item,
+            } => {
+                let matches_item = matches!(
+                    cursor,
+                    Cursor::ListItem {
+                        block: item_block,
+                        item: item_index,
+                        ..
+                    } if item_block == block && item_index == list_item
+                );
+                if !matches_item {
+                    items.push(item.clone());
+                    continue;
+                }
+                if !replaced_rows.insert(item.rect.y) {
+                    continue;
+                }
+                let display = match state.app.editor.document.blocks.get(block) {
+                    Some(DocBlock::List(list)) => list
+                        .items
+                        .get(list_item)
+                        .map_or_else(String::new, mdtui_core::ListItem::rendered_text),
+                    _ => String::new(),
+                };
+                if let Some(line) = rendered.lines.get_mut(usize::from(item.rect.y)) {
+                    *line = display.clone();
+                }
+                items.push(mdtui_render::DisplayItem {
+                    kind: DisplayKind::TextRun,
+                    rect: mdtui_render::Rect {
+                        x: 0,
+                        y: item.rect.y,
+                        width: display.chars().count() as u16,
+                        height: 1,
+                    },
+                    cursor: Some(Cursor::ListItem {
+                        block,
+                        item: list_item,
+                        offset: 0,
+                    }),
+                    action: None,
+                    text: display,
+                });
+            }
         }
-        let Some(DocBlock::Heading { .. }) = state.app.editor.document.blocks.get(active_block)
-        else {
-            items.push(item.clone());
-            continue;
-        };
-        let text = item.text.trim();
-        let display = text.to_string();
-        let text_y = usize::from(item.rect.y);
-        let rule_y = usize::from(item.rect.y.saturating_add(1));
-        if let Some(line) = rendered.lines.get_mut(text_y) {
-            *line = String::new();
-        }
-        if let Some(line) = rendered.lines.get_mut(rule_y) {
-            *line = display.clone();
-        }
-        items.push(mdtui_render::DisplayItem {
-            kind: DisplayKind::TextRun,
-            rect: mdtui_render::Rect {
-                x: 0,
-                y: item.rect.y.saturating_add(1),
-                width: display.chars().count() as u16,
-                height: 1,
-            },
-            cursor: Some(Cursor::Text {
-                block: active_block,
-                offset: 0,
-            }),
-            action: None,
-            text: display,
-        });
     }
     rendered.display.items = items;
 }
 
-fn active_headline_block(state: &TuiState) -> Option<usize> {
-    if !state.kitty_graphics {
+fn active_editable_target(state: &TuiState) -> Option<EditableTarget> {
+    let target = current_editable_target(state)?;
+    if state
+        .pending_edit_target
+        .is_some_and(|pending| pending.target == target)
+    {
         return None;
     }
-    let block = cursor_block(state.app.editor.cursor);
-    match state.app.editor.document.blocks.get(block) {
-        Some(DocBlock::Heading { level: 1 | 2, .. }) => Some(block),
+    Some(target)
+}
+
+fn current_editable_target(state: &TuiState) -> Option<EditableTarget> {
+    editable_target_for_cursor(state, state.app.editor.cursor)
+}
+
+fn editable_target_for_cursor(state: &TuiState, cursor: Cursor) -> Option<EditableTarget> {
+    match cursor {
+        Cursor::Text { block, .. } => match state.app.editor.document.blocks.get(block) {
+            Some(DocBlock::Heading { level: 1 | 2, .. }) if state.kitty_graphics => {
+                Some(EditableTarget::Block(block))
+            }
+            Some(DocBlock::ImageBlock { .. }) => Some(EditableTarget::Block(block)),
+            Some(block_ref) if editable_block_fallback(block_ref).is_some() => {
+                Some(EditableTarget::Block(block))
+            }
+            _ => None,
+        },
+        Cursor::ListItem { block, item, .. }
+            if is_toc_list_item(&state.app.editor.document.blocks, block, item) =>
+        {
+            Some(EditableTarget::ListItem { block, item })
+        }
         _ => None,
     }
+}
+
+fn is_toc_list_item(blocks: &[DocBlock], block: usize, item: usize) -> bool {
+    let headings = blocks
+        .iter()
+        .filter_map(|block| match block {
+            DocBlock::Heading { inlines, .. } => {
+                Some(outline_slugify_heading(&mdtui_core::inline_text(inlines)))
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let Some(DocBlock::List(list)) = blocks.get(block) else {
+        return false;
+    };
+    let Some(item) = list.items.get(item) else {
+        return false;
+    };
+    let [DocBlock::Paragraph(inlines)] = item.blocks.as_slice() else {
+        return false;
+    };
+    let [Inline::Link { target, .. }] = inlines.as_slice() else {
+        return false;
+    };
+    target
+        .strip_prefix('#')
+        .is_some_and(|slug| headings.contains(slug))
+}
+
+fn schedule_editable_target_activation(state: &mut TuiState, cursor: Cursor) {
+    if let Some(target) = editable_target_for_cursor(state, cursor) {
+        state.pending_edit_target = Some(PendingEditableTarget {
+            target,
+            activate_at: Instant::now() + SPECIAL_EDIT_DELAY,
+        });
+    } else {
+        state.pending_edit_target = None;
+    }
+}
+
+fn activate_pending_edit_target_now(state: &mut TuiState) {
+    if current_editable_target(state).is_some() {
+        state.pending_edit_target = None;
+    }
+}
+
+fn clear_pending_edit_target(state: &mut TuiState) {
+    state.pending_edit_target = None;
 }
 
 fn document_content_left(area: Rect) -> u16 {
@@ -5466,6 +6696,58 @@ fn document_content_top(area: Rect) -> u16 {
     area.y.saturating_add(1)
 }
 
+fn document_screen_cursor(
+    area: Rect,
+    scroll: u16,
+    cursor_screen: Option<(u16, u16)>,
+) -> Option<(u16, u16)> {
+    let (x, y) = cursor_screen?;
+    let screen_x = document_content_left(area).saturating_add(x);
+    let screen_y = document_content_top(area).saturating_add(y.saturating_sub(scroll));
+    (screen_y > area.y && screen_y < area.y.saturating_add(area.height.saturating_sub(1)))
+        .then_some((screen_x, screen_y))
+}
+
+fn recover_nonvisual_cursor(state: &mut TuiState, delta: i32, extend: bool) -> bool {
+    let Some(cursor) = neighboring_document_cursor(state, delta) else {
+        return false;
+    };
+    state.preferred_column = None;
+    state.cursor_row_hint = None;
+    clear_spacer_cursor(state);
+    if extend {
+        let anchor = state
+            .app
+            .editor
+            .selection
+            .map_or(state.app.editor.cursor, |selection| selection.anchor);
+        state.app.editor.select_range(anchor, cursor);
+        clear_pending_edit_target(state);
+    } else {
+        state.app.editor.set_cursor(cursor);
+        schedule_editable_target_activation(state, cursor);
+    }
+    true
+}
+
+fn neighboring_document_cursor(state: &TuiState, delta: i32) -> Option<Cursor> {
+    let step = delta.signum();
+    if step == 0 {
+        return None;
+    }
+    let mut block = cursor_block(state.app.editor.cursor) as i32 + step;
+    while block >= 0 && (block as usize) < state.app.editor.document.blocks.len() {
+        if let Some(cursor) = default_cursor_for_block(
+            block as usize,
+            &state.app.editor.document.blocks[block as usize],
+        ) {
+            return Some(cursor);
+        }
+        block += step;
+    }
+    None
+}
+
 fn clamp_scroll(offset: u16, content: usize, viewport: usize) -> u16 {
     if viewport == 0 {
         return 0;
@@ -5473,15 +6755,45 @@ fn clamp_scroll(offset: u16, content: usize, viewport: usize) -> u16 {
     offset.min(content.saturating_sub(viewport) as u16)
 }
 
-fn normalize_headline_cursor(state: &TuiState, cursor: Cursor) -> Cursor {
+fn normalize_active_block_cursor(state: &TuiState, cursor: Cursor) -> Cursor {
     match cursor {
         Cursor::Text { block, offset } => match state.app.editor.document.blocks.get(block) {
             Some(DocBlock::Heading { inlines, .. }) if state.kitty_graphics => Cursor::Text {
                 block,
                 offset: offset.min(mdtui_core::inline_text(inlines).chars().count()),
             },
+            Some(DocBlock::ImageBlock { alt, .. }) => Cursor::Text {
+                block,
+                offset: offset.min(alt.chars().count()),
+            },
+            Some(block_ref) if editable_block_fallback(block_ref).is_some() => Cursor::Text {
+                block,
+                offset: offset.min(
+                    editable_block_fallback(block_ref)
+                        .map(|fallback| fallback.placeholder.chars().count())
+                        .unwrap_or(0),
+                ),
+            },
             _ => cursor,
         },
+        Cursor::ListItem {
+            block,
+            item,
+            offset,
+        } if is_toc_list_item(&state.app.editor.document.blocks, block, item) => {
+            let max = match state.app.editor.document.blocks.get(block) {
+                Some(DocBlock::List(list)) => list
+                    .items
+                    .get(item)
+                    .map_or(0, |item| item.rendered_text().chars().count()),
+                _ => 0,
+            };
+            Cursor::ListItem {
+                block,
+                item,
+                offset: offset.min(max),
+            }
+        }
         _ => cursor,
     }
 }
@@ -5491,6 +6803,12 @@ fn workspace_root_for(path: Option<&Path>) -> PathBuf {
         || env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         workspace_root,
     )
+}
+
+fn sorted_paths(paths: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut sorted = paths.iter().cloned().collect::<Vec<_>>();
+    sorted.sort();
+    sorted
 }
 
 fn toggle_style(active: bool, theme: &Theme) -> Style {
@@ -5578,16 +6896,6 @@ fn split_heading_number(text: &str) -> Option<(String, &str)> {
         break;
     }
     seen_period.then_some((text[..end].to_string(), text[end..].trim_start()))
-}
-
-fn compact_text(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let mut out = text.chars().take(max.saturating_sub(1)).collect::<String>();
-        out.push('…');
-        out
-    }
 }
 
 fn put(buf: &mut Buffer, x: &mut u16, y: u16, right: u16, text: &str, style: Style) {
@@ -5723,8 +7031,11 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
-        state.last_rendered = Some(rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
+        state.last_rendered = Some(Arc::new(rendered));
+
+        move_visual(&mut state, 1, false);
+        assert_eq!(state.spacer_cursor, Some(1));
 
         move_visual(&mut state, 1, false);
 
@@ -5734,6 +7045,235 @@ mod tests {
                 block: 1,
                 offset: 0
             }
+        );
+    }
+
+    #[test]
+    fn move_visual_can_enter_thematic_break_blocks() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "before\n\n---\n\nafter"), None);
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        state.last_rendered = Some(Arc::new(rendered));
+
+        move_visual(&mut state, 1, false);
+        assert_eq!(state.spacer_cursor, Some(1));
+
+        move_visual(&mut state, 1, false);
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 1,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn move_visual_can_cross_thematic_break_without_waiting_for_redraw() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "before\n\n---\n\nafter"), None);
+        state.last_doc_area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        state.app.render_options = RenderOptions {
+            width: 36,
+            heading_width: 36,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let rendered = Arc::new(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        state.last_rendered = Some(rendered.clone());
+        state.last_render_key = Some(RenderCacheKey {
+            version: state.app.editor.document.version,
+            options: state.app.render_options.clone(),
+            active_fallback_block: None,
+        });
+
+        move_visual(&mut state, 1, false);
+        move_visual(&mut state, 1, false);
+        move_visual(&mut state, 1, false);
+        move_visual(&mut state, 1, false);
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 2,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn move_visual_recovers_from_thematic_break_cursor() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "before\n\n---\n\nafter"), None);
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        state.last_rendered = Some(Arc::new(rendered));
+
+        move_visual(&mut state, 1, false);
+        assert_eq!(state.spacer_cursor, Some(2));
+
+        move_visual(&mut state, 1, false);
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 2,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn active_thematic_break_renders_placeholder_text() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "---"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+
+        materialize_active_block_fallback(&state, &mut rendered);
+
+        assert_eq!(rendered.lines, vec!["-".to_string()]);
+        assert!(rendered.display.items.iter().any(|item| {
+            item.kind == DisplayKind::TextRun
+                && item.text == "-"
+                && item.cursor
+                    == Some(Cursor::Text {
+                        block: 0,
+                        offset: 0,
+                    })
+        }));
+    }
+
+    #[test]
+    fn move_visual_can_leave_active_h1_upward() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "before\n\n# Title\n\nafter"),
+            None,
+        );
+        state.kitty_graphics = true;
+        state.app.render_options = RenderOptions {
+            width: 40,
+            heading_width: 40,
+            kitty_graphics: true,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        let heading_row = rendered
+            .display
+            .items
+            .iter()
+            .find_map(|item| {
+                (item.cursor
+                    == Some(Cursor::Text {
+                        block: 1,
+                        offset: 0,
+                    }))
+                .then_some(item.rect.y)
+            })
+            .expect("active heading row");
+        state.last_rendered = Some(Arc::new(rendered));
+
+        move_visual(&mut state, -1, false);
+        assert_eq!(state.spacer_cursor, Some(1));
+        assert_eq!(
+            state.cursor_row_hint,
+            Some(heading_row.saturating_sub(2)),
+            "upward move should skip the fake internal headline spacer row"
+        );
+
+        move_visual(&mut state, -1, false);
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: 0
+            }
+        );
+    }
+
+    #[test]
+    fn move_visual_preserves_hyphenated_row_affinity() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "Hyphenation makes representation considerably prettier in narrow paragraphs.",
+            ),
+            None,
+        );
+        state.app.render_options = RenderOptions {
+            width: 12,
+            heading_width: 12,
+            kitty_graphics: false,
+            show_status: false,
+            hyphenate: true,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        let rendered = Arc::new(rendered);
+        let nav_index =
+            DisplayNavIndex::build(&rendered.display.items, &state.app.editor.document.blocks);
+        let segments = nav_index
+            .lanes
+            .get(&CursorLane::Text { block: 0 })
+            .expect("text lane");
+        let boundary = segments
+            .windows(2)
+            .find(|pair| pair[0].end == pair[1].start)
+            .expect("wrapped boundary");
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: boundary[0].end,
+        });
+        state.cursor_row_hint = Some(boundary[0].y);
+        state.last_rendered = Some(rendered);
+
+        move_visual(&mut state, 1, false);
+
+        assert_eq!(
+            state.cursor_row_hint,
+            Some(boundary[1].y),
+            "visual move should advance to the next wrapped row even when the model offset is shared"
         );
     }
 
@@ -5759,7 +7299,7 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let copy_item = rendered
             .display
             .items
@@ -5767,7 +7307,7 @@ mod tests {
             .find(|item| item.action.is_some())
             .cloned()
             .expect("copy action item");
-        state.last_rendered = Some(rendered);
+        state.last_rendered = Some(Arc::new(rendered));
         let column = document_content_left(state.last_doc_area) + copy_item.rect.x;
         let row = document_content_top(state.last_doc_area) + copy_item.rect.y;
 
@@ -5810,7 +7350,7 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let thumb_item = rendered
             .display
             .items
@@ -5818,7 +7358,7 @@ mod tests {
             .find(|item| matches!(item.action, Some(DisplayAction::ScrollCodeBlock { .. })))
             .cloned()
             .expect("scroll thumb item");
-        state.last_rendered = Some(rendered);
+        state.last_rendered = Some(Arc::new(rendered));
         let down_column = document_content_left(state.last_doc_area) + thumb_item.rect.x;
         let row = document_content_top(state.last_doc_area) + thumb_item.rect.y;
 
@@ -5874,7 +7414,7 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
 
         assert_eq!(
             selection_rects(&state, &rendered),
@@ -5995,6 +7535,54 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_shows_shortcuts_only_after_hyphenation_toggle() {
+        let mut state = TuiState::new(App::from_markdown("notes.md", "alpha beta gamma"), None);
+        state.last_status_area = Rect {
+            x: 0,
+            y: 0,
+            width: 140,
+            height: 1,
+        };
+        state.message = "saved notes.md".to_string();
+        state.app.editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+        state.app.render_options = RenderOptions {
+            width: 80,
+            heading_width: 80,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let mut terminal = Terminal::new(TestBackend::new(140, 1)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, state.last_status_area, &mut state, &rendered, &theme))
+            .expect("draw status");
+        let buffer = terminal.backend().buffer();
+        let row = (0..140)
+            .filter_map(|x| buffer.cell((x, 0)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(row.contains("Ctrl-S save"));
+        assert!(row.contains("Ctrl-Q quit"));
+        assert!(row.contains("Ctrl-H help"));
+        assert!(!row.contains("saved notes.md"));
+        assert!(!row.contains("selection"));
+        assert!(!row.contains("notes.md"));
+    }
+
+    #[test]
     fn render_cache_only_tracks_active_kitty_headlines() {
         let mut state = TuiState::new(App::from_markdown("x.md", "one\n\ntwo"), None);
         state.kitty_graphics = true;
@@ -6005,7 +7593,7 @@ mod tests {
         let first = RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
-            active_headline_block: active_headline_block(&state),
+            active_fallback_block: active_editable_target(&state),
         };
         state.app.editor.set_cursor(Cursor::Text {
             block: 1,
@@ -6014,7 +7602,7 @@ mod tests {
         let second = RenderCacheKey {
             version: state.app.editor.document.version,
             options: state.app.render_options.clone(),
-            active_headline_block: active_headline_block(&state),
+            active_fallback_block: active_editable_target(&state),
         };
 
         assert_eq!(first, second);
@@ -6036,21 +7624,99 @@ mod tests {
         state.last_render_key = Some(RenderCacheKey {
             version: 1,
             options: state.app.render_options.clone(),
-            active_headline_block: None,
+            active_fallback_block: None,
         });
-        state.last_rendered = Some(render_document(
+        state.last_rendered = Some(Arc::new(render_document(
             &state.app.editor.document,
             state.app.render_options.clone(),
-        ));
+        )));
+        state.last_outline_key = Some(OutlineCacheKey {
+            version: 1,
+            width: 32,
+        });
+        state.last_outline_lines = Some(Arc::new(vec![Line::from("cached outline")]));
+        state.last_outline_hits = Some(Arc::new(vec![OutlineHit { row: 0, block: 0 }]));
+        state.last_explorer_key = Some(ExplorerCacheKey {
+            root: root.clone(),
+            active_file: state.app.file_name.clone(),
+            mode: state.explorer_mode,
+            collapsed_dirs: Vec::new(),
+        });
+        state.last_explorer_lines = Some(Arc::new(vec![Line::from("cached explorer")]));
+        state.last_explorer_hits = Some(Arc::new(vec![ExplorerHit {
+            row: 0,
+            start: 0,
+            end: 3,
+            action: ExplorerAction::OpenFile(first.clone()),
+        }]));
         state.last_kitty_signature = Some("cached".to_string());
 
         open_file(&mut state, &second);
 
         assert!(state.last_render_key.is_none());
         assert!(state.last_rendered.is_none());
+        assert!(state.last_outline_key.is_none());
+        assert!(state.last_outline_lines.is_none());
+        assert!(state.last_outline_hits.is_none());
+        assert!(state.last_explorer_key.is_none());
+        assert!(state.last_explorer_lines.is_none());
+        assert!(state.last_explorer_hits.is_none());
         assert!(state.last_kitty_signature.is_none());
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn draw_reuses_cached_explorer_between_edits() {
+        let root =
+            std::env::temp_dir().join(format!("mdtui-explorer-cache-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let file = root.join("note.md");
+        fs::write(&file, "hello").expect("write note");
+
+        let mut state = TuiState::new(
+            App::from_markdown(file.to_string_lossy(), "hello"),
+            Some(file.clone()),
+        );
+        let cached_lines = Arc::new(vec![Line::from("cached explorer")]);
+        let cached_hits = Arc::new(vec![ExplorerHit {
+            row: 0,
+            start: 0,
+            end: 15,
+            action: ExplorerAction::OpenFile(file.clone()),
+        }]);
+        state.last_explorer_key = Some(ExplorerCacheKey {
+            root: root.clone(),
+            active_file: state.app.file_name.clone(),
+            mode: state.explorer_mode,
+            collapsed_dirs: Vec::new(),
+        });
+        state.last_explorer_lines = Some(cached_lines.clone());
+        state.last_explorer_hits = Some(cached_hits.clone());
+        state.app.type_char('!');
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw frame");
+
+        assert!(Arc::ptr_eq(
+            state
+                .last_explorer_lines
+                .as_ref()
+                .expect("cached explorer lines"),
+            &cached_lines
+        ));
+        assert!(Arc::ptr_eq(
+            state
+                .last_explorer_hits
+                .as_ref()
+                .expect("cached explorer hits"),
+            &cached_hits
+        ));
+
+        let _ = fs::remove_file(file);
         let _ = fs::remove_dir(root);
     }
 
@@ -6071,7 +7737,7 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let theme = Theme::dark_amber();
         let area = Rect {
             x: 0,
@@ -6139,7 +7805,7 @@ mod tests {
         };
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let theme = Theme::dark_amber();
         let area = Rect {
             x: 0,
@@ -6255,9 +7921,13 @@ mod tests {
             show_status: false,
             ..RenderOptions::default()
         };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 2,
+            offset: 0,
+        });
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let toc_item = rendered
             .display
             .items
@@ -6265,7 +7935,9 @@ mod tests {
             .find(|item| matches!(item.action, Some(DisplayAction::FollowLink { block: 2 })))
             .cloned()
             .expect("toc row");
-        state.last_rendered = Some(rendered);
+        let rendered = Arc::new(rendered);
+        state.last_rendered = Some(rendered.clone());
+        state.last_nav_index = Some(display_nav_index(&mut state, &rendered));
         let column = document_content_left(state.last_doc_area) + toc_item.rect.x;
         let row = document_content_top(state.last_doc_area) + toc_item.rect.y;
 
@@ -6289,6 +7961,183 @@ mod tests {
     }
 
     #[test]
+    fn clicking_toc_title_places_cursor_without_following_link() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "## Table of contents\n\n1. [Project identity](#project-identity)\n\n# Project identity",
+            ),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 60,
+            height: 12,
+        };
+        state.app.render_options = RenderOptions {
+            width: 28,
+            heading_width: 28,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 2,
+            offset: 0,
+        });
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        let toc_title = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| {
+                item.cursor
+                    == Some(Cursor::ListItem {
+                        block: 1,
+                        item: 0,
+                        offset: 0,
+                    })
+                    && item.action.is_none()
+            })
+            .cloned()
+            .expect("toc title");
+        let rendered = Arc::new(rendered);
+        state.last_rendered = Some(rendered.clone());
+        state.last_nav_index = Some(display_nav_index(&mut state, &rendered));
+        let column = document_content_left(state.last_doc_area) + toc_title.rect.x + 1;
+        let row = document_content_top(state.last_doc_area) + toc_title.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(matches!(
+            state.app.editor.cursor,
+            Cursor::ListItem {
+                block: 1,
+                item: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ctrl_click_selects_whole_paragraph_block() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello world"), None);
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 40,
+            height: 8,
+        };
+        state.app.render_options = RenderOptions {
+            width: 20,
+            heading_width: 20,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        let mut rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        materialize_active_block_fallback(&state, &mut rendered);
+        let item = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| {
+                item.cursor
+                    == Some(Cursor::Text {
+                        block: 0,
+                        offset: 0,
+                    })
+            })
+            .cloned()
+            .expect("paragraph item");
+        let rendered = Arc::new(rendered);
+        state.last_rendered = Some(rendered.clone());
+        state.last_nav_index = Some(display_nav_index(&mut state, &rendered));
+        let column = document_content_left(state.last_doc_area) + item.rect.x + 1;
+        let row = document_content_top(state.last_doc_area) + item.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::CONTROL,
+            },
+        );
+
+        assert!(state.app.editor.selection_covers_active_text());
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 0,
+                offset: "hello world".chars().count()
+            }
+        );
+    }
+
+    #[test]
+    fn ctrl_h_toggles_help() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+        assert!(state.show_help);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+        assert!(!state.show_help);
+    }
+
+    #[test]
+    fn del_char_is_treated_as_backspace_not_text_input() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 5,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('\u{7f}'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "hell");
+    }
+
+    #[test]
+    fn delete_key_deletes_forward() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.app.editor.document.blocks[0].rendered_text(), "ello");
+    }
+
+    #[test]
     fn explorer_and_outline_sidebar_are_wider() {
         let mut state = TuiState::new(App::from_markdown("x.md", "body"), None);
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
@@ -6298,6 +8147,34 @@ mod tests {
 
         assert_eq!(state.last_explorer_area.width, 43);
         assert_eq!(state.last_outline_area.width, 43);
+    }
+
+    #[test]
+    fn style_popup_waits_until_drag_selection_finishes() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha beta"), None);
+        state.app.editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+        state.drag_anchor = Some((0, 0));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw ui during drag");
+
+        assert!(state.last_style_popup.is_none());
+        state.drag_anchor = None;
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw ui after drag");
+        assert!(state.last_style_popup.is_some());
     }
 
     #[test]
@@ -6315,7 +8192,7 @@ mod tests {
             width: 40,
             height: 6,
         };
-        state.last_rendered = Some(render_document(
+        state.last_rendered = Some(Arc::new(render_document(
             &state.app.editor.document,
             RenderOptions {
                 width: 24,
@@ -6324,7 +8201,7 @@ mod tests {
                 show_status: false,
                 ..RenderOptions::default()
             },
-        ));
+        )));
         let column = state.last_doc_area.x + state.last_doc_area.width.saturating_sub(1);
         let start_row = state.last_doc_area.y + 2;
         let end_row = state.last_doc_area.y + state.last_doc_area.height.saturating_sub(2);
@@ -6447,7 +8324,7 @@ mod tests {
         .editor
         .document;
         let theme = Theme::dark_amber();
-        let (lines, hits) = outline_lines(&doc.blocks, 0, &theme, 32);
+        let (lines, hits) = outline_lines(&doc.blocks, &theme, 32);
         let rendered = lines
             .iter()
             .map(|line| {
@@ -6477,6 +8354,25 @@ mod tests {
     }
 
     #[test]
+    fn document_cursor_uses_content_column_not_visual_padding() {
+        let area = Rect {
+            x: 4,
+            y: 2,
+            width: 40,
+            height: 10,
+        };
+
+        assert_eq!(
+            document_screen_cursor(area, 0, Some((0, 0))),
+            Some((document_content_left(area), document_content_top(area)))
+        );
+        assert_eq!(
+            document_screen_cursor(area, 3, Some((0, 5))),
+            Some((document_content_left(area), document_content_top(area) + 2))
+        );
+    }
+
+    #[test]
     fn code_chrome_uses_page_background_and_light_border() {
         let state = TuiState::new(
             App::from_markdown("x.md", "```rust\nfn main() {}\n```"),
@@ -6484,7 +8380,7 @@ mod tests {
         );
         let mut rendered =
             render_document(&state.app.editor.document, state.app.render_options.clone());
-        materialize_active_headline_fallback(&state, &mut rendered);
+        materialize_active_block_fallback(&state, &mut rendered);
         let theme = Theme::dark_amber();
         let area = Rect {
             x: 0,
@@ -6614,7 +8510,8 @@ mod tests {
             5,
         );
 
-        assert!(popup.y < doc_area.y + 1 + 10);
+        assert!(popup.x > doc_area.x + 1 + 12);
+        assert_eq!(popup.y, doc_area.y + 1 + 10);
     }
 
     #[test]
@@ -6663,8 +8560,8 @@ mod tests {
                 width: 5,
                 height: 1,
             }],
-            popup_line_width(&style_popup_cells()),
-            3,
+            style_popup_width(&style_popup_items()),
+            style_popup_items().len() as u16 + 2,
         );
         let buffer = terminal.backend().buffer();
         let cell = buffer
