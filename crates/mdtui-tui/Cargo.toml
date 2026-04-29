@@ -19,8 +19,6 @@ mdtui-markdown = { path = "../mdtui-markdown" }
 mdtui-render = { path = "../mdtui-render" }
 mdtui-terminal = { path = "../mdtui-terminal" }
 ratatui = "0.29"
-
-[dev-dependencies]
 unicode-width = "0.2"
 
 [package.metadata.deb]

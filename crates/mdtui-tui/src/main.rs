@@ -45,6 +45,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
@@ -54,6 +55,7 @@ const HEADLINE_DEBUG_SLAB: bool = false;
 const DOCUMENT_LEFT_PAD: u16 = 1;
 const SPECIAL_EDIT_DELAY: Duration = Duration::from_millis(200);
 const STYLE_POPUP_DELAY: Duration = Duration::from_millis(500);
+const LOCK_BUTTON_LABEL: &str = "⚿";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -285,8 +287,8 @@ struct TabHit {
 
 #[derive(Clone, Debug)]
 enum TabControlAction {
-    NewFile,
     OpenMenu,
+    ToggleDocumentLock,
 }
 
 #[derive(Clone, Debug)]
@@ -299,13 +301,12 @@ struct TabControlHit {
 #[derive(Clone, Debug)]
 enum FilePopup {
     Menu,
-    NewFileMenu,
     NewFile { input: String },
     RenameFile { input: String, path: PathBuf },
     DeleteFile { path: PathBuf },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum FilePopupAction {
     Create,
     Rename,
@@ -442,6 +443,7 @@ struct TuiState {
     spacer_cursor: Option<usize>,
     wrap_width: u16,
     show_help: bool,
+    document_locked: bool,
     dirty: bool,
     message: String,
     pending_edit_target: Option<PendingEditableTarget>,
@@ -487,6 +489,7 @@ struct TuiState {
     tab_app_cache: HashMap<PathBuf, App>,
     file_popup: Option<FilePopup>,
     file_popup_hits: Vec<FilePopupHit>,
+    file_menu_hover: Option<FilePopupAction>,
     last_file_popup: Option<Rect>,
     link_popup: Option<LinkPopup>,
     last_link_popup: Option<Rect>,
@@ -529,6 +532,7 @@ impl TuiState {
             spacer_cursor: None,
             wrap_width: 65,
             show_help: false,
+            document_locked: false,
             dirty: false,
             message: "direct editing · Ctrl-H help · Ctrl-S save · Ctrl-Q quit".to_string(),
             pending_edit_target: None,
@@ -574,6 +578,7 @@ impl TuiState {
             tab_app_cache: HashMap::new(),
             file_popup: None,
             file_popup_hits: Vec::new(),
+            file_menu_hover: None,
             last_file_popup: None,
             link_popup: None,
             last_link_popup: None,
@@ -702,7 +707,11 @@ fn process_event(state: &mut TuiState, event: Event) -> bool {
     match event {
         Event::Key(key) if should_handle_key(state, key) => handle_key(state, key),
         Event::Paste(text) => {
-            paste_document_text(state, &text);
+            if state.document_locked {
+                reject_locked_edit(state);
+            } else {
+                paste_document_text(state, &text);
+            }
             false
         }
         Event::Mouse(mouse) => {
@@ -748,7 +757,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => state.file_popup = None,
             KeyCode::Enter => confirm_file_popup(state),
-            KeyCode::Char('n') if matches!(state.file_popup, Some(FilePopup::NewFileMenu)) => {
+            KeyCode::Char('n') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
                 open_new_file_popup(state)
             }
             KeyCode::Char('r') if matches!(state.file_popup, Some(FilePopup::Menu)) => {
@@ -785,6 +794,14 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     }
 
     if let Some(LinkPopup::Edit { input }) = state.link_popup.as_mut() {
+        if state.document_locked {
+            if matches!(key.code, KeyCode::Esc) {
+                state.link_popup = None;
+            } else {
+                reject_locked_edit(state);
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Esc => state.link_popup = None,
             KeyCode::Enter => confirm_link_popup(state),
@@ -812,10 +829,18 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 step_heading_popup_selection(state, 1);
             }
             KeyCode::Char(ch) if key.modifiers.is_empty() && ('1'..='6').contains(&ch) => {
-                apply_heading_popup_level(state, ch.to_digit(10).expect("digit") as u8);
+                if state.document_locked {
+                    reject_locked_edit(state);
+                } else {
+                    apply_heading_popup_level(state, ch.to_digit(10).expect("digit") as u8);
+                }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                apply_heading_popup_level(state, active_heading_popup_level(state));
+                if state.document_locked {
+                    reject_locked_edit(state);
+                } else {
+                    apply_heading_popup_level(state, active_heading_popup_level(state));
+                }
             }
             _ => {}
         }
@@ -834,10 +859,26 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 step_table_popup_selection(state, 1);
                 state.table_popup_hover = None;
             }
-            KeyCode::Char('r') => apply_table_popup_action(state, TablePopupAction::RemoveRow),
-            KeyCode::Char('c') => apply_table_popup_action(state, TablePopupAction::RemoveColumn),
+            KeyCode::Char('r') => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                } else {
+                    apply_table_popup_action(state, TablePopupAction::RemoveRow);
+                }
+            }
+            KeyCode::Char('c') => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                } else {
+                    apply_table_popup_action(state, TablePopupAction::RemoveColumn);
+                }
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                apply_table_popup_action(state, active_table_popup_action(state))
+                if state.document_locked {
+                    reject_locked_edit(state);
+                } else {
+                    apply_table_popup_action(state, active_table_popup_action(state))
+                }
             }
             _ => {}
         }
@@ -862,6 +903,10 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 return false;
             }
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 apply_color_popup_selection(state);
                 return false;
             }
@@ -890,6 +935,10 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 return false;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 apply_style_popup_action(state, active_style_popup_action(state));
                 state.dirty = true;
                 if state.link_popup.is_none() {
@@ -906,6 +955,10 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Char(ch)
                 if key.modifiers.is_empty() && spacer_prompt_action_for_key(ch).is_some() =>
             {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 run_spacer_prompt_action(
                     state,
                     insert_index,
@@ -914,22 +967,42 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 return false;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 insert_table_block(state, insert_index);
                 return false;
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 insert_code_block(state, insert_index);
                 return false;
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 insert_quote_block(state, insert_index);
                 return false;
             }
             KeyCode::Char(ch) if is_text_input_char(key, ch) => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 insert_paragraph_text(state, insert_index, &ch.to_string());
                 return false;
             }
             KeyCode::Char(' ') => {
+                if state.document_locked {
+                    reject_locked_edit(state);
+                    return false;
+                }
                 insert_paragraph_text(state, insert_index, " ");
                 return false;
             }
@@ -955,6 +1028,11 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         activate_pending_edit_target_now(state);
     }
 
+    if state.document_locked && key_would_edit_document(state, key) {
+        reject_locked_edit(state);
+        return false;
+    }
+
     match key.code {
         KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => state.save(),
@@ -966,6 +1044,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             } else {
                 state.message = "no link under cursor".to_string();
             }
+        }
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            toggle_document_lock(state);
         }
         KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.preferred_column = None;
@@ -1123,6 +1204,76 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
     }
     ensure_cursor_visible(state);
     false
+}
+
+fn key_would_edit_document(state: &TuiState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.app.editor.current_link_target().is_some()
+        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(state.app.editor.cursor, Cursor::TableCell { .. }) =>
+        {
+            true
+        }
+        KeyCode::Char('z' | 'b' | 'i' | 'e' | 'X')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        KeyCode::Char('x')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            true
+        }
+        KeyCode::Char(' ') => true,
+        _ if is_backspace_key(key) || is_delete_key(key) => true,
+        KeyCode::Char(ch) if is_text_input_char(key, ch) => true,
+        KeyCode::Enter => true,
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            matches!(state.app.editor.cursor, Cursor::TableCell { .. })
+        }
+        _ => false,
+    }
+}
+
+fn reject_locked_edit(state: &mut TuiState) {
+    clear_pending_edit_target(state);
+    hide_style_popup(state);
+    state.message = "document locked".to_string();
+    state.dirty = true;
+}
+
+fn toggle_document_lock(state: &mut TuiState) {
+    state.document_locked = !state.document_locked;
+    clear_pending_edit_target(state);
+    if state.document_locked {
+        hide_style_popup(state);
+        close_color_popup(state);
+        close_heading_popup(state);
+        state.table_popup = None;
+        state.table_popup_hits.clear();
+        state.link_popup = None;
+        state.last_link_popup = None;
+        state.spacer_cursor = None;
+        if locked_cursor_should_skip(state, state.app.editor.cursor) {
+            move_visual(state, 1, false);
+            if locked_cursor_should_skip(state, state.app.editor.cursor) {
+                move_visual(state, -1, false);
+            }
+        }
+        state.message = "document locked".to_string();
+    } else {
+        state.message = "document unlocked".to_string();
+    }
+    state.dirty = true;
 }
 
 fn is_plain_text_key(key: KeyEvent) -> bool {
@@ -1456,6 +1607,10 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
     while target_y >= 0 && target_y < max_y {
         let row = target_y as u16;
         if let Some(insert_index) = nav_index.spacer_rows.get(&row).copied() {
+            if state.document_locked {
+                target_y += delta.signum();
+                continue;
+            }
             if matches!(
                 state.app.editor.document.blocks.get(current_block),
                 Some(DocBlock::ThematicBreak)
@@ -1485,6 +1640,15 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
             && let Some(candidate) =
                 target.map(|cursor| normalize_active_block_cursor(state, cursor))
             && editable_target_for_cursor(state, candidate) == Some(active_target)
+        {
+            target = None;
+            target_y += delta.signum();
+            continue;
+        }
+        if state.document_locked
+            && target
+                .map(|cursor| normalize_active_block_cursor(state, cursor))
+                .is_some_and(|cursor| locked_cursor_should_skip(state, cursor))
         {
             target = None;
             target_y += delta.signum();
@@ -1587,19 +1751,39 @@ fn block_row_for_cursor(state: &TuiState, rendered: &Rendered) -> Option<u16> {
 
 fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     if let Some(popup) = state.last_file_popup {
-        if mouse.column >= popup.x
+        let inside = mouse.column >= popup.x
             && mouse.column < popup.x.saturating_add(popup.width)
             && mouse.row >= popup.y
-            && mouse.row < popup.y.saturating_add(popup.height)
-        {
-            if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            && mouse.row < popup.y.saturating_add(popup.height);
+        if inside {
+            if matches!(state.file_popup, Some(FilePopup::Menu)) {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        click_file_popup(state, popup, mouse.column, mouse.row)
+                    }
+                    MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                        hover_file_menu(state, popup, mouse.column, mouse.row);
+                    }
+                    _ => {}
+                }
+            } else if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
                 click_file_popup(state, popup, mouse.column, mouse.row);
             }
             return;
         }
+        // outside
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
+        ) && state.file_menu_hover.is_some()
+        {
+            state.file_menu_hover = None;
+            state.dirty = true;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             state.file_popup = None;
             state.file_popup_hits.clear();
+            state.file_menu_hover = None;
         }
     }
     if let Some(popup) = state.last_link_popup {
@@ -1811,8 +1995,8 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 .cloned()
             {
                 match hit.action {
-                    TabControlAction::NewFile => open_new_file_menu(state),
                     TabControlAction::OpenMenu => state.file_popup = Some(FilePopup::Menu),
+                    TabControlAction::ToggleDocumentLock => toggle_document_lock(state),
                 }
             } else if let Some(hit) = state
                 .tab_hits
@@ -2028,14 +2212,25 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                     clear_spacer_cursor(state);
                     if let Cursor::Checkbox { block, item } = cursor {
                         clear_pending_edit_target(state);
-                        state.app.editor.toggle_checkbox(block, item);
+                        if state.document_locked {
+                            reject_locked_edit(state);
+                        } else {
+                            state.app.editor.toggle_checkbox(block, item);
+                        }
+                    } else if state.document_locked && locked_cursor_should_skip(state, cursor) {
+                        clear_pending_edit_target(state);
+                        reject_locked_edit(state);
                     } else {
                         clear_pending_edit_target(state);
                         state.app.editor.set_cursor(cursor);
                     }
                 }
                 Some(DocumentTarget::Spacer(insert_index)) => {
-                    set_spacer_cursor(state, insert_index, y);
+                    if state.document_locked {
+                        reject_locked_edit(state);
+                    } else {
+                        set_spacer_cursor(state, insert_index, y);
+                    }
                 }
                 None => {}
             }
@@ -2385,11 +2580,14 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     if state.show_help {
         draw_help(frame, area, &theme);
     }
-    if state.file_popup.is_some() {
+    if matches!(state.file_popup, Some(FilePopup::Menu)) {
+        state.last_file_popup = Some(draw_file_menu_dropdown(frame, area, state, &theme));
+    } else if state.file_popup.is_some() {
         state.last_file_popup = Some(draw_file_popup(frame, area, state, &theme));
     } else {
         state.last_file_popup = None;
         state.file_popup_hits.clear();
+        state.file_menu_hover = None;
     }
     if state.link_popup.is_some() {
         state.last_link_popup = Some(draw_link_popup(frame, area, state, &theme));
@@ -2605,29 +2803,84 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Th
         x = start_x.saturating_add(width);
     }
 
-    let controls_text = "[+] [⋮]";
-    let controls_width = controls_text.chars().count() as u16;
+    let controls_width = tab_control_buttons_width();
     let mut controls_x = right.saturating_sub(controls_width.saturating_add(1));
-    let start = controls_x.saturating_sub(area.x);
-    put(
+    draw_tab_control_button(
         buf,
         &mut controls_x,
         label_y,
         right,
-        controls_text,
-        Style::default()
-            .fg(rgb(theme.text_secondary))
-            .bg(rgb(theme.panel_bg)),
+        "⋮",
+        TabControlAction::OpenMenu,
+        area.x,
+        &mut state.tab_control_hits,
+        theme,
+        true,
     );
-    state.tab_control_hits.push(TabControlHit {
-        start: start.saturating_add(1),
-        end: start.saturating_add(2),
-        action: TabControlAction::NewFile,
-    });
-    state.tab_control_hits.push(TabControlHit {
-        start: start.saturating_add(5),
-        end: start.saturating_add(6),
-        action: TabControlAction::OpenMenu,
+    draw_tab_control_button(
+        buf,
+        &mut controls_x,
+        label_y,
+        right,
+        LOCK_BUTTON_LABEL,
+        TabControlAction::ToggleDocumentLock,
+        area.x,
+        &mut state.tab_control_hits,
+        theme,
+        state.document_locked,
+    );
+}
+
+fn tab_control_buttons_width() -> u16 {
+    (button_width("⋮") + button_width(LOCK_BUTTON_LABEL)) as u16
+}
+
+fn button_width(label: &str) -> usize {
+    2 + UnicodeWidthStr::width(label)
+}
+
+fn draw_tab_control_button(
+    buf: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    label: &str,
+    action: TabControlAction,
+    local_origin: u16,
+    hits: &mut Vec<TabControlHit>,
+    theme: &Theme,
+    active: bool,
+) {
+    let (border_style, inner_style) = if active {
+        (
+            Style::default()
+                .fg(rgb(theme.border_strong))
+                .bg(rgb(theme.panel_bg)),
+            Style::default()
+                .fg(Color::Black)
+                .bg(rgb(theme.border_strong))
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            Style::default()
+                .fg(rgb(theme.text_muted))
+                .bg(rgb(theme.panel_bg)),
+            Style::default()
+                .fg(rgb(theme.panel_bg))
+                .bg(rgb(theme.text_muted))
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let button_start = x.saturating_sub(local_origin);
+    put(buf, x, y, right, "▐", border_style);
+    put(buf, x, y, right, label, inner_style);
+    put(buf, x, y, right, "▌", border_style);
+    let button_end = x.saturating_sub(local_origin);
+    hits.push(TabControlHit {
+        start: button_start,
+        end: button_end,
+        action,
     });
 }
 
@@ -3237,6 +3490,9 @@ fn draw_status(
 }
 
 fn status_shortcuts(state: &TuiState) -> String {
+    if state.document_locked {
+        return "locked  Ctrl-K unlock  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string();
+    }
     if matches!(state.app.editor.cursor, Cursor::TableCell { .. }) {
         return "Ctrl+←↑↓→ insert  Ctrl+D remove  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
             .to_string();
@@ -3245,7 +3501,7 @@ fn status_shortcuts(state: &TuiState) -> String {
         return "Ctrl-L edit link  Shift+arrows select  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
             .to_string();
     }
-    "Shift+arrows select  Ctrl-click block  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string()
+    "Shift+arrows select  Ctrl-K lock  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string()
 }
 
 fn draw_spacer_status_actions(
@@ -3354,7 +3610,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         )]),
         Line::from(vec![Span::styled(" Session ", section)]),
         Line::from(vec![Span::styled(
-            " Ctrl-S save · Ctrl-Q quit · Esc or Ctrl-H closes help",
+            " Ctrl-K lock/unlock · Ctrl-S save · Ctrl-Q quit · Esc or Ctrl-H closes help",
             body,
         )]),
         Line::from(vec![Span::styled(
@@ -3820,6 +4076,10 @@ fn set_code_horizontal_scroll(state: &mut TuiState, block: usize, scroll: usize)
 }
 
 fn click_style_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     let local_y = y.saturating_sub(popup.y);
     let local_x = x.saturating_sub(popup.x.saturating_add(1));
     let Some(action) = state
@@ -3885,6 +4145,10 @@ fn step_color_popup_selection(state: &mut TuiState, delta: i32) {
 }
 
 fn apply_color_popup_selection(state: &mut TuiState) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     let color = active_color_popup_choice(state);
     state.app.apply_text_color(color);
     close_color_popup(state);
@@ -3929,15 +4193,10 @@ fn draw_table_popup(
     theme: &Theme,
 ) -> Rect {
     state.table_popup_hits.clear();
-    let Some(TablePopup { block, row, col }) = state.table_popup.clone() else {
+    let Some(TablePopup { row, col, .. }) = state.table_popup.clone() else {
         return Rect::default();
     };
-    let body = [
-        format!(" remove row {}", row + 1),
-        format!(" remove column {}", col + 1),
-        format!(" table {}", block + 1),
-    ];
-    let popup = centered(area, 24.min(area.width), 6.min(area.height));
+    let popup = centered(area, 24.min(area.width), 5.min(area.height));
     frame.render_widget(Clear, popup);
     let block_widget = Block::default()
         .borders(Borders::ALL)
@@ -3953,8 +4212,14 @@ fn draw_table_popup(
         .style(Style::default().bg(rgb(theme.panel_raised)));
     frame.render_widget(block_widget, popup);
     let items = [
-        ("[r] remove row", TablePopupAction::RemoveRow),
-        ("[c] remove column", TablePopupAction::RemoveColumn),
+        (
+            format!(" remove row {}", row + 1),
+            TablePopupAction::RemoveRow,
+        ),
+        (
+            format!(" remove column {}", col + 1),
+            TablePopupAction::RemoveColumn,
+        ),
     ];
     for (index, (label, action)) in items.iter().enumerate() {
         let y = popup.y + 1 + index as u16;
@@ -3975,10 +4240,7 @@ fn draw_table_popup(
             &mut x,
             y,
             popup.x + popup.width - 1,
-            &format!(
-                " {}",
-                pad_width(label, usize::from(popup.width.saturating_sub(3)))
-            ),
+            &pad_width(label, usize::from(popup.width.saturating_sub(2))),
             style,
         );
         state.table_popup_hits.push(TablePopupHit {
@@ -3988,20 +4250,6 @@ fn draw_table_popup(
             action: action.clone(),
         });
     }
-    let mut x = popup.x + 1;
-    put(
-        frame.buffer_mut(),
-        &mut x,
-        popup.y + popup.height.saturating_sub(2),
-        popup.x + popup.width - 1,
-        &format!(
-            " {}",
-            pad_width(&body[2], usize::from(popup.width.saturating_sub(3)))
-        ),
-        Style::default()
-            .fg(rgb(theme.text_secondary))
-            .bg(rgb(theme.panel_raised)),
-    );
     popup
 }
 
@@ -4014,22 +4262,17 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
         FilePopup::Menu => (
             " file ",
             vec![
+                " [n] new file".to_string(),
                 " [r] rename file".to_string(),
                 " [d] delete file".to_string(),
             ],
             vec![
+                ("new", FilePopupAction::OpenNewFileInput),
                 ("rename", FilePopupAction::OpenRename),
                 ("delete", FilePopupAction::OpenDelete),
             ],
             28,
-            6,
-        ),
-        FilePopup::NewFileMenu => (
-            " new ",
-            vec![" [n] markdown file".to_string()],
-            vec![("markdown", FilePopupAction::OpenNewFileInput)],
-            28,
-            5,
+            7,
         ),
         FilePopup::NewFile { input } => (
             " new file ",
@@ -4114,7 +4357,6 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
                     state.file_popup,
                     Some(FilePopup::DeleteFile { .. })
                         | Some(FilePopup::Menu)
-                        | Some(FilePopup::NewFileMenu)
                 )
             {
                 Style::default()
@@ -4133,21 +4375,19 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
                 row: 0,
                 start: 1,
                 end: inner.width.saturating_sub(1),
-                action: FilePopupAction::OpenRename,
+                action: FilePopupAction::OpenNewFileInput,
             });
             state.file_popup_hits.push(FilePopupHit {
                 row: 1,
                 start: 1,
                 end: inner.width.saturating_sub(1),
-                action: FilePopupAction::OpenDelete,
+                action: FilePopupAction::OpenRename,
             });
-        }
-        FilePopup::NewFileMenu => {
             state.file_popup_hits.push(FilePopupHit {
-                row: 0,
+                row: 2,
                 start: 1,
                 end: inner.width.saturating_sub(1),
-                action: FilePopupAction::OpenNewFileInput,
+                action: FilePopupAction::OpenDelete,
             });
         }
         _ => {
@@ -4178,6 +4418,113 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
                 cursor = cursor.saturating_add(len + 2);
             }
         }
+    }
+    popup
+}
+
+struct FileMenuItem {
+    label: &'static str,
+    action: FilePopupAction,
+}
+
+fn file_menu_items() -> [FileMenuItem; 3] {
+    [
+        FileMenuItem {
+            label: "New file",
+            action: FilePopupAction::OpenNewFileInput,
+        },
+        FileMenuItem {
+            label: "Rename file",
+            action: FilePopupAction::OpenRename,
+        },
+        FileMenuItem {
+            label: "Delete file",
+            action: FilePopupAction::OpenDelete,
+        },
+    ]
+}
+
+fn draw_file_menu_dropdown(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    theme: &Theme,
+) -> Rect {
+    let items = file_menu_items();
+    let max_label = items
+        .iter()
+        .map(|i| i.label.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = max_label + 4;
+    let height = items.len() as u16 + 2;
+
+    // Anchor below the ⋮ button, right-aligned to its right edge.
+    let menu_hit = state
+        .tab_control_hits
+        .iter()
+        .find(|h| matches!(h.action, TabControlAction::OpenMenu))
+        .cloned();
+    let (anchor_right, anchor_y) = if let Some(hit) = menu_hit {
+        (
+            state.last_tabs_area.x.saturating_add(hit.end),
+            state.last_tabs_area.y.saturating_add(state.last_tabs_area.height),
+        )
+    } else {
+        (area.x.saturating_add(area.width), area.y)
+    };
+    let x = anchor_right.saturating_sub(width).max(area.x);
+    let y = anchor_y.min(area.y.saturating_add(area.height).saturating_sub(height));
+    let popup = Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    };
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(rgb(theme.border_strong)))
+            .style(Style::default().bg(rgb(theme.panel_bg))),
+        popup,
+    );
+
+    state.file_popup_hits.clear();
+    let idle_style = Style::default()
+        .fg(rgb(theme.text_primary))
+        .bg(rgb(theme.panel_bg));
+    let hover_style = Style::default()
+        .fg(rgb(theme.panel_bg))
+        .bg(rgb(theme.accent_highlight))
+        .add_modifier(Modifier::BOLD);
+
+    for (index, item) in items.iter().enumerate() {
+        let row = index as u16 + 1;
+        let y = popup.y + row;
+        let hovered = state.file_menu_hover.as_ref() == Some(&item.action);
+        let style = if hovered { hover_style } else { idle_style };
+        let label = format!(
+            " {}",
+            pad_width(item.label, usize::from(popup.width.saturating_sub(3)))
+        );
+        let mut x = popup.x + 1;
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            popup.x + popup.width - 1,
+            &label,
+            style,
+        );
+        state.file_popup_hits.push(FilePopupHit {
+            row,
+            start: 1,
+            end: popup.width.saturating_sub(1),
+            action: item.action.clone(),
+        });
     }
     popup
 }
@@ -4360,6 +4707,20 @@ fn click_file_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
     }
 }
 
+fn hover_file_menu(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let hover = state
+        .file_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.action.clone());
+    if state.file_menu_hover != hover {
+        state.file_menu_hover = hover;
+        state.dirty = true;
+    }
+}
+
 fn active_style_popup_action(state: &TuiState) -> StylePopupAction {
     state
         .style_popup_hover
@@ -4399,6 +4760,10 @@ fn step_heading_popup_selection(state: &mut TuiState, delta: i32) {
 }
 
 fn apply_heading_popup_level(state: &mut TuiState, level: u8) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     let Some(HeadingPopup { insert_index }) = state.heading_popup.clone() else {
         return;
     };
@@ -4433,6 +4798,10 @@ fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
 }
 
 fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     match action {
         StylePopupAction::Bold => state.app.apply_bold(),
         StylePopupAction::Italic => state.app.apply_italic(),
@@ -4508,6 +4877,10 @@ fn step_table_popup_selection(state: &mut TuiState, delta: i32) {
 }
 
 fn apply_table_popup_action(state: &mut TuiState, action: TablePopupAction) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     let changed = match action {
         TablePopupAction::RemoveRow => state.app.editor.remove_current_table_row(),
         TablePopupAction::RemoveColumn => state.app.editor.remove_current_table_column(),
@@ -4530,6 +4903,10 @@ fn apply_table_popup_action(state: &mut TuiState, action: TablePopupAction) {
 }
 
 fn open_table_popup(state: &mut TuiState) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     let Cursor::TableCell {
         block, row, col, ..
     } = state.app.editor.cursor
@@ -4543,6 +4920,10 @@ fn open_table_popup(state: &mut TuiState) {
 }
 
 fn open_heading_popup(state: &mut TuiState, insert_index: usize) {
+    if state.document_locked {
+        reject_locked_edit(state);
+        return;
+    }
     state.heading_popup = Some(HeadingPopup { insert_index });
     state.heading_popup_selected = 2;
     state.heading_popup_hover = None;
@@ -4759,6 +5140,10 @@ fn run_status_action(state: &mut TuiState, action: &StatusAction) {
             persist_view_state(state);
         }
         StatusAction::SpacerPrompt(action) => {
+            if state.document_locked {
+                reject_locked_edit(state);
+                return;
+            }
             if let Some(insert_index) = state.spacer_cursor {
                 run_spacer_prompt_action(state, insert_index, action);
             }
@@ -4836,6 +5221,7 @@ fn reset_open_file_state(state: &mut TuiState) {
     state.last_nav_key = None;
     state.file_popup = None;
     state.file_popup_hits.clear();
+    state.file_menu_hover = None;
     state.last_file_popup = None;
     state.link_popup = None;
     state.last_link_popup = None;
@@ -4882,11 +5268,6 @@ fn open_new_file_popup(state: &mut TuiState) {
     state.file_popup_hits.clear();
 }
 
-fn open_new_file_menu(state: &mut TuiState) {
-    state.file_popup = Some(FilePopup::NewFileMenu);
-    state.file_popup_hits.clear();
-}
-
 fn open_rename_file_popup(state: &mut TuiState) {
     let Some(path) = state.path.clone() else {
         state.message = "rename unavailable".to_string();
@@ -4916,7 +5297,6 @@ fn confirm_file_popup(state: &mut TuiState) {
     };
     match popup {
         FilePopup::Menu => {}
-        FilePopup::NewFileMenu => open_new_file_popup(state),
         FilePopup::NewFile { input } => {
             if let Err(error) = create_file_from_input(state, &input) {
                 state.message = format!("create failed: {error}");
@@ -8191,6 +8571,9 @@ fn shifted_display_item(
 }
 
 fn active_editable_target(state: &TuiState) -> Option<EditableTarget> {
+    if state.document_locked {
+        return None;
+    }
     if state.spacer_cursor.is_some() {
         return None;
     }
@@ -8209,6 +8592,9 @@ fn current_editable_target(state: &TuiState) -> Option<EditableTarget> {
 }
 
 fn editable_target_for_cursor(state: &TuiState, cursor: Cursor) -> Option<EditableTarget> {
+    if state.document_locked {
+        return None;
+    }
     match cursor {
         Cursor::Text { block, .. } => match state.app.editor.document.blocks.get(block) {
             Some(DocBlock::Heading { level: 1 | 2, .. }) if state.kitty_graphics => {
@@ -8226,6 +8612,21 @@ fn editable_target_for_cursor(state: &TuiState, cursor: Cursor) -> Option<Editab
             Some(EditableTarget::ListItem { block, item })
         }
         _ => None,
+    }
+}
+
+fn locked_cursor_should_skip(state: &TuiState, cursor: Cursor) -> bool {
+    match cursor {
+        Cursor::Text { block, .. } => match state.app.editor.document.blocks.get(block) {
+            Some(DocBlock::Heading { level: 1 | 2, .. }) if state.kitty_graphics => true,
+            Some(DocBlock::ImageBlock { .. }) => true,
+            Some(block_ref) if editable_block_fallback(block_ref).is_some() => true,
+            _ => false,
+        },
+        Cursor::ListItem { block, item, .. } => {
+            is_toc_list_item(&state.app.editor.document.blocks, block, item)
+        }
+        _ => false,
     }
 }
 
@@ -8253,6 +8654,10 @@ fn is_toc_list_item(blocks: &[DocBlock], block: usize, item: usize) -> bool {
 }
 
 fn schedule_editable_target_activation(state: &mut TuiState, cursor: Cursor) {
+    if state.document_locked {
+        state.pending_edit_target = None;
+        return;
+    }
     if let Some(target) = editable_target_for_cursor(state, cursor) {
         state.pending_edit_target = Some(PendingEditableTarget {
             target,
@@ -8490,7 +8895,7 @@ fn put(buf: &mut Buffer, x: &mut u16, y: u16, right: u16, text: &str, style: Sty
             break;
         }
         buf.set_string(*x, y, ch.to_string(), style);
-        *x = x.saturating_add(1);
+        *x = x.saturating_add(ch.width().unwrap_or(0) as u16);
     }
 }
 
@@ -10876,6 +11281,151 @@ mod tests {
         );
 
         assert!(matches!(state.explorer_mode, ExplorerMode::Flat));
+    }
+
+    #[test]
+    fn tab_controls_render_button_hits_and_lock_toggle() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "body"), None);
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 3,
+        };
+        state.last_tabs_area = area;
+        let mut terminal = Terminal::new(TestBackend::new(60, 3)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_tabs(frame, area, &mut state, &theme))
+            .expect("draw tabs");
+
+        assert_eq!(state.tab_control_hits.len(), 2);
+        assert!(
+            state
+                .tab_control_hits
+                .iter()
+                .any(|hit| matches!(hit.action, TabControlAction::ToggleDocumentLock))
+        );
+        let menu = state
+            .tab_control_hits
+            .iter()
+            .find(|hit| matches!(hit.action, TabControlAction::OpenMenu))
+            .expect("menu hit");
+        let menu_cell = terminal
+            .backend()
+            .buffer()
+            .cell((menu.start + 1, 1))
+            .expect("menu inner cell");
+        assert_eq!(menu_cell.fg, Color::Black);
+        assert_eq!(menu_cell.bg, rgb(theme.border_strong));
+
+        let lock = state
+            .tab_control_hits
+            .iter()
+            .find(|hit| matches!(hit.action, TabControlAction::ToggleDocumentLock))
+            .cloned()
+            .expect("lock hit");
+        assert_eq!(menu.end, lock.start);
+        let lock_inner = terminal
+            .backend()
+            .buffer()
+            .cell((lock.start + 1, 1))
+            .expect("lock inner cell");
+        assert_eq!(lock_inner.symbol(), LOCK_BUTTON_LABEL);
+        // unlocked → inverted muted style
+        assert_eq!(lock_inner.bg, rgb(theme.text_muted));
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + lock.start,
+                row: area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(state.document_locked);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(!state.document_locked);
+    }
+
+    #[test]
+    fn locked_document_blocks_text_editing_and_checkbox_toggle() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "- [ ] task"), None);
+        state.document_locked = true;
+        let before = state.app.editor.document.blocks.clone();
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+        );
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.app.editor.document.blocks, before);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw checkbox");
+        let checkbox = state
+            .last_rendered
+            .as_ref()
+            .and_then(|rendered| {
+                rendered
+                    .display
+                    .items
+                    .iter()
+                    .find(|item| matches!(item.cursor, Some(Cursor::Checkbox { .. })))
+            })
+            .cloned()
+            .expect("checkbox item");
+        let checkbox_column = document_content_left(state.last_doc_area) + checkbox.rect.x;
+        let checkbox_row = document_content_top(state.last_doc_area) + checkbox.rect.y;
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: checkbox_column,
+                row: checkbox_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(state.app.editor.document.blocks, before);
+    }
+
+    #[test]
+    fn locked_document_skips_kitty_heading_edit_surface() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "# Title\n\nbody"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw heading");
+
+        toggle_document_lock(&mut state);
+
+        assert!(state.document_locked);
+        assert!(state.pending_edit_target.is_none());
+        assert!(!matches!(
+            state.app.editor.cursor,
+            Cursor::Text { block: 0, .. }
+        ));
+        assert!(active_editable_target(&state).is_none());
     }
 
     #[test]
