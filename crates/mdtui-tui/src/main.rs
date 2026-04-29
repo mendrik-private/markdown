@@ -53,6 +53,7 @@ const HEADLINE_RASTER_VERSION: u32 = 9;
 const HEADLINE_DEBUG_SLAB: bool = true;
 const DOCUMENT_LEFT_PAD: u16 = 1;
 const SPECIAL_EDIT_DELAY: Duration = Duration::from_millis(200);
+const STYLE_POPUP_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExplorerMode {
@@ -454,6 +455,7 @@ struct TuiState {
     style_popup_hits: Vec<StylePopupHit>,
     style_popup_selected: StylePopupAction,
     style_popup_hover: Option<StylePopupAction>,
+    style_popup_not_before: Option<Instant>,
     explorer_mode: ExplorerMode,
     explorer_scroll: u16,
     outline_scroll: u16,
@@ -533,6 +535,7 @@ impl TuiState {
             style_popup_hits: Vec::new(),
             style_popup_selected: StylePopupAction::Bold,
             style_popup_hover: None,
+            style_popup_not_before: None,
             explorer_mode: ExplorerMode::Nested,
             explorer_scroll: 0,
             outline_scroll: 0,
@@ -601,6 +604,9 @@ fn run(terminal: &mut TuiTerminal, state: &mut TuiState) -> AppResult<()> {
         if maybe_activate_pending_edit_target(state) {
             needs_redraw = true;
         }
+        if maybe_activate_delayed_style_popup(state) {
+            needs_redraw = true;
+        }
         if needs_redraw {
             terminal.draw(|frame| draw(frame, state))?;
             emit_kitty_headlines(terminal.backend_mut(), state)?;
@@ -634,6 +640,21 @@ fn maybe_activate_pending_edit_target(state: &mut TuiState) -> bool {
         return false;
     }
     state.pending_edit_target = None;
+    true
+}
+
+fn maybe_activate_delayed_style_popup(state: &mut TuiState) -> bool {
+    let Some(not_before) = state.style_popup_not_before else {
+        return false;
+    };
+    if !has_selection(state) || !state.app.editor.show_style_popover {
+        state.style_popup_not_before = None;
+        return false;
+    }
+    if Instant::now() < not_before {
+        return false;
+    }
+    state.style_popup_not_before = None;
     true
 }
 
@@ -997,6 +1018,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 .app
                 .editor
                 .move_left(key.modifiers.contains(KeyModifiers::SHIFT));
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                schedule_style_popup_delay(state);
+            }
         }
         KeyCode::Right => {
             state.preferred_column = None;
@@ -1004,6 +1028,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
                 .app
                 .editor
                 .move_right(key.modifiers.contains(KeyModifiers::SHIFT));
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                schedule_style_popup_delay(state);
+            }
         }
         KeyCode::Up => move_visual(state, -1, key.modifiers.contains(KeyModifiers::SHIFT)),
         KeyCode::Down => move_visual(state, 1, key.modifiers.contains(KeyModifiers::SHIFT)),
@@ -1214,8 +1241,9 @@ fn current_navigation_render(state: &mut TuiState) -> Arc<Rendered> {
 }
 
 fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
-    let rendered = current_base_render(state);
+    let rendered = current_navigation_render(state);
     let nav_index = display_nav_index(state, &rendered);
+    let active_target = active_editable_target(state);
     let Some((x, y)) = visual_cursor_position(state, nav_index.as_ref()) else {
         recover_nonvisual_cursor(state, delta, extend);
         return;
@@ -1249,6 +1277,15 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
         target = nearest_cursor_on_row(preferred_x, row, &rendered.display, nav_index.as_ref())
             .or_else(|| hit_test_row(preferred_x, row, &rendered.display, nav_index.as_ref()))
             .or_else(|| hit_test_row(0, row, &rendered.display, nav_index.as_ref()));
+        if let Some(active_target) = active_target
+            && let Some(candidate) =
+                target.map(|cursor| normalize_active_block_cursor(state, cursor))
+            && editable_target_for_cursor(state, candidate) == Some(active_target)
+        {
+            target = None;
+            target_y += delta.signum();
+            continue;
+        }
         if target.is_some() {
             target_row = Some(row);
             break;
@@ -1276,6 +1313,7 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
             .map_or(state.app.editor.cursor, |selection| selection.anchor);
         state.app.editor.select_range(anchor, cursor);
         clear_pending_edit_target(state);
+        schedule_style_popup_delay(state);
     } else {
         state.app.editor.set_cursor(cursor);
         schedule_editable_target_activation(state, cursor);
@@ -1681,6 +1719,7 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
                 && !mouse.modifiers.contains(KeyModifiers::CONTROL)
                 && let Some(action) = action_at(x, y, &rendered.display)
             {
+                clear_pending_edit_target(state);
                 match action {
                     DisplayAction::CopyCodeBlock { .. } | DisplayAction::FollowLink { .. } => {
                         run_action(state, action)
@@ -2004,7 +2043,11 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     draw_tabs(frame, tabs_area, state, &theme);
     draw_status(frame, status_area, state, &rendered, &theme);
 
-    if has_selection(state) && state.app.editor.show_style_popover && state.drag_anchor.is_none() {
+    if has_selection(state)
+        && state.app.editor.show_style_popover
+        && state.drag_anchor.is_none()
+        && style_popup_delay_elapsed(state)
+    {
         let selection_rects = selection_rects(state, &rendered);
         state.last_style_popup = Some(draw_style_popover(
             frame,
@@ -4388,11 +4431,28 @@ fn persist_view_state(state: &TuiState) {
 }
 
 fn hide_style_popup(state: &mut TuiState) {
+    state.style_popup_not_before = None;
     if state.app.editor.show_style_popover {
         state.app.editor.show_style_popover = false;
         state.style_popup_hover = None;
         state.dirty = true;
     }
+}
+
+fn schedule_style_popup_delay(state: &mut TuiState) {
+    if has_selection(state) && state.app.editor.show_style_popover {
+        state.style_popup_not_before = Some(Instant::now() + STYLE_POPUP_DELAY);
+        state.last_style_popup = None;
+        state.style_popup_hits.clear();
+    } else {
+        state.style_popup_not_before = None;
+    }
+}
+
+fn style_popup_delay_elapsed(state: &TuiState) -> bool {
+    state
+        .style_popup_not_before
+        .is_none_or(|not_before| Instant::now() >= not_before)
 }
 
 fn explorer_lines(
@@ -7268,6 +7328,9 @@ fn materialize_active_block_fallback(state: &TuiState, rendered: &mut Rendered) 
 }
 
 fn active_editable_target(state: &TuiState) -> Option<EditableTarget> {
+    if state.spacer_cursor.is_some() {
+        return None;
+    }
     let target = current_editable_target(state)?;
     if state
         .pending_edit_target
@@ -7382,6 +7445,7 @@ fn recover_nonvisual_cursor(state: &mut TuiState, delta: i32, extend: bool) -> b
             .map_or(state.app.editor.cursor, |selection| selection.anchor);
         state.app.editor.select_range(anchor, cursor);
         clear_pending_edit_target(state);
+        schedule_style_popup_delay(state);
     } else {
         state.app.editor.set_cursor(cursor);
         schedule_editable_target_activation(state, cursor);
@@ -7887,6 +7951,40 @@ mod tests {
                 offset: 0
             }
         );
+    }
+
+    #[test]
+    fn arrow_up_from_active_h1_editor_skips_internal_empty_row() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "before\n\n# Title\n\nafter"),
+            None,
+        );
+        state.kitty_graphics = true;
+        state.app.render_options = RenderOptions {
+            width: 40,
+            heading_width: 40,
+            kitty_graphics: true,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 1,
+            offset: 0,
+        });
+        let rendered = current_navigation_render(&mut state);
+        let nav_index = display_nav_index(&mut state, &rendered);
+        let (_, editor_row) =
+            visual_cursor_position(&state, &nav_index).expect("active editor cursor");
+        let headline_top_row = editor_row.saturating_sub(1);
+
+        move_visual(&mut state, -1, false);
+
+        assert_ne!(
+            state.cursor_row_hint,
+            Some(headline_top_row),
+            "upward movement must not land on the empty internal headline editor row"
+        );
+        assert_eq!(active_editable_target(&state), None);
     }
 
     #[test]
@@ -8721,6 +8819,88 @@ mod tests {
     }
 
     #[test]
+    fn clicking_block_outside_active_toc_title_exits_toc_editor() {
+        let mut state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "## Table of contents\n\n1. [Project identity](#project-identity)\n\nOutside block\n\n# Project identity",
+            ),
+            None,
+        );
+        state.last_doc_area = Rect {
+            x: 1,
+            y: 1,
+            width: 70,
+            height: 14,
+        };
+        state.app.render_options = RenderOptions {
+            width: 36,
+            heading_width: 36,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::ListItem {
+            block: 1,
+            item: 0,
+            offset: 0,
+        });
+        let rendered = current_navigation_render(&mut state);
+        assert!(
+            rendered
+                .display
+                .items
+                .iter()
+                .any(|item| item.text == "Project identity"
+                    && item.cursor
+                        == Some(Cursor::ListItem {
+                            block: 1,
+                            item: 0,
+                            offset: 0
+                        }))
+        );
+        state.last_nav_index = Some(display_nav_index(&mut state, &rendered));
+        let outside = rendered
+            .display
+            .items
+            .iter()
+            .find(|item| {
+                item.cursor
+                    == Some(Cursor::Text {
+                        block: 2,
+                        offset: 0,
+                    })
+            })
+            .cloned()
+            .expect("outside paragraph");
+        let column = document_content_left(state.last_doc_area) + outside.rect.x;
+        let row = document_content_top(state.last_doc_area) + outside.rect.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert_eq!(
+            state.app.editor.cursor,
+            Cursor::Text {
+                block: 2,
+                offset: 0
+            }
+        );
+        let rendered = current_navigation_render(&mut state);
+        assert!(active_editable_target(&state).is_none());
+        assert!(rendered.text().contains("Project identity"));
+        assert!(rendered.text().contains("1"));
+        assert!(rendered.text().contains('.'));
+    }
+
+    #[test]
     fn edited_toc_title_renders_from_link_text_not_heading() {
         let mut app = App::from_markdown(
             "x.md",
@@ -9076,6 +9256,67 @@ mod tests {
                 offset: "hello world".chars().count()
             }
         );
+    }
+
+    #[test]
+    fn shift_arrow_selection_delays_style_popup() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        );
+
+        assert!(has_selection(&state));
+        assert!(state.app.editor.show_style_popover);
+        assert!(state.style_popup_not_before.is_some());
+        assert!(!style_popup_delay_elapsed(&state));
+    }
+
+    #[test]
+    fn delayed_style_popup_rearms_on_more_shift_selection() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        );
+        let first = state.style_popup_not_before.expect("first delay");
+        state.style_popup_not_before = Some(Instant::now() - Duration::from_millis(1));
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        );
+
+        assert!(state.style_popup_not_before.expect("second delay") > first);
+        assert!(!style_popup_delay_elapsed(&state));
+    }
+
+    #[test]
+    fn delayed_style_popup_activates_after_quiet_period() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "hello"), None);
+        state.app.editor.set_cursor(Cursor::Text {
+            block: 0,
+            offset: 0,
+        });
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        );
+        state.style_popup_not_before = Some(Instant::now() - Duration::from_millis(1));
+
+        assert!(maybe_activate_delayed_style_popup(&mut state));
+        assert!(state.style_popup_not_before.is_none());
+        assert!(style_popup_delay_elapsed(&state));
     }
 
     #[test]
