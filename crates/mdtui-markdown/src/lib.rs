@@ -62,11 +62,16 @@ pub fn import_gfm(source: &str) -> Document {
             continue;
         }
 
-        if let Some(rest) = line.trim_start().strip_prefix("> ") {
-            blocks.push(Block::BlockQuote(vec![Block::Paragraph(parse_inlines(
-                rest,
-            ))]));
-            i += 1;
+        if line.trim_start().starts_with("> ") {
+            let mut quoted = Vec::new();
+            while i < lines.len() {
+                let Some(rest) = lines[i].trim_start().strip_prefix("> ") else {
+                    break;
+                };
+                quoted.push(Block::Paragraph(parse_inlines(rest)));
+                i += 1;
+            }
+            blocks.push(Block::BlockQuote(quoted));
             continue;
         }
 
@@ -479,5 +484,18 @@ mod tests {
 
         assert_eq!(exported, source);
         assert!(semantic_equivalent_after_roundtrip(source));
+    }
+
+    #[test]
+    fn consecutive_blockquote_lines_import_as_single_blockquote() {
+        let document = import_gfm("> alpha\n> beta");
+
+        assert_eq!(
+            document.blocks,
+            vec![Block::BlockQuote(vec![
+                Block::Paragraph(vec![Inline::Text("alpha".to_string())]),
+                Block::Paragraph(vec![Inline::Text("beta".to_string())]),
+            ])]
+        );
     }
 }

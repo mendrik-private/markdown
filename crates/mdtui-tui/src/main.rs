@@ -93,6 +93,7 @@ enum StatusAction {
     SetWrapWidth(u16),
     SetColumns(u8),
     ToggleHyphenation,
+    SpacerPrompt(SpacerPromptAction),
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +110,7 @@ enum StylePopupAction {
     Code,
     Superscript,
     Subscript,
+    Link,
     Clear,
     Quote,
 }
@@ -121,6 +123,7 @@ impl StylePopupAction {
             Self::Code => "Ctrl+E",
             Self::Superscript => "Ctrl+.",
             Self::Subscript => "Ctrl+,",
+            Self::Link => "Enter",
             Self::Clear => "Enter",
             Self::Quote => "Enter",
         }
@@ -133,6 +136,7 @@ impl StylePopupAction {
             Self::Code => "Code",
             Self::Superscript => "Superscript",
             Self::Subscript => "Subscript",
+            Self::Link => "Link",
             Self::Clear => "Remove styling",
             Self::Quote => "Block quote",
         }
@@ -145,6 +149,35 @@ struct StylePopupHit {
     start: u16,
     end: u16,
     action: StylePopupAction,
+}
+
+#[derive(Clone, Debug)]
+enum LinkPopup {
+    Edit { input: String },
+}
+
+#[derive(Clone, Debug)]
+struct HeadingPopup {
+    insert_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HeadingPopupHit {
+    row: u16,
+    start: u16,
+    end: u16,
+    level: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpacerPromptAction {
+    Heading,
+    Table,
+    Code,
+    Quote,
+    Paragraph,
+    List,
+    Divider,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,6 +460,13 @@ struct TuiState {
     file_popup: Option<FilePopup>,
     file_popup_hits: Vec<FilePopupHit>,
     last_file_popup: Option<Rect>,
+    link_popup: Option<LinkPopup>,
+    last_link_popup: Option<Rect>,
+    heading_popup: Option<HeadingPopup>,
+    heading_popup_hits: Vec<HeadingPopupHit>,
+    last_heading_popup: Option<Rect>,
+    heading_popup_selected: u8,
+    heading_popup_hover: Option<u8>,
     table_popup: Option<TablePopup>,
     table_popup_hits: Vec<TablePopupHit>,
     last_table_popup: Option<Rect>,
@@ -497,6 +537,13 @@ impl TuiState {
             file_popup: None,
             file_popup_hits: Vec::new(),
             last_file_popup: None,
+            link_popup: None,
+            last_link_popup: None,
+            heading_popup: None,
+            heading_popup_hits: Vec::new(),
+            last_heading_popup: None,
+            heading_popup_selected: 2,
+            heading_popup_hover: None,
             table_popup: None,
             table_popup_hits: Vec::new(),
             last_table_popup: None,
@@ -660,6 +707,45 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
         return false;
     }
 
+    if let Some(LinkPopup::Edit { input }) = state.link_popup.as_mut() {
+        match key.code {
+            KeyCode::Esc => state.link_popup = None,
+            KeyCode::Enter => confirm_link_popup(state),
+            KeyCode::Backspace | KeyCode::Char('\u{8}' | '\u{7f}') if key.modifiers.is_empty() => {
+                input.pop();
+            }
+            KeyCode::Char(ch)
+                if is_text_input_char(key, ch)
+                    || matches!(ch, ':' | '/' | '#' | '?' | '&' | '=' | '.' | '-' | '_') =>
+            {
+                input.push(ch);
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    if state.heading_popup.is_some() {
+        match key.code {
+            KeyCode::Esc => close_heading_popup(state),
+            KeyCode::Left | KeyCode::Up => {
+                step_heading_popup_selection(state, -1);
+            }
+            KeyCode::Right | KeyCode::Down => {
+                step_heading_popup_selection(state, 1);
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() && ('1'..='6').contains(&ch) => {
+                apply_heading_popup_level(state, ch.to_digit(10).expect("digit") as u8);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                apply_heading_popup_level(state, active_heading_popup_level(state));
+            }
+            _ => {}
+        }
+        state.heading_popup_hits.clear();
+        return false;
+    }
+
     if state.table_popup.is_some() {
         match key.code {
             KeyCode::Esc => state.table_popup = None,
@@ -697,7 +783,9 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 apply_style_popup_action(state, active_style_popup_action(state));
                 state.dirty = true;
-                state.message = "style toggled".to_string();
+                if state.link_popup.is_none() {
+                    state.message = "style toggled".to_string();
+                }
                 return false;
             }
             _ => {}
@@ -706,28 +794,14 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) -> bool {
 
     if let Some(insert_index) = state.spacer_cursor {
         match key.code {
-            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 1);
-                return false;
-            }
-            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 2);
-                return false;
-            }
-            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 3);
-                return false;
-            }
-            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 4);
-                return false;
-            }
-            KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 5);
-                return false;
-            }
-            KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                insert_heading_block(state, insert_index, 6);
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() && spacer_prompt_action_for_key(ch).is_some() =>
+            {
+                run_spacer_prompt_action(
+                    state,
+                    insert_index,
+                    spacer_prompt_action_for_key(ch).expect("checked above"),
+                );
                 return false;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -947,6 +1021,31 @@ fn is_text_input_char(key: KeyEvent, ch: char) -> bool {
     is_plain_text_key(key) && !ch.is_control()
 }
 
+fn spacer_prompt_action_for_key(ch: char) -> Option<SpacerPromptAction> {
+    match ch.to_ascii_lowercase() {
+        'h' => Some(SpacerPromptAction::Heading),
+        't' => Some(SpacerPromptAction::Table),
+        'c' => Some(SpacerPromptAction::Code),
+        'q' => Some(SpacerPromptAction::Quote),
+        'p' => Some(SpacerPromptAction::Paragraph),
+        'l' => Some(SpacerPromptAction::List),
+        'd' => Some(SpacerPromptAction::Divider),
+        _ => None,
+    }
+}
+
+fn spacer_prompt_items() -> [(SpacerPromptAction, &'static str, char); 7] {
+    [
+        (SpacerPromptAction::Heading, "Heading", 'H'),
+        (SpacerPromptAction::Table, "Table", 'T'),
+        (SpacerPromptAction::Code, "Code", 'C'),
+        (SpacerPromptAction::Quote, "Quote", 'Q'),
+        (SpacerPromptAction::Paragraph, "Paragraph", 'P'),
+        (SpacerPromptAction::List, "List", 'L'),
+        (SpacerPromptAction::Divider, "Divider", 'D'),
+    ]
+}
+
 fn display_nav_index(state: &mut TuiState, rendered: &Rendered) -> Arc<DisplayNavIndex> {
     if state.last_render_key.is_none()
         || state.last_nav_key.as_ref() != state.last_render_key.as_ref()
@@ -1095,6 +1194,7 @@ fn move_visual(state: &mut TuiState, delta: i32, extend: bool) {
         return;
     }
     let Some(cursor) = target.map(|cursor| normalize_active_block_cursor(state, cursor)) else {
+        recover_nonvisual_cursor(state, delta, extend);
         return;
     };
     state.preferred_column = Some(preferred_x);
@@ -1152,6 +1252,40 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             state.file_popup = None;
             state.file_popup_hits.clear();
+        }
+    }
+    if let Some(popup) = state.last_link_popup {
+        if mouse.column >= popup.x
+            && mouse.column < popup.x.saturating_add(popup.width)
+            && mouse.row >= popup.y
+            && mouse.row < popup.y.saturating_add(popup.height)
+        {
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            state.link_popup = None;
+            state.last_link_popup = None;
+        }
+    }
+    if let Some(popup) = state.last_heading_popup {
+        if mouse.column >= popup.x
+            && mouse.column < popup.x.saturating_add(popup.width)
+            && mouse.row >= popup.y
+            && mouse.row < popup.y.saturating_add(popup.height)
+        {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    click_heading_popup(state, popup, mouse.column, mouse.row)
+                }
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                    hover_heading_popup(state, popup, mouse.column, mouse.row)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            close_heading_popup(state);
         }
     }
     if let Some(popup) = state.last_table_popup {
@@ -1825,6 +1959,17 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else {
         state.last_file_popup = None;
         state.file_popup_hits.clear();
+    }
+    if state.link_popup.is_some() {
+        state.last_link_popup = Some(draw_link_popup(frame, area, state, &theme));
+    } else {
+        state.last_link_popup = None;
+    }
+    if state.heading_popup.is_some() {
+        state.last_heading_popup = Some(draw_heading_popup(frame, area, state, &theme));
+    } else {
+        state.last_heading_popup = None;
+        state.heading_popup_hits.clear();
     }
     if state.table_popup.is_some() {
         state.last_table_popup = Some(draw_table_popup(frame, area, state, &theme));
@@ -2512,23 +2657,91 @@ fn draw_status(
         &mut x,
         area.y,
         right,
-        &format!("  {}", status_shortcuts(state)),
-        Style::default()
-            .fg(rgb(theme.text_secondary))
-            .bg(rgb(theme.panel_bg)),
+        "  ",
+        Style::default().bg(rgb(theme.panel_bg)),
     );
+    if state.spacer_cursor.is_some() {
+        draw_spacer_status_actions(buf, &mut x, area.y, right, state, theme);
+    } else {
+        put(
+            buf,
+            &mut x,
+            area.y,
+            right,
+            &status_shortcuts(state),
+            Style::default()
+                .fg(rgb(theme.text_secondary))
+                .bg(rgb(theme.panel_bg)),
+        );
+    }
 }
 
 fn status_shortcuts(state: &TuiState) -> String {
-    if state.spacer_cursor.is_some() {
-        return "type paragraph  Ctrl+T table  Ctrl+E code  Ctrl+B quote  Ctrl+1-6 heading"
-            .to_string();
-    }
     if matches!(state.app.editor.cursor, Cursor::TableCell { .. }) {
-        return "Tab next  Shift+Tab prev  Ctrl+←↑↓→ insert  Ctrl+D remove  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
+        return "Ctrl+←↑↓→ insert  Ctrl+D remove  Ctrl-S save  Ctrl-Q quit  Ctrl-H help"
             .to_string();
     }
     "Shift+arrows select  Ctrl-click block  Ctrl-S save  Ctrl-Q quit  Ctrl-H help".to_string()
+}
+
+fn draw_spacer_status_actions(
+    buf: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    state: &mut TuiState,
+    theme: &Theme,
+) {
+    for (index, (action, label, shortcut)) in spacer_prompt_items().iter().enumerate() {
+        if index > 0 {
+            put(
+                buf,
+                x,
+                y,
+                right,
+                " ",
+                Style::default().bg(rgb(theme.panel_bg)),
+            );
+        }
+        let start = (*x).saturating_sub(state.last_status_area.x);
+        put(
+            buf,
+            x,
+            y,
+            right,
+            "[",
+            Style::default()
+                .fg(rgb(theme.border))
+                .bg(rgb(theme.panel_bg)),
+        );
+        put(
+            buf,
+            x,
+            y,
+            right,
+            &shortcut.to_string(),
+            Style::default()
+                .fg(rgb(theme.accent_highlight))
+                .bg(rgb(theme.panel_bg))
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        put(
+            buf,
+            x,
+            y,
+            right,
+            &format!("{}]", &label[1..]),
+            Style::default()
+                .fg(rgb(theme.text_primary))
+                .bg(rgb(theme.panel_bg)),
+        );
+        let end = (*x).saturating_sub(state.last_status_area.x);
+        state.status_hits.push(StatusHit {
+            start,
+            end,
+            action: StatusAction::SpacerPrompt(*action),
+        });
+    }
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -2558,12 +2771,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
             body,
         )]),
         Line::from(vec![Span::styled(
-            " Ctrl-Shift-X strike · Ctrl-./, super/sub · spacer rows: type or Ctrl+1-6 / T / E / B",
+            " Ctrl-Shift-X strike · Ctrl-./, super/sub · spacer rows: H then 1-6, T/C/Q/P/L/D",
             body,
         )]),
         Line::from(vec![Span::styled(" Tables & lists ", section)]),
         Line::from(vec![Span::styled(
-            " Tab / Shift+Tab move cells · Ctrl+Arrow insert row/column · Ctrl+D removes row/column",
+            " Ctrl+Arrow insert row/column · Ctrl+D removes row/column",
             body,
         )]),
         Line::from(vec![Span::styled(" Mouse ", section)]),
@@ -2635,51 +2848,68 @@ struct StylePopupItem {
     action: StylePopupAction,
 }
 
-fn style_popup_items() -> [StylePopupItem; 7] {
+#[derive(Clone, Copy)]
+enum StylePopupEntry {
+    Action(StylePopupItem),
+    Separator,
+}
+
+fn style_popup_items() -> [StylePopupEntry; 9] {
     [
-        StylePopupItem {
+        StylePopupEntry::Action(StylePopupItem {
             label: "Bold",
             action: StylePopupAction::Bold,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
             label: "Italic",
             action: StylePopupAction::Italic,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
             label: "Code",
             action: StylePopupAction::Code,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
             label: "Superscript",
             action: StylePopupAction::Superscript,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
             label: "Subscript",
             action: StylePopupAction::Subscript,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
             label: "Block quote",
             action: StylePopupAction::Quote,
-        },
-        StylePopupItem {
+        }),
+        StylePopupEntry::Action(StylePopupItem {
+            label: "Link",
+            action: StylePopupAction::Link,
+        }),
+        StylePopupEntry::Separator,
+        StylePopupEntry::Action(StylePopupItem {
             label: "Remove styling",
             action: StylePopupAction::Clear,
-        },
+        }),
     ]
 }
 
-fn style_popup_width(items: &[StylePopupItem]) -> u16 {
+fn style_popup_width(items: &[StylePopupEntry]) -> u16 {
     items
         .iter()
-        .map(|item| item.label.chars().count())
+        .filter_map(|item| match item {
+            StylePopupEntry::Action(item) => Some(item.label.chars().count()),
+            StylePopupEntry::Separator => None,
+        })
         .max()
         .unwrap_or(0) as u16
         + 4
 }
 
-fn populate_style_popup_hits(state: &mut TuiState, items: &[StylePopupItem], popup: Rect) {
+fn populate_style_popup_hits(state: &mut TuiState, items: &[StylePopupEntry], popup: Rect) {
     state.style_popup_hits.clear();
     for (index, item) in items.iter().enumerate() {
+        let StylePopupEntry::Action(item) = item else {
+            continue;
+        };
         state.style_popup_hits.push(StylePopupHit {
             row: index as u16 + 1,
             start: 1,
@@ -2694,7 +2924,7 @@ fn render_popup_items(
     popup: Rect,
     state: &TuiState,
     theme: &Theme,
-    items: &[StylePopupItem],
+    items: &[StylePopupEntry],
 ) {
     let idle_style = Style::default()
         .fg(rgb(theme.text_primary))
@@ -2703,16 +2933,37 @@ fn render_popup_items(
         .fg(rgb(theme.panel_bg))
         .bg(rgb(theme.accent_highlight))
         .add_modifier(Modifier::BOLD);
+    let divider_style = Style::default()
+        .fg(rgb(theme.border))
+        .bg(rgb(theme.panel_bg));
     for (index, item) in items.iter().enumerate() {
         let y = popup.y + 1 + index as u16;
-        let mut x = popup.x + 1;
-        let selected = item.action == active_style_popup_action(state);
-        let style = if selected { active_style } else { idle_style };
-        let label = format!(
-            " {}",
-            pad_width(item.label, usize::from(popup.width.saturating_sub(3)))
-        );
-        put(buf, &mut x, y, popup.x + popup.width - 1, &label, style);
+        match item {
+            StylePopupEntry::Action(item) => {
+                let mut x = popup.x + 1;
+                let selected = item.action == active_style_popup_action(state);
+                let style = if selected { active_style } else { idle_style };
+                let label = format!(
+                    " {}",
+                    pad_width(item.label, usize::from(popup.width.saturating_sub(3)))
+                );
+                put(buf, &mut x, y, popup.x + popup.width - 1, &label, style);
+            }
+            StylePopupEntry::Separator => {
+                let mut x = popup.x + 1;
+                put(
+                    buf,
+                    &mut x,
+                    y,
+                    popup.x + popup.width - 1,
+                    &format!(
+                        " {}",
+                        "─".repeat(usize::from(popup.width.saturating_sub(3)))
+                    ),
+                    divider_style,
+                );
+            }
+        }
     }
 }
 
@@ -2840,43 +3091,13 @@ fn follow_link_to_block(state: &mut TuiState, block: usize, message: &str) {
     state.cursor_row_hint = None;
     clear_spacer_cursor(state);
     clear_pending_edit_target(state);
-    if editable_target_for_cursor(state, Cursor::Text { block, offset: 0 }).is_some() {
-        scroll_block_into_view(state, block);
-    } else {
-        state
-            .app
-            .editor
-            .set_cursor(Cursor::Text { block, offset: 0 });
-        ensure_cursor_visible(state);
+    let cursor = Cursor::Text { block, offset: 0 };
+    state.app.editor.set_cursor(cursor);
+    if editable_target_for_cursor(state, cursor).is_some() {
+        schedule_editable_target_activation(state, cursor);
     }
+    ensure_cursor_visible(state);
     state.message = message.to_string();
-}
-
-fn scroll_block_into_view(state: &mut TuiState, block: usize) {
-    let rendered = state
-        .last_base_rendered
-        .as_ref()
-        .cloned()
-        .or_else(|| state.last_rendered.clone());
-    let Some(rendered) = rendered else {
-        return;
-    };
-    let Some(target_row) = rendered
-        .display
-        .items
-        .iter()
-        .filter_map(|item| (display_item_block(item) == Some(block)).then_some(item.rect.y))
-        .min()
-    else {
-        return;
-    };
-    let viewport = state.last_doc_area.height.saturating_sub(2);
-    if viewport == 0 {
-        state.scroll = target_row;
-        return;
-    }
-    let margin = viewport.saturating_sub(1).min(2);
-    state.scroll = target_row.saturating_sub(margin);
 }
 
 fn update_code_thumb_drag(state: &mut TuiState, drag: CodeThumbDrag, x: u16) {
@@ -3202,6 +3423,156 @@ fn draw_file_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, them
     popup
 }
 
+fn draw_link_popup(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState, theme: &Theme) -> Rect {
+    let Some(LinkPopup::Edit { input }) = state.link_popup.clone() else {
+        return Rect::default();
+    };
+    let popup = centered(area, 40.min(area.width), 7.min(area.height));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" link ")
+            .title_style(
+                Style::default()
+                    .fg(rgb(theme.accent_primary))
+                    .bg(rgb(theme.panel_raised))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .border_style(Style::default().fg(rgb(theme.border_strong)))
+            .style(Style::default().bg(rgb(theme.panel_raised))),
+        popup,
+    );
+    let body = vec![
+        Line::from(Span::styled(
+            " target",
+            Style::default()
+                .fg(rgb(theme.text_secondary))
+                .bg(rgb(theme.panel_raised)),
+        )),
+        Line::from(Span::styled(
+            format!(
+                " {}",
+                pad_width(&input, usize::from(popup.width.saturating_sub(3)))
+            ),
+            Style::default()
+                .fg(rgb(theme.text_primary))
+                .bg(rgb(theme.panel_bg)),
+        )),
+        Line::from(Span::styled(
+            " [enter] apply  [esc] cancel",
+            Style::default()
+                .fg(rgb(theme.text_secondary))
+                .bg(rgb(theme.panel_raised)),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(body).style(Style::default().bg(rgb(theme.panel_raised))),
+        Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        },
+    );
+    popup
+}
+
+fn draw_heading_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    theme: &Theme,
+) -> Rect {
+    state.heading_popup_hits.clear();
+    let Some(_popup_state) = state.heading_popup.as_ref() else {
+        return Rect::default();
+    };
+    let popup = centered(area, 46.min(area.width), 7.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" heading ")
+        .title_style(
+            Style::default()
+                .fg(rgb(theme.accent_primary))
+                .bg(rgb(theme.panel_raised))
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(rgb(theme.border_strong)))
+        .style(Style::default().bg(rgb(theme.panel_raised)));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.buffer_mut().set_stringn(
+        inner.x,
+        inner.y,
+        " choose level",
+        usize::from(inner.width),
+        Style::default()
+            .fg(rgb(theme.text_secondary))
+            .bg(rgb(theme.panel_raised)),
+    );
+    let labels = [
+        (1u8, "H1"),
+        (2u8, "H2"),
+        (3u8, "H3"),
+        (4u8, "H4"),
+        (5u8, "H5"),
+        (6u8, "H6"),
+    ];
+    let mut x = inner.x;
+    let y = inner.y + 2;
+    for (index, (level, label)) in labels.iter().enumerate() {
+        if index > 0 {
+            put(
+                frame.buffer_mut(),
+                &mut x,
+                y,
+                inner.x + inner.width,
+                " ",
+                Style::default().bg(rgb(theme.panel_raised)),
+            );
+        }
+        let local_start = x.saturating_sub(inner.x);
+        let selected = *level == active_heading_popup_level(state);
+        put(
+            frame.buffer_mut(),
+            &mut x,
+            y,
+            inner.x + inner.width,
+            &format!("[{level}] {label}"),
+            if selected {
+                Style::default()
+                    .fg(rgb(theme.panel_bg))
+                    .bg(rgb(theme.accent_highlight))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(rgb(theme.text_primary))
+                    .bg(rgb(theme.panel_raised))
+            },
+        );
+        state.heading_popup_hits.push(HeadingPopupHit {
+            row: y.saturating_sub(popup.y),
+            start: local_start,
+            end: x.saturating_sub(inner.x),
+            level: *level,
+        });
+    }
+    frame.buffer_mut().set_stringn(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        "[1-6] choose  [enter] insert  [esc] cancel",
+        usize::from(inner.width),
+        Style::default()
+            .fg(rgb(theme.text_secondary))
+            .bg(rgb(theme.panel_raised)),
+    );
+    popup
+}
+
 fn click_file_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
     let local_y = y.saturating_sub(popup.y);
     let local_x = x.saturating_sub(popup.x.saturating_add(1));
@@ -3235,6 +3606,38 @@ fn active_style_popup_action(state: &TuiState) -> StylePopupAction {
         .unwrap_or(state.style_popup_selected)
 }
 
+fn active_heading_popup_level(state: &TuiState) -> u8 {
+    state
+        .heading_popup_hover
+        .unwrap_or(state.heading_popup_selected)
+        .clamp(1, 6)
+}
+
+fn close_heading_popup(state: &mut TuiState) {
+    state.heading_popup = None;
+    state.heading_popup_hits.clear();
+    state.last_heading_popup = None;
+    state.heading_popup_hover = None;
+    state.dirty = true;
+}
+
+fn step_heading_popup_selection(state: &mut TuiState, delta: i32) {
+    let current = i32::from(state.heading_popup_selected.clamp(1, 6));
+    let next = (current - 1 + delta).rem_euclid(6) + 1;
+    state.heading_popup_selected = next as u8;
+    state.heading_popup_hover = None;
+    state.message = format!("heading {}", state.heading_popup_selected);
+    state.dirty = true;
+}
+
+fn apply_heading_popup_level(state: &mut TuiState, level: u8) {
+    let Some(HeadingPopup { insert_index }) = state.heading_popup.clone() else {
+        return;
+    };
+    close_heading_popup(state);
+    insert_heading_block(state, insert_index, level.clamp(1, 6));
+}
+
 fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
     let actions = [
         StylePopupAction::Bold,
@@ -3243,6 +3646,7 @@ fn step_style_popup_selection(state: &mut TuiState, delta: i32) {
         StylePopupAction::Superscript,
         StylePopupAction::Subscript,
         StylePopupAction::Quote,
+        StylePopupAction::Link,
         StylePopupAction::Clear,
     ];
     let current = actions
@@ -3277,8 +3681,42 @@ fn apply_style_popup_action(state: &mut TuiState, action: StylePopupAction) {
         }
         StylePopupAction::Superscript => state.app.apply_superscript(),
         StylePopupAction::Subscript => state.app.apply_subscript(),
+        StylePopupAction::Link => open_link_popup(state),
         StylePopupAction::Clear => state.app.clear_styles(),
         StylePopupAction::Quote => state.app.apply_block_quote(),
+    }
+}
+
+fn click_heading_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let Some(level) = state
+        .heading_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.level)
+    else {
+        return;
+    };
+    state.heading_popup_selected = level;
+    state.heading_popup_hover = Some(level);
+    apply_heading_popup_level(state, level);
+}
+
+fn hover_heading_popup(state: &mut TuiState, popup: Rect, x: u16, y: u16) {
+    let local_y = y.saturating_sub(popup.y);
+    let local_x = x.saturating_sub(popup.x.saturating_add(1));
+    let hover = state
+        .heading_popup_hits
+        .iter()
+        .find(|hit| hit.row == local_y && local_x >= hit.start && local_x < hit.end)
+        .map(|hit| hit.level);
+    if state.heading_popup_hover != hover {
+        state.heading_popup_hover = hover;
+        if let Some(level) = hover {
+            state.heading_popup_selected = level;
+        }
+        state.dirty = true;
     }
 }
 
@@ -3332,6 +3770,15 @@ fn open_table_popup(state: &mut TuiState) {
     state.table_popup = Some(TablePopup { block, row, col });
     state.table_popup_selected = TablePopupAction::RemoveRow;
     state.table_popup_hover = None;
+    state.dirty = true;
+}
+
+fn open_heading_popup(state: &mut TuiState, insert_index: usize) {
+    state.heading_popup = Some(HeadingPopup { insert_index });
+    state.heading_popup_selected = 2;
+    state.heading_popup_hover = None;
+    state.last_heading_popup = None;
+    state.message = "heading level 1-6".to_string();
     state.dirty = true;
 }
 
@@ -3444,6 +3891,37 @@ fn insert_quote_block(state: &mut TuiState, insert_index: usize) {
     );
 }
 
+fn insert_list_block(state: &mut TuiState, insert_index: usize) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::List(mdtui_core::List {
+            ordered: false,
+            tight: false,
+            items: vec![mdtui_core::ListItem::paragraph(String::new(), None)],
+        }),
+        Cursor::ListItem {
+            block: insert_index,
+            item: 0,
+            offset: 0,
+        },
+        "list",
+    );
+}
+
+fn insert_divider_block(state: &mut TuiState, insert_index: usize) {
+    insert_block_with_cursor(
+        state,
+        insert_index,
+        DocBlock::ThematicBreak,
+        Cursor::Text {
+            block: insert_index,
+            offset: 0,
+        },
+        "divider",
+    );
+}
+
 fn insert_paragraph_text(state: &mut TuiState, insert_index: usize, text: &str) {
     insert_block_with_cursor(
         state,
@@ -3455,6 +3933,18 @@ fn insert_paragraph_text(state: &mut TuiState, insert_index: usize, text: &str) 
         },
         "paragraph",
     );
+}
+
+fn run_spacer_prompt_action(state: &mut TuiState, insert_index: usize, action: SpacerPromptAction) {
+    match action {
+        SpacerPromptAction::Heading => open_heading_popup(state, insert_index),
+        SpacerPromptAction::Table => insert_table_block(state, insert_index),
+        SpacerPromptAction::Code => insert_code_block(state, insert_index),
+        SpacerPromptAction::Quote => insert_quote_block(state, insert_index),
+        SpacerPromptAction::Paragraph => insert_paragraph_text(state, insert_index, ""),
+        SpacerPromptAction::List => insert_list_block(state, insert_index),
+        SpacerPromptAction::Divider => insert_divider_block(state, insert_index),
+    }
 }
 
 fn run_explorer_action(state: &mut TuiState, action: &ExplorerAction) {
@@ -3499,6 +3989,11 @@ fn run_status_action(state: &mut TuiState, action: &StatusAction) {
             };
             persist_view_state(state);
         }
+        StatusAction::SpacerPrompt(action) => {
+            if let Some(insert_index) = state.spacer_cursor {
+                run_spacer_prompt_action(state, insert_index, action);
+            }
+        }
     }
 }
 
@@ -3540,6 +4035,15 @@ fn open_file(state: &mut TuiState, path: &Path) {
             state.last_explorer_key = None;
             state.last_nav_index = None;
             state.last_nav_key = None;
+            state.file_popup = None;
+            state.file_popup_hits.clear();
+            state.last_file_popup = None;
+            state.link_popup = None;
+            state.last_link_popup = None;
+            state.heading_popup = None;
+            state.heading_popup_hits.clear();
+            state.last_heading_popup = None;
+            state.heading_popup_hover = None;
             state.table_popup = None;
             state.table_popup_hits.clear();
             state.last_table_popup = None;
@@ -3630,6 +4134,28 @@ fn confirm_file_popup(state: &mut TuiState) {
             }
         }
     }
+}
+
+fn open_link_popup(state: &mut TuiState) {
+    state.link_popup = Some(LinkPopup::Edit {
+        input: "https://".to_string(),
+    });
+    state.last_link_popup = None;
+}
+
+fn confirm_link_popup(state: &mut TuiState) {
+    let Some(LinkPopup::Edit { input }) = state.link_popup.clone() else {
+        return;
+    };
+    let target = input.trim();
+    if target.is_empty() {
+        state.message = "link target required".to_string();
+        return;
+    }
+    state.app.apply_link(target.to_string());
+    state.link_popup = None;
+    state.message = "link applied".to_string();
+    state.dirty = true;
 }
 
 fn create_file_from_input(state: &mut TuiState, input: &str) -> io::Result<()> {
@@ -4601,7 +5127,7 @@ fn toc_row_spans(text: &str, theme: &Theme, background: Color, linked: bool) -> 
     }
     vec![Span::styled(
         text.to_string(),
-        Style::default().fg(rgb(theme.link)).bg(background),
+        Style::default().fg(rgb(theme.text_primary)).bg(background),
     )]
 }
 
@@ -5743,6 +6269,10 @@ fn visual_cursor_position(state: &TuiState, index: &DisplayNavIndex) -> Option<(
 
 fn clear_spacer_cursor(state: &mut TuiState) {
     state.spacer_cursor = None;
+    state.heading_popup = None;
+    state.heading_popup_hits.clear();
+    state.last_heading_popup = None;
+    state.heading_popup_hover = None;
 }
 
 fn set_spacer_cursor(state: &mut TuiState, insert_index: usize, row: u16) {
@@ -6641,15 +7171,6 @@ fn editable_target_for_cursor(state: &TuiState, cursor: Cursor) -> Option<Editab
 }
 
 fn is_toc_list_item(blocks: &[DocBlock], block: usize, item: usize) -> bool {
-    let headings = blocks
-        .iter()
-        .filter_map(|block| match block {
-            DocBlock::Heading { inlines, .. } => {
-                Some(outline_slugify_heading(&mdtui_core::inline_text(inlines)))
-            }
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
     let Some(DocBlock::List(list)) = blocks.get(block) else {
         return false;
     };
@@ -6662,9 +7183,14 @@ fn is_toc_list_item(blocks: &[DocBlock], block: usize, item: usize) -> bool {
     let [Inline::Link { target, .. }] = inlines.as_slice() else {
         return false;
     };
-    target
-        .strip_prefix('#')
-        .is_some_and(|slug| headings.contains(slug))
+    target.strip_prefix('#').is_some_and(|slug| {
+        blocks.iter().any(|block| match block {
+            DocBlock::Heading { inlines, .. } => {
+                outline_slugify_heading(&mdtui_core::inline_text(inlines)) == slug
+            }
+            _ => false,
+        })
+    })
 }
 
 fn schedule_editable_target_activation(state: &mut TuiState, cursor: Cursor) {
@@ -8028,6 +8554,279 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn toc_titles_use_normal_text_color() {
+        let state = TuiState::new(
+            App::from_markdown(
+                "x.md",
+                "1. [Project identity](#project-identity)\n\n# Project identity",
+            ),
+            None,
+        );
+        let rendered = render_document(
+            &state.app.editor.document,
+            RenderOptions {
+                width: 28,
+                heading_width: 28,
+                kitty_graphics: false,
+                show_status: false,
+                ..RenderOptions::default()
+            },
+        );
+        let theme = Theme::dark_amber();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 6,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(32, 6)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_document(frame, area, &state, &rendered, &theme))
+            .expect("draw document");
+        let buffer = terminal.backend().buffer();
+        let content_x = document_content_left(area);
+
+        assert_eq!(
+            buffer.cell((content_x, 1)).expect("toc title").fg,
+            rgb(theme.text_primary)
+        );
+    }
+
+    #[test]
+    fn table_status_shortcuts_omit_tab_hints() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "| A |\n| - |\n| B |"), None);
+        state.app.editor.set_cursor(Cursor::TableCell {
+            block: 0,
+            row: 0,
+            col: 0,
+            offset: 0,
+        });
+
+        let shortcuts = status_shortcuts(&state);
+
+        assert!(!shortcuts.contains("Tab next"));
+        assert!(shortcuts.contains("Ctrl+D remove"));
+    }
+
+    #[test]
+    fn spacer_status_shows_heading_chip_without_old_shortcut_hint() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha\n\nomega"), None);
+        state.last_status_area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 1,
+        };
+        state.spacer_cursor = Some(1);
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, state.last_status_area, &mut state, &rendered, &theme))
+            .expect("draw status");
+        let buffer = terminal.backend().buffer();
+        let row = (0..120)
+            .filter_map(|x| buffer.cell((x, 0)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(row.contains("[Heading]"));
+        assert!(row.contains("[Divider]"));
+        assert!(!row.contains("Ctrl+1-6 heading"));
+        assert!(!row.contains("Ctrl-S save"));
+        assert!(!row.contains("Ctrl-Q quit"));
+        assert!(!row.contains("Ctrl-H help"));
+    }
+
+    #[test]
+    fn spacer_heading_key_opens_level_popup_and_digit_inserts_heading() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha\n\nomega"), None);
+        state.spacer_cursor = Some(1);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
+        );
+
+        assert!(state.heading_popup.is_some());
+        assert_eq!(state.heading_popup_selected, 2);
+
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::empty()),
+        );
+
+        assert!(matches!(
+            state.app.editor.document.blocks[1],
+            DocBlock::Heading { level: 4, .. }
+        ));
+        assert!(state.heading_popup.is_none());
+    }
+
+    #[test]
+    fn clicking_status_bar_spacer_prompt_inserts_table() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha\n\nomega"), None);
+        state.last_status_area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 1,
+        };
+        state.spacer_cursor = Some(1);
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, state.last_status_area, &mut state, &rendered, &theme))
+            .expect("draw status");
+        let hit = state
+            .status_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    hit.action,
+                    StatusAction::SpacerPrompt(SpacerPromptAction::Table)
+                )
+            })
+            .cloned()
+            .expect("table spacer hit");
+        let click_column = state.last_status_area.x + hit.start;
+        let click_row = state.last_status_area.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: click_column,
+                row: click_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(matches!(
+            state.app.editor.document.blocks[1],
+            DocBlock::Table(_)
+        ));
+    }
+
+    #[test]
+    fn clicking_heading_status_chip_and_level_inserts_heading() {
+        let mut state = TuiState::new(App::from_markdown("x.md", "alpha\n\nomega"), None);
+        state.last_status_area = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 1,
+        };
+        state.spacer_cursor = Some(1);
+        let rendered =
+            render_document(&state.app.editor.document, state.app.render_options.clone());
+        let theme = Theme::dark_amber();
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| draw_status(frame, state.last_status_area, &mut state, &rendered, &theme))
+            .expect("draw status");
+        let heading_hit = state
+            .status_hits
+            .iter()
+            .find(|hit| {
+                matches!(
+                    hit.action,
+                    StatusAction::SpacerPrompt(SpacerPromptAction::Heading)
+                )
+            })
+            .cloned()
+            .expect("heading spacer hit");
+        let heading_column = state.last_status_area.x + heading_hit.start;
+        let status_row = state.last_status_area.y;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: heading_column,
+                row: status_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(state.heading_popup.is_some());
+
+        terminal
+            .draw(|frame| {
+                let _ = draw_heading_popup(frame, Rect::new(0, 0, 120, 20), &mut state, &theme);
+            })
+            .expect("draw heading popup");
+        let popup = centered(Rect::new(0, 0, 120, 20), 46, 7);
+        state.last_heading_popup = Some(popup);
+        let level_hit = state
+            .heading_popup_hits
+            .iter()
+            .find(|hit| hit.level == 3)
+            .cloned()
+            .expect("heading level hit");
+        let popup_column = popup.x + 1 + level_hit.start;
+        let popup_row = popup.y + level_hit.row;
+
+        handle_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: popup_column,
+                row: popup_row,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+
+        assert!(matches!(
+            state.app.editor.document.blocks[1],
+            DocBlock::Heading { level: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn move_visual_can_leave_top_table_row_upward() {
+        let mut state = TuiState::new(
+            App::from_markdown("x.md", "above\n\n| A |\n| - |\n| B |"),
+            None,
+        );
+        state.app.render_options = RenderOptions {
+            width: 40,
+            heading_width: 40,
+            kitty_graphics: false,
+            show_status: false,
+            ..RenderOptions::default()
+        };
+        state.app.editor.set_cursor(Cursor::TableCell {
+            block: 1,
+            row: 0,
+            col: 0,
+            offset: 0,
+        });
+        let rendered = Arc::new(render_document(
+            &state.app.editor.document,
+            state.app.render_options.clone(),
+        ));
+        state.last_rendered = Some(rendered.clone());
+        state.last_base_rendered = Some(rendered.clone());
+        state.last_render_key = Some(RenderCacheKey {
+            version: state.app.editor.document.version,
+            options: state.app.render_options.clone(),
+            active_fallback_block: None,
+        });
+
+        move_visual(&mut state, -1, false);
+        move_visual(&mut state, -1, false);
+
+        assert!(
+            matches!(state.app.editor.cursor, Cursor::Text { block: 0, .. })
+                || state.spacer_cursor == Some(1)
+        );
     }
 
     #[test]

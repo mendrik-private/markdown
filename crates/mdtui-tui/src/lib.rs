@@ -92,6 +92,10 @@ impl App {
         self.editor.apply_mark(InlineMark::Code);
     }
 
+    pub fn apply_link(&mut self, target: impl Into<String>) {
+        self.editor.apply_link(target);
+    }
+
     pub fn apply_code_block(&mut self) {
         self.editor.toggle_code_block();
     }

@@ -322,6 +322,10 @@ pub enum Op {
         selection: Selection,
         mark: InlineMark,
     },
+    WrapLink {
+        selection: Selection,
+        target: String,
+    },
     ToggleTask {
         block: usize,
         item: usize,
@@ -609,6 +613,52 @@ impl Editor {
             Cursor::Checkbox { .. } => {}
         }
         self.document.version += 1;
+    }
+
+    pub fn apply_link(&mut self, target: impl Into<String>) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let Some((start, end)) = same_owner_offsets(selection) else {
+            return;
+        };
+        if start == end {
+            return;
+        }
+        let target = target.into();
+        self.record_undo();
+        match selection.anchor {
+            Cursor::Text { block, .. } => {
+                if let Some(block) = self.document.blocks.get_mut(block) {
+                    wrap_block_link(block, start, end, &target);
+                }
+            }
+            Cursor::ListItem { block, item, .. } => {
+                if let Some(Block::List(list)) = self.document.blocks.get_mut(block)
+                    && let Some(list_item) = list.items.get_mut(item)
+                    && let Some(block) = list_item.blocks.get_mut(0)
+                {
+                    wrap_block_link(block, start, end, &target);
+                }
+            }
+            Cursor::TableCell {
+                block, row, col, ..
+            } => {
+                if let Some(Block::Table(table)) = self.document.blocks.get_mut(block)
+                    && let Some(block) = table
+                        .rows
+                        .get_mut(row)
+                        .and_then(|row| row.cells.get_mut(col))
+                        .and_then(|cell| cell.blocks.get_mut(0))
+                {
+                    wrap_block_link(block, start, end, &target);
+                }
+            }
+            Cursor::Checkbox { .. } => {}
+        }
+        self.show_style_popover = true;
+        self.document.version += 1;
+        self.push_tx(vec![Op::WrapLink { selection, target }]);
     }
 
     pub fn toggle_block_quote(&mut self) {
@@ -1595,6 +1645,22 @@ fn clear_block_styles(block: &mut Block, start: usize, end: usize) {
     }
 }
 
+fn wrap_block_link(block: &mut Block, start: usize, end: usize, target: &str) {
+    if start >= end {
+        return;
+    }
+    let inlines = match block {
+        Block::Paragraph(inlines) | Block::Heading { inlines, .. } => inlines,
+        _ => return,
+    };
+    let chunks = inline_chunks(inlines);
+    if chunks.is_empty() {
+        return;
+    }
+    let next = apply_link_to_chunks(&chunks, start, end, target);
+    *inlines = chunks_to_inlines(&next);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InlineChunk {
     text: String,
@@ -1814,6 +1880,53 @@ fn clear_styles_in_chunks(chunks: &[InlineChunk], start: usize, end: usize) -> V
         }
         if !middle.is_empty() {
             push_inline_chunk(&mut out, middle, ActiveMarks::default(), None);
+        }
+        if !suffix.is_empty() {
+            push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
+        }
+        offset = chunk_end;
+    }
+    out
+}
+
+fn apply_link_to_chunks(
+    chunks: &[InlineChunk],
+    start: usize,
+    end: usize,
+    target: &str,
+) -> Vec<InlineChunk> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let meta = LinkMeta {
+        target: target.to_string(),
+        title: None,
+    };
+    for chunk in chunks {
+        let len = char_len(&chunk.text);
+        let chunk_end = offset + len;
+        let overlap_start = start.max(offset);
+        let overlap_end = end.min(chunk_end);
+        if overlap_end <= overlap_start {
+            push_inline_chunk(
+                &mut out,
+                chunk.text.clone(),
+                chunk.marks,
+                chunk.link.as_ref(),
+            );
+            offset = chunk_end;
+            continue;
+        }
+
+        let leading = overlap_start.saturating_sub(offset);
+        let selected = overlap_end - overlap_start;
+        let (prefix, rest) = split_chars(&chunk.text, leading);
+        let (middle, suffix) = split_chars(&rest, selected);
+
+        if !prefix.is_empty() {
+            push_inline_chunk(&mut out, prefix, chunk.marks, chunk.link.as_ref());
+        }
+        if !middle.is_empty() {
+            push_inline_chunk(&mut out, middle, chunk.marks, Some(&meta));
         }
         if !suffix.is_empty() {
             push_inline_chunk(&mut out, suffix, chunk.marks, chunk.link.as_ref());
@@ -2316,6 +2429,37 @@ mod tests {
                 src: "cover.png".to_string(),
                 alt: "Cover!".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn applying_link_wraps_selected_text() {
+        let mut editor = Editor::new(Document::new(vec![Block::Paragraph(vec![Inline::Text(
+            "hello world".to_string(),
+        )])]));
+        editor.select_range(
+            Cursor::Text {
+                block: 0,
+                offset: 0,
+            },
+            Cursor::Text {
+                block: 0,
+                offset: 5,
+            },
+        );
+
+        editor.apply_link("https://example.com");
+
+        assert_eq!(
+            editor.document.blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Link {
+                    target: "https://example.com".to_string(),
+                    title: None,
+                    children: vec![Inline::Text("hello".to_string())],
+                },
+                Inline::Text(" world".to_string()),
+            ])]
         );
     }
 }
