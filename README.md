@@ -1,3 +1,6 @@
+> [!WARNING]
+> This is work in progress and not working yet
+
 # mdtui
 
 `mdtui` is a keyboard-first terminal Markdown editor with semantic Markdown rendering, table editing, TOC/outline navigation, inline styling, and optional Kitty graphics headlines.
