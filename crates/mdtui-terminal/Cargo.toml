@@ -1,9 +1,17 @@
 [package]
 name = "mdtui-terminal"
-version.workspace = true
 edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+base64.workspace = true
+crossterm.workspace = true
+image.workspace = true
+mdtui-render = { path = "../mdtui-render" }
+ratatui.workspace = true
 
 [lints]
 workspace = true

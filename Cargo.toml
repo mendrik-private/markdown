@@ -13,8 +13,29 @@ edition = "2024"
 version = "0.1.0"
 license = "MIT"
 
+[workspace.dependencies]
+anyhow = "1.0"
+arboard = "3.6"
+base64 = "0.22"
+bitflags = "2.6"
+comrak = "0.35"
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+ratatui = "0.29"
+ratatui-image = { version = "8.0.2", default-features = false, features = ["crossterm"] }
+ropey = "1.6"
+serde = { version = "1.0", features = ["derive"] }
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+thiserror = "2.0"
+toml = "0.8"
+tree-sitter = "0.23"
+tree-sitter-md = { version = "0.3", features = ["parser"] }
+tui-checkbox = "0.2.6"
+tui-scrollview = "0.5.1"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
-

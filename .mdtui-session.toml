@@ -1,0 +1,7 @@
+active = 0
+
+[[tabs]]
+path = "./example.md"
+cursor_source_byte = 0
+scroll_y = 0
+pinned = false

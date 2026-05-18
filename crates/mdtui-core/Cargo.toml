@@ -1,9 +1,16 @@
 [package]
 name = "mdtui-core"
-version.workspace = true
 edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
+ropey.workspace = true
+serde.workspace = true
+tree-sitter.workspace = true
+tree-sitter-md.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true

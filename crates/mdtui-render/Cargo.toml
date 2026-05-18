@@ -1,13 +1,14 @@
 [package]
 name = "mdtui-render"
-version.workspace = true
 edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
-hyphenation = { version = "0.8.4", features = ["embed_all"] }
 mdtui-core = { path = "../mdtui-core" }
-unicode-width = "0.2.0"
-whatlang = "0.18.0"
+syntect.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 
 [lints]
 workspace = true

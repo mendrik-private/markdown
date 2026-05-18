@@ -1,9 +1,11 @@
 [package]
 name = "mdtui-markdown"
-version.workspace = true
 edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [dependencies]
+comrak.workspace = true
 mdtui-core = { path = "../mdtui-core" }
 
 [lints]
