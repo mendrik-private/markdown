@@ -21,6 +21,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const CODE_HIGHLIGHT_CACHE_CAP: usize = 64;
+const BLOCK_SURFACE_MIN_WIDTH: usize = 34;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -712,21 +713,40 @@ impl RenderBuilder {
             .collect::<Vec<_>>()
             .join(" ");
         let label = alert.map(alert_label);
+        let surface_width = block_surface_width(self.width);
         if let Some(label) = label {
             let mut cells = vec![cell("▌ ", quote()), cell(format!("{label} "), accent())];
-            cells.extend(text_cells(&raw, muted()));
+            let content_width = surface_width.saturating_sub(cells_width(&cells) as usize);
+            let mut content = text_cells(&truncate_to_width(&raw, content_width), muted());
+            let used_content_width = cells_width(&content) as usize;
+            cells.append(&mut content);
+            if content_width > used_content_width {
+                cells.push(cell(
+                    " ".repeat(content_width - used_content_width),
+                    muted(),
+                ));
+            }
             self.push_component_line(component, cells);
             return;
         }
 
         let mut cells = vec![cell("▌ ", quote())];
-        cells.extend(text_cells(
-            &raw,
+        let content_width = surface_width.saturating_sub(cells_width(&cells) as usize);
+        let mut content = text_cells(
+            &truncate_to_width(&raw, content_width),
             CellStyle {
                 italic: true,
                 ..muted()
             },
-        ));
+        );
+        let used_content_width = cells_width(&content) as usize;
+        cells.append(&mut content);
+        if content_width > used_content_width {
+            cells.push(cell(
+                " ".repeat(content_width - used_content_width),
+                muted(),
+            ));
+        }
         self.push_component_line(component, cells);
     }
 
@@ -782,9 +802,10 @@ impl RenderBuilder {
         let surface_width = surface_width(
             max_body_width
                 .saturating_add(8)
-                .max(title_width.saturating_add(13)),
+                .max(title_width.saturating_add(13))
+                .max(block_surface_width(self.width)),
             self.width,
-            34,
+            BLOCK_SURFACE_MIN_WIDTH,
         );
         let title = truncate_to_width(title, surface_width.saturating_sub(13).max(1));
         let title_width = UnicodeWidthStr::width(title.as_str());
@@ -912,6 +933,7 @@ impl RenderBuilder {
                     .min(24);
             }
         }
+        normalize_table_widths(&mut widths, block_surface_width(self.width));
         let component_start = self.total_rows;
         let total_height = table_render_height(rows.len());
         self.push_component_line_if_visible(
@@ -928,7 +950,10 @@ impl RenderBuilder {
             let row_style = if row_idx == 0 { accent() } else { normal() };
             for (idx, width) in widths.iter().enumerate() {
                 let value = row.get(idx).map(String::as_str).unwrap_or("");
-                cells.push(cell(format!(" {} ", fit_to_width(value, *width)), row_style));
+                cells.push(cell(
+                    format!(" {} ", fit_to_width(value, *width)),
+                    row_style,
+                ));
                 cells.push(cell("│", border()));
             }
             self.push_component_line_if_visible(component, row_y, cells);
@@ -1674,6 +1699,22 @@ fn table_border_cells(left: char, mid: char, right: char, widths: &[usize]) -> V
     cells
 }
 
+fn table_total_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + widths.len().saturating_mul(3) + 1
+}
+
+fn normalize_table_widths(widths: &mut [usize], target_width: usize) {
+    if widths.is_empty() {
+        return;
+    }
+    while table_total_width(widths) < target_width {
+        let Some((idx, _)) = widths.iter().enumerate().min_by_key(|(_, width)| **width) else {
+            return;
+        };
+        widths[idx] = widths[idx].saturating_add(1);
+    }
+}
+
 fn fit_to_width(value: &str, width: usize) -> String {
     let truncated = truncate_to_width(value, width);
     let used = UnicodeWidthStr::width(truncated.as_str());
@@ -1692,6 +1733,10 @@ fn cells_width(cells: &[StyledCell]) -> u16 {
 fn surface_width(content_width: usize, viewport_width: u16, min_width: usize) -> usize {
     let viewport_width = usize::from(viewport_width).max(12);
     content_width.max(min_width).min(viewport_width)
+}
+
+fn block_surface_width(viewport_width: u16) -> usize {
+    usize::from(viewport_width).clamp(BLOCK_SURFACE_MIN_WIDTH, 72)
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
@@ -1950,6 +1995,34 @@ mod tests {
                 .collect::<String>();
             text.contains("你好") && UnicodeWidthStr::width(text.as_str()) == widths[0]
         }));
+    }
+
+    #[test]
+    fn block_surfaces_share_consistent_width() {
+        let document = Document::new(
+            None,
+            "| A | B |\n| --- | --- |\n| ✅ | short |\n\n```rust\nfn main() {}\n```\n\n> quoted\n\n> [!NOTE]\n> alert\n",
+        );
+        let rendered = render_document(&document, 80);
+        let interesting = rendered
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let text = line
+                    .cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>();
+                (text.starts_with('┌')
+                    || text.starts_with('│')
+                    || text.starts_with('└')
+                    || text.starts_with('▌'))
+                .then(|| UnicodeWidthStr::width(text.as_str()))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!interesting.is_empty());
+        assert!(interesting.iter().all(|width| *width == interesting[0]));
     }
 
     #[test]
